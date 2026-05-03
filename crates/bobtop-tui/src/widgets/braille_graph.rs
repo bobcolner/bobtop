@@ -18,6 +18,7 @@
 //! resolution) and `Blocks` (TTY fallback using ▁▂▃▄▅▆▇█ when braille glyphs
 //! aren't renderable, e.g. on a Linux VT).
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use ratatui::buffer::Buffer;
@@ -26,6 +27,15 @@ use ratatui::style::{Color, Style};
 use ratatui::widgets::Widget;
 
 use crate::color::{dim, Gradient};
+
+// Per-thread scratch buffers reused across frames so the hot render path
+// allocates zero. The renderer is single-threaded today (one TUI thread)
+// so a thread-local fits with no synchronization cost. `Widget::render`
+// consumes `self` by value, which rules out an `&mut` field on the widget.
+thread_local! {
+    static SCRATCH_TOPS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_RANGES: RefCell<Vec<(i32, i32)>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Number of dot columns per terminal cell (Unicode braille is 2 wide).
 const DOTS_PER_CELL_X: usize = 2;
@@ -293,62 +303,66 @@ fn render_braille(buf: &mut Buffer, area: Rect, trace: &Trace, show_fill: bool, 
     let dot_rows = cells_h * DOTS_PER_CELL_Y;
 
     // Per-dot-column "topmost set dot row" — `dot_rows` means "no dots set".
-    let tops = trace_top_dots(trace, dot_cols, dot_rows);
+    // Borrowed from a thread-local scratch so we don't alloc per frame.
+    SCRATCH_TOPS.with(|c| {
+        let mut tops = c.borrow_mut();
+        trace_top_dots(trace, dot_cols, dot_rows, &mut tops);
 
-    for cell_x in 0..cells_w {
-        let dx_l = cell_x * DOTS_PER_CELL_X;
-        let dx_r = dx_l + 1;
-        let top_l = tops[dx_l];
-        let top_r = tops[dx_r];
-        let cell_top_row = |cell_y: usize| cell_y * DOTS_PER_CELL_Y;
+        for cell_x in 0..cells_w {
+            let dx_l = cell_x * DOTS_PER_CELL_X;
+            let dx_r = dx_l + 1;
+            let top_l = tops[dx_l];
+            let top_r = tops[dx_r];
+            let cell_top_row = |cell_y: usize| cell_y * DOTS_PER_CELL_Y;
 
-        for cell_y in 0..cells_h {
-            let row_top = cell_top_row(cell_y);
-            let row_bot = row_top + DOTS_PER_CELL_Y - 1;
+            for cell_y in 0..cells_h {
+                let row_top = cell_top_row(cell_y);
+                let row_bot = row_top + DOTS_PER_CELL_Y - 1;
 
-            let mut bits: u8 = 0;
-            for ci in 0..DOTS_PER_CELL_X {
-                let top = if ci == 0 { top_l } else { top_r };
-                for ri in 0..DOTS_PER_CELL_Y {
-                    let dot_row = row_top + ri;
-                    let dot_set = if show_fill {
-                        dot_row >= top
-                    } else {
-                        dot_row == top
-                    };
-                    if dot_set {
-                        bits |= BRAILLE_BIT[ci][ri];
+                let mut bits: u8 = 0;
+                for ci in 0..DOTS_PER_CELL_X {
+                    let top = if ci == 0 { top_l } else { top_r };
+                    for ri in 0..DOTS_PER_CELL_Y {
+                        let dot_row = row_top + ri;
+                        let dot_set = if show_fill {
+                            dot_row >= top
+                        } else {
+                            dot_row == top
+                        };
+                        if dot_set {
+                            bits |= BRAILLE_BIT[ci][ri];
+                        }
                     }
                 }
-            }
-            if bits == 0 {
-                continue;
-            }
+                if bits == 0 {
+                    continue;
+                }
 
-            // Determine if this cell contains the trace's leading edge in
-            // either column. If so it's "trace"; if entirely below it's "fill".
-            let trace_in_cell =
-                (top_l >= row_top && top_l <= row_bot) || (top_r >= row_top && top_r <= row_bot);
+                // Determine if this cell contains the trace's leading edge in
+                // either column. If so it's "trace"; if entirely below it's "fill".
+                let trace_in_cell = (top_l >= row_top && top_l <= row_bot)
+                    || (top_r >= row_top && top_r <= row_bot);
 
-            // Color is sampled at the topmost set dot in the cell. row 0 = top
-            // → t=1.0; row dot_rows-1 = bottom → t=0.0.
-            let topmost = top_l.min(top_r).max(row_top);
-            let t = if dot_rows > 1 {
-                1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
-            } else {
-                1.0
-            };
-            let mut color = trace.gradient.sample(t);
-            if !trace_in_cell {
-                color = dim(color, dim_factor);
+                // Color is sampled at the topmost set dot in the cell. row 0 = top
+                // → t=1.0; row dot_rows-1 = bottom → t=0.0.
+                let topmost = top_l.min(top_r).max(row_top);
+                let t = if dot_rows > 1 {
+                    1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
+                } else {
+                    1.0
+                };
+                let mut color = trace.gradient.sample(t);
+                if !trace_in_cell {
+                    color = dim(color, dim_factor);
+                }
+
+                let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
+                let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+                cell.set_char(glyph);
+                cell.set_style(Style::default().fg(color));
             }
-
-            let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
-            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
-            cell.set_char(glyph);
-            cell.set_style(Style::default().fg(color));
         }
-    }
+    });
 }
 
 /// Overlay a trace on top of an already-rendered area: OR in the dot bits and
@@ -364,72 +378,77 @@ fn render_braille_overlay(
     let cells_h = area.height as usize;
     let dot_cols = cells_w * DOTS_PER_CELL_X;
     let dot_rows = cells_h * DOTS_PER_CELL_Y;
-    let tops = trace_top_dots(trace, dot_cols, dot_rows);
+    SCRATCH_TOPS.with(|c| {
+        let mut tops = c.borrow_mut();
+        trace_top_dots(trace, dot_cols, dot_rows, &mut tops);
 
-    for cell_x in 0..cells_w {
-        let dx_l = cell_x * DOTS_PER_CELL_X;
-        let dx_r = dx_l + 1;
-        let top_l = tops[dx_l];
-        let top_r = tops[dx_r];
+        for cell_x in 0..cells_w {
+            let dx_l = cell_x * DOTS_PER_CELL_X;
+            let dx_r = dx_l + 1;
+            let top_l = tops[dx_l];
+            let top_r = tops[dx_r];
 
-        for cell_y in 0..cells_h {
-            let row_top = cell_y * DOTS_PER_CELL_Y;
-            let row_bot = row_top + DOTS_PER_CELL_Y - 1;
+            for cell_y in 0..cells_h {
+                let row_top = cell_y * DOTS_PER_CELL_Y;
+                let row_bot = row_top + DOTS_PER_CELL_Y - 1;
 
-            let mut new_bits: u8 = 0;
-            for ci in 0..DOTS_PER_CELL_X {
-                let top = if ci == 0 { top_l } else { top_r };
-                for ri in 0..DOTS_PER_CELL_Y {
-                    let dot_row = row_top + ri;
-                    let set = if show_fill {
-                        dot_row >= top
-                    } else {
-                        dot_row == top
-                    };
-                    if set {
-                        new_bits |= BRAILLE_BIT[ci][ri];
+                let mut new_bits: u8 = 0;
+                for ci in 0..DOTS_PER_CELL_X {
+                    let top = if ci == 0 { top_l } else { top_r };
+                    for ri in 0..DOTS_PER_CELL_Y {
+                        let dot_row = row_top + ri;
+                        let set = if show_fill {
+                            dot_row >= top
+                        } else {
+                            dot_row == top
+                        };
+                        if set {
+                            new_bits |= BRAILLE_BIT[ci][ri];
+                        }
                     }
                 }
-            }
-            if new_bits == 0 {
-                continue;
-            }
+                if new_bits == 0 {
+                    continue;
+                }
 
-            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
-            let existing_glyph = cell.symbol().chars().next().unwrap_or(' ');
-            let existing_bits = if (0x2800..=0x28FF).contains(&(existing_glyph as u32)) {
-                (existing_glyph as u32 - 0x2800) as u8
-            } else {
-                0
-            };
-            let merged = existing_bits | new_bits;
-            let glyph = char::from_u32(0x2800 + merged as u32).unwrap_or('⠀');
-            cell.set_char(glyph);
+                let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+                let existing_glyph = cell.symbol().chars().next().unwrap_or(' ');
+                let existing_bits = if (0x2800..=0x28FF).contains(&(existing_glyph as u32)) {
+                    (existing_glyph as u32 - 0x2800) as u8
+                } else {
+                    0
+                };
+                let merged = existing_bits | new_bits;
+                let glyph = char::from_u32(0x2800 + merged as u32).unwrap_or('⠀');
+                cell.set_char(glyph);
 
-            // Color this cell with the secondary if it has a "higher" trace
-            // (smaller top dot row) in this cell, else leave the existing color.
-            let trace_in_cell =
-                (top_l >= row_top && top_l <= row_bot) || (top_r >= row_top && top_r <= row_bot);
-            if trace_in_cell {
-                let topmost = top_l.min(top_r).max(row_top);
-                let t = if dot_rows > 1 {
-                    1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
-                } else {
-                    1.0
-                };
-                cell.set_style(Style::default().fg(trace.gradient.sample(t)));
-            } else if existing_bits == 0 {
-                // Pure fill cell: dim secondary at this row.
-                let topmost = row_top;
-                let t = if dot_rows > 1 {
-                    1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
-                } else {
-                    1.0
-                };
-                cell.set_style(Style::default().fg(dim(trace.gradient.sample(t), dim_factor)));
+                // Color this cell with the secondary if it has a "higher"
+                // trace (smaller top dot row) in this cell, else keep prior.
+                let trace_in_cell = (top_l >= row_top && top_l <= row_bot)
+                    || (top_r >= row_top && top_r <= row_bot);
+                if trace_in_cell {
+                    let topmost = top_l.min(top_r).max(row_top);
+                    let t = if dot_rows > 1 {
+                        1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
+                    } else {
+                        1.0
+                    };
+                    cell.set_style(Style::default().fg(trace.gradient.sample(t)));
+                } else if existing_bits == 0 {
+                    // Pure fill cell: dim secondary at this row.
+                    let topmost = row_top;
+                    let t = if dot_rows > 1 {
+                        1.0 - (topmost as f32) / ((dot_rows - 1) as f32)
+                    } else {
+                        1.0
+                    };
+                    cell.set_style(
+                        Style::default().fg(dim(trace.gradient.sample(t), dim_factor)),
+                    );
+                }
             }
         }
-    }
+    });
 }
 
 /// Mirrored render: draw the trace from the TOP downward instead of from the
@@ -441,70 +460,78 @@ fn render_braille_mirrored_top(buf: &mut Buffer, area: Rect, trace: &Trace) {
     let dot_rows = cells_h * DOTS_PER_CELL_Y;
 
     // Bottoms (mirror of tops): for each dot column, value v fills rows
-    // 0..floor(v * dot_rows). row 0 = top.
-    let mut bottoms = vec![0usize; dot_cols];
-    let n = trace.data.len();
-    let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
-    let pad = dot_cols.saturating_sub(n);
-    for c in 0..dot_cols {
-        let v = if c < pad {
-            0.0
-        } else {
-            trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
-        };
-        let v = v.clamp(0.0, 1.0);
-        bottoms[c] = ((v * dot_rows as f64).round() as usize).min(dot_rows);
-    }
+    // 0..floor(v * dot_rows). row 0 = top. Reuses SCRATCH_TOPS — same
+    // Vec<usize> shape (length == dot_cols), and the four braille renderers
+    // are called sequentially within a single draw, never nested.
+    SCRATCH_TOPS.with(|c| {
+        let mut bottoms = c.borrow_mut();
+        bottoms.clear();
+        bottoms.resize(dot_cols, 0);
+        let n = trace.data.len();
+        let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
+        let pad = dot_cols.saturating_sub(n);
+        for c in 0..dot_cols {
+            let v = if c < pad {
+                0.0
+            } else {
+                trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
+            };
+            let v = v.clamp(0.0, 1.0);
+            bottoms[c] = ((v * dot_rows as f64).round() as usize).min(dot_rows);
+        }
 
-    for cell_x in 0..cells_w {
-        let dx_l = cell_x * DOTS_PER_CELL_X;
-        let dx_r = dx_l + 1;
-        let bot_l = bottoms[dx_l];
-        let bot_r = bottoms[dx_r];
+        for cell_x in 0..cells_w {
+            let dx_l = cell_x * DOTS_PER_CELL_X;
+            let dx_r = dx_l + 1;
+            let bot_l = bottoms[dx_l];
+            let bot_r = bottoms[dx_r];
 
-        for cell_y in 0..cells_h {
-            let row_top = cell_y * DOTS_PER_CELL_Y;
-            let row_bot = row_top + DOTS_PER_CELL_Y - 1;
+            for cell_y in 0..cells_h {
+                let row_top = cell_y * DOTS_PER_CELL_Y;
+                let row_bot = row_top + DOTS_PER_CELL_Y - 1;
 
-            let mut bits: u8 = 0;
-            for ci in 0..DOTS_PER_CELL_X {
-                let bottom = if ci == 0 { bot_l } else { bot_r };
-                for ri in 0..DOTS_PER_CELL_Y {
-                    let dot_row = row_top + ri;
-                    if dot_row < bottom {
-                        bits |= BRAILLE_BIT[ci][ri];
+                let mut bits: u8 = 0;
+                for ci in 0..DOTS_PER_CELL_X {
+                    let bottom = if ci == 0 { bot_l } else { bot_r };
+                    for ri in 0..DOTS_PER_CELL_Y {
+                        let dot_row = row_top + ri;
+                        if dot_row < bottom {
+                            bits |= BRAILLE_BIT[ci][ri];
+                        }
                     }
                 }
-            }
-            if bits == 0 {
-                continue;
-            }
+                if bits == 0 {
+                    continue;
+                }
 
-            let trace_in_cell =
-                (bot_l > row_top && bot_l <= row_bot + 1)
+                let trace_in_cell = (bot_l > row_top && bot_l <= row_bot + 1)
                     || (bot_r > row_top && bot_r <= row_bot + 1);
-            let bottommost = bot_l.max(bot_r).min(row_bot + 1).saturating_sub(1);
-            let t = if dot_rows > 1 {
-                1.0 - (bottommost as f32) / ((dot_rows - 1) as f32)
-            } else {
-                1.0
-            };
-            let mut color = trace.gradient.sample(t);
-            if !trace_in_cell {
-                color = dim(color, DEFAULT_DIM_FILL);
+                let bottommost = bot_l.max(bot_r).min(row_bot + 1).saturating_sub(1);
+                let t = if dot_rows > 1 {
+                    1.0 - (bottommost as f32) / ((dot_rows - 1) as f32)
+                } else {
+                    1.0
+                };
+                let mut color = trace.gradient.sample(t);
+                if !trace_in_cell {
+                    color = dim(color, DEFAULT_DIM_FILL);
+                }
+                let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
+                let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+                cell.set_char(glyph);
+                cell.set_style(Style::default().fg(color));
             }
-            let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
-            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
-            cell.set_char(glyph);
-            cell.set_style(Style::default().fg(color));
         }
-    }
+    });
 }
 
-/// For each dot column, return the index of the topmost set dot row. A return
-/// value equal to `dot_rows` means "no dots in this column."
-fn trace_top_dots(trace: &Trace, dot_cols: usize, dot_rows: usize) -> Vec<usize> {
-    let mut tops = vec![dot_rows; dot_cols];
+/// Fill `out` with the index of the topmost set dot row for each dot column.
+/// A value equal to `dot_rows` means "no dots in this column." Reuses the
+/// caller-provided buffer (length is reset, capacity retained) so the hot
+/// render path doesn't allocate per frame.
+fn trace_top_dots(trace: &Trace, dot_cols: usize, dot_rows: usize, out: &mut Vec<usize>) {
+    out.clear();
+    out.resize(dot_cols, dot_rows);
     let n = trace.data.len();
     let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
     let pad = dot_cols.saturating_sub(n);
@@ -523,9 +550,8 @@ fn trace_top_dots(trace: &Trace, dot_cols: usize, dot_rows: usize) -> Vec<usize>
             continue;
         }
         let top = dot_rows - height;
-        tops[c] = top;
+        out[c] = top;
     }
-    tops
 }
 
 // ---------------------------------------------------------------------------
@@ -551,56 +577,61 @@ fn render_braille_centered(buf: &mut Buffer, area: Rect, trace: &Trace) {
     let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
     let pad = dot_cols.saturating_sub(n);
 
-    // Per-column fill range (lo..hi over dot rows).
-    let mut ranges: Vec<(i32, i32)> = Vec::with_capacity(dot_cols);
-    for c in 0..dot_cols {
-        let v = if c < pad {
-            0.0
-        } else {
-            trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
-        };
-        let v = v.clamp(0.0, 1.0);
-        // Total filled dots = round(v * dot_rows). Always at least 1 so a
-        // value of 0 still draws a thin centerline reference.
-        let total = ((v * dot_rows as f64).round() as i32).max(1);
-        let half = total / 2;
-        let extra = total - 2 * half; // 1 when total is odd, 0 when even
-        let lo = (center - half).max(0);
-        let hi = (center + half + extra).min(dot_rows as i32);
-        ranges.push((lo, hi));
-    }
+    // Per-column fill range (lo..hi over dot rows). Reuses thread-local
+    // scratch — capacity grows monotonically so steady-state allocs == 0.
+    SCRATCH_RANGES.with(|c| {
+        let mut ranges = c.borrow_mut();
+        ranges.clear();
+        ranges.reserve(dot_cols);
+        for c in 0..dot_cols {
+            let v = if c < pad {
+                0.0
+            } else {
+                trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
+            };
+            let v = v.clamp(0.0, 1.0);
+            // Total filled dots = round(v * dot_rows). Always at least 1 so a
+            // value of 0 still draws a thin centerline reference.
+            let total = ((v * dot_rows as f64).round() as i32).max(1);
+            let half = total / 2;
+            let extra = total - 2 * half; // 1 when total is odd, 0 when even
+            let lo = (center - half).max(0);
+            let hi = (center + half + extra).min(dot_rows as i32);
+            ranges.push((lo, hi));
+        }
 
-    for cell_x in 0..cells_w {
-        for cell_y in 0..cells_h {
-            let row_top = (cell_y * DOTS_PER_CELL_Y) as i32;
+        for cell_x in 0..cells_w {
+            for cell_y in 0..cells_h {
+                let row_top = (cell_y * DOTS_PER_CELL_Y) as i32;
 
-            let mut bits: u8 = 0;
-            for ci in 0..DOTS_PER_CELL_X {
-                let dx = cell_x * DOTS_PER_CELL_X + ci;
-                let (lo, hi) = ranges[dx];
-                for ri in 0..DOTS_PER_CELL_Y {
-                    let dot_row = row_top + ri as i32;
-                    if dot_row >= lo && dot_row < hi {
-                        bits |= BRAILLE_BIT[ci][ri];
+                let mut bits: u8 = 0;
+                for ci in 0..DOTS_PER_CELL_X {
+                    let dx = cell_x * DOTS_PER_CELL_X + ci;
+                    let (lo, hi) = ranges[dx];
+                    for ri in 0..DOTS_PER_CELL_Y {
+                        let dot_row = row_top + ri as i32;
+                        if dot_row >= lo && dot_row < hi {
+                            bits |= BRAILLE_BIT[ci][ri];
+                        }
                     }
                 }
-            }
-            if bits == 0 {
-                continue;
-            }
-            // Color by cell's vertical distance from the centerline.
-            let cell_center_dot = row_top + (DOTS_PER_CELL_Y as i32) / 2;
-            let dist = (cell_center_dot - center).abs() as f32;
-            let max_dist = ((dot_rows as i32) / 2).max(1) as f32;
-            let t = (dist / max_dist).clamp(0.0, 1.0);
-            let color = trace.gradient.sample(t);
+                if bits == 0 {
+                    continue;
+                }
+                // Color by cell's vertical distance from the centerline.
+                let cell_center_dot = row_top + (DOTS_PER_CELL_Y as i32) / 2;
+                let dist = (cell_center_dot - center).abs() as f32;
+                let max_dist = ((dot_rows as i32) / 2).max(1) as f32;
+                let t = (dist / max_dist).clamp(0.0, 1.0);
+                let color = trace.gradient.sample(t);
 
-            let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
-            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
-            cell.set_char(glyph);
-            cell.set_style(Style::default().fg(color));
+                let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
+                let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+                cell.set_char(glyph);
+                cell.set_style(Style::default().fg(color));
+            }
         }
-    }
+    });
 }
 
 /// Render a single trace into one half of the centered-split layout.
@@ -769,7 +800,8 @@ mod tests {
         for _ in 0..4 {
             t.push(1.0);
         }
-        let tops = trace_top_dots(&t, 8, 4);
+        let mut tops = Vec::new();
+        trace_top_dots(&t, 8, 4, &mut tops);
         assert_eq!(tops, vec![4, 4, 4, 4, 0, 0, 0, 0]);
     }
 

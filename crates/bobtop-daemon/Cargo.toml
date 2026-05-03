@@ -32,6 +32,13 @@ toml = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "render_loop"
+harness = false
+
 [features]
 # eBPF on by default — build.rs in bobtop-net gracefully no-ops when
 # clang/libbpf-dev aren't present, so the daemon still builds on bare-bones

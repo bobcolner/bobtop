@@ -22,7 +22,9 @@ pub struct Cli {
     /// Global update tick in milliseconds. Every collector — CPU, memory,
     /// network, disk, processes — samples on this single cadence (matches
     /// btop's `update_ms` model). Live-tunable in the TUI with `+` / `-`.
-    #[arg(long, alias = "interval-ms", default_value_t = 500)]
+    /// Default 1500 ms matches btop's recommended cadence — calm by default,
+    /// tune down for finer-grained traces.
+    #[arg(long, alias = "interval-ms", default_value_t = 1500)]
     pub tick_ms: u64,
 
     /// Layout preset.

@@ -15,12 +15,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod boxes;
 pub mod bus;
 pub mod collector;
 pub mod error;
 pub mod event;
 pub mod sample;
 
+pub use boxes::{Box, BoxesEnabled};
 pub use bus::DataBus;
 pub use collector::Collector;
 pub use error::{CoreError, Result};

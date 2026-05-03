@@ -5,7 +5,10 @@
 //! - `restore_terminal` is the safe path on normal shutdown.
 //! - `spawn_input_thread` shoves crossterm events onto an mpsc — the actual
 //!   `event::read` is blocking, so it lives on its own OS thread.
-//! - `run` is the 60Hz event loop: drain the bus + input, then redraw.
+//! - `run` is event-driven: it wakes on a bus event, an input event, or a
+//!   slow heartbeat, then redraws only if `App::take_dirty()` is true.
+//!   At idle (no metrics arriving, no keystrokes) this draws zero frames,
+//!   matching btop's "draw on change" cost model.
 
 use std::io::{self, Stdout, Write};
 use std::sync::{Arc, Mutex};
@@ -28,7 +31,10 @@ use crate::ui;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
-const FRAME_INTERVAL: Duration = Duration::from_millis(16); // ≈ 60fps
+/// Slow heartbeat: ensures we still wake up periodically even with no bus
+/// activity (so future time-derived UI like a clock or uptime overlay can
+/// repaint). Independent of metric tick — just a "are we still alive" tick.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub fn init_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
@@ -80,7 +86,10 @@ pub fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
     rx
 }
 
-/// Drive the terminal at ~60Hz: drain the bus + input, redraw, repeat.
+/// Event-driven render loop. Wakes on a bus event, an input event, or
+/// the heartbeat tick — then redraws only if `App` is marked dirty. Idle
+/// terminals (no metrics flowing, no keystrokes) draw exactly one frame
+/// per `HEARTBEAT_INTERVAL`, not 60 per second.
 pub async fn run(
     term: &mut Term,
     app: Arc<Mutex<App>>,
@@ -88,8 +97,16 @@ pub async fn run(
     mut input_rx: mpsc::UnboundedReceiver<Event>,
 ) -> io::Result<()> {
     let mut bus_rx = bus.subscribe();
-    let mut tick = tokio::time::interval(FRAME_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Paint the initial frame so users see the layout immediately rather
+    // than a blank alt-screen until the first sample arrives.
+    {
+        let mut g = lock(&app);
+        g.take_dirty();
+        term.draw(|f| ui::draw(f, &g))?;
+    }
 
     loop {
         tokio::select! {
@@ -98,37 +115,62 @@ pub async fn run(
                 tracing::info!("ctrl-c received, shutting down");
                 return Ok(());
             }
-            _ = tick.tick() => {
-                // Drain pending bus events. ALL event types apply — earlier
-                // versions had a separate "inter-tick" select arm that
-                // consumed events from the bus but only applied CPU/Mem/Process,
-                // silently dropping Network and Disk events. Removed.
-                loop {
-                    match bus_rx.try_recv() {
-                        Ok(ev) => {
-                            let mut g = lock(&app);
-                            g.apply_event(ev);
-                        }
-                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return Ok(()),
-                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                            tracing::warn!(skipped = n, "bus receiver lagged");
-                        }
-                    }
-                }
-                // Drain pending input.
-                while let Ok(ev) = input_rx.try_recv() {
-                    let flow = {
+            recv = bus_rx.recv() => {
+                match recv {
+                    Ok(ev) => {
                         let mut g = lock(&app);
-                        g.handle_input(ev)
-                    };
-                    if matches!(flow, ControlFlow::Quit) {
-                        return Ok(());
+                        g.apply_event(ev);
+                        // Drain any other events that piled up while we were
+                        // parked, so a burst of samples turns into one frame
+                        // not N frames.
+                        drain_bus(&mut bus_rx, &mut g);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "bus receiver lagged");
+                        continue;
                     }
                 }
-                // Render with a snapshot reference (lock held only for the draw).
-                let g = lock(&app);
-                term.draw(|f| ui::draw(f, &g))?;
+            }
+            input = input_rx.recv() => {
+                match input {
+                    Some(ev) => {
+                        let flow = {
+                            let mut g = lock(&app);
+                            g.handle_input(ev)
+                        };
+                        if matches!(flow, ControlFlow::Quit) {
+                            return Ok(());
+                        }
+                    }
+                    None => return Ok(()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                // No-op wake; falls through to the dirty check below so
+                // any time-derived UI (clock/uptime, future) can repaint.
+            }
+        }
+
+        // One redraw per wake, gated on dirty so idle ticks are free.
+        let mut g = lock(&app);
+        if g.take_dirty() {
+            term.draw(|f| ui::draw(f, &g))?;
+        }
+    }
+}
+
+fn drain_bus(
+    rx: &mut tokio::sync::broadcast::Receiver<bobtop_core::MetricEvent>,
+    app: &mut App,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => app.apply_event(ev),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "bus receiver lagged");
             }
         }
     }

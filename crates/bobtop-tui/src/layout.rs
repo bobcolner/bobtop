@@ -24,12 +24,31 @@
 //!
 //! Just CPU on top + PROC below — useful at narrow terminal widths.
 
+use bobtop_core::Box as BoxKind;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutPreset {
     Full,
     Minimal,
+}
+
+impl LayoutPreset {
+    /// Which collector boxes are visible in this preset. The daemon mirrors
+    /// the result into the shared `BoxesEnabled` so hidden collectors skip
+    /// their work — same trick btop uses to keep idle CPU low.
+    pub fn enabled_boxes(self) -> &'static [BoxKind] {
+        match self {
+            LayoutPreset::Full => &[
+                BoxKind::Cpu,
+                BoxKind::Memory,
+                BoxKind::Disk,
+                BoxKind::Network,
+                BoxKind::Process,
+            ],
+            LayoutPreset::Minimal => &[BoxKind::Cpu, BoxKind::Process],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

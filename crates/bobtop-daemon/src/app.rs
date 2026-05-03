@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use bobtop_core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
 };
-use bobtop_core::MetricEvent;
+use bobtop_core::{BoxesEnabled, MetricEvent};
 use bobtop_net::{AttributorTier, ProcessNetSample};
 use bobtop_tui::widgets::ProcessSort;
 use bobtop_tui::{LayoutPreset, Theme};
@@ -38,6 +38,12 @@ pub struct App {
     pub layout_preset: LayoutPreset,
     pub tty_graphs: bool,
     pub show_virtual_net: bool,
+
+    /// Per-box visibility shared with collectors. When a box is disabled,
+    /// its collector tick wakes, checks the bit, and goes back to sleep
+    /// without doing the (expensive) sample. Mirrors `layout_preset`'s
+    /// `enabled_boxes()` set whenever the preset changes.
+    pub boxes: BoxesEnabled,
 
     #[allow(dead_code)] // Used by future "uptime" / session-duration overlays.
     pub started_at: Instant,
@@ -72,6 +78,12 @@ pub struct App {
     pub proc_sort: ProcessSort,
     /// Sort direction for `proc_sort`. Toggled by `r`.
     pub proc_sort_descending: bool,
+
+    /// Set by `apply_event` and `handle_input` whenever something
+    /// observable to the renderer has changed. Cleared by `take_dirty`
+    /// after the render loop calls `terminal.draw()`. Lets us render
+    /// on change instead of on a 60Hz heartbeat — see `tui::run`.
+    dirty: bool,
 }
 
 impl App {
@@ -82,11 +94,13 @@ impl App {
         tty_graphs: bool,
         show_virtual_net: bool,
     ) -> Self {
+        let boxes = BoxesEnabled::with(layout_preset.enabled_boxes());
         Self {
             theme,
             layout_preset,
             tty_graphs,
             show_virtual_net,
+            boxes,
             started_at: Instant::now(),
             tick_ms,
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_CAP),
@@ -104,10 +118,27 @@ impl App {
             scroll_offset: 0,
             proc_sort: ProcessSort::Cpu,
             proc_sort_descending: true,
+            // Start dirty so the very first frame paints something rather
+            // than a blank alt-screen until the first sample lands.
+            dirty: true,
         }
     }
 
+    /// Atomically read-and-clear the dirty flag. The render loop calls this
+    /// to decide whether to skip `terminal.draw()` this iteration.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
+    }
+
+    /// Mark state as observably changed. Anything that mutates a field
+    /// `ui::draw` reads should call this (apply_event, handle_input
+    /// branches that change selection/sort/layout/tick).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn apply_event(&mut self, ev: MetricEvent) {
+        self.dirty = true;
         match ev {
             MetricEvent::Cpu(s) => {
                 if self.cpu_history.len() == CPU_HISTORY_CAP {
@@ -187,6 +218,7 @@ impl App {
         self.net_samples = samples;
         self.net_tier = tier;
         self.rebuild_sorted();
+        self.dirty = true;
     }
 
     /// Rebuild `processes_sorted` from `latest_processes`, joining in
@@ -247,6 +279,14 @@ impl App {
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
     }
 
+    /// Switch the layout preset and mirror the new visible-box set into
+    /// the shared `BoxesEnabled` so collectors for hidden boxes stop
+    /// doing work on their next wake.
+    pub fn set_layout(&mut self, preset: LayoutPreset) {
+        self.layout_preset = preset;
+        self.boxes.replace(preset.enabled_boxes());
+    }
+
     pub fn toggle_sort_direction(&mut self) {
         self.proc_sort_descending = !self.proc_sort_descending;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
@@ -257,7 +297,14 @@ impl App {
         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
             return ControlFlow::Quit;
         }
-        self.handle_key(k)
+        // Every recognized key either quits or mutates rendered state
+        // (selection, sort, layout, tick). Cheaper to mark unconditionally
+        // here than to thread `mark_dirty()` through each branch.
+        let flow = self.handle_key(k);
+        if matches!(flow, ControlFlow::Continue) {
+            self.dirty = true;
+        }
+        flow
     }
 
     fn handle_key(&mut self, k: KeyEvent) -> ControlFlow {
@@ -265,11 +312,11 @@ impl App {
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
             KeyCode::Char('1') => {
-                self.layout_preset = LayoutPreset::Full;
+                self.set_layout(LayoutPreset::Full);
                 ControlFlow::Continue
             }
             KeyCode::Char('m') => {
-                self.layout_preset = LayoutPreset::Minimal;
+                self.set_layout(LayoutPreset::Minimal);
                 ControlFlow::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -463,6 +510,49 @@ mod tests {
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(app.handle_input(ev), ControlFlow::Quit);
+    }
+
+    #[test]
+    fn layout_switch_updates_boxes_enabled() {
+        use bobtop_core::Box as BoxKind;
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        for b in BoxKind::ALL {
+            assert!(app.boxes.is_enabled(b), "{b:?} should start enabled in Full");
+        }
+        app.set_layout(LayoutPreset::Minimal);
+        assert!(app.boxes.is_enabled(BoxKind::Cpu));
+        assert!(app.boxes.is_enabled(BoxKind::Process));
+        assert!(!app.boxes.is_enabled(BoxKind::Memory));
+        assert!(!app.boxes.is_enabled(BoxKind::Disk));
+        assert!(!app.boxes.is_enabled(BoxKind::Network));
+        app.set_layout(LayoutPreset::Full);
+        for b in BoxKind::ALL {
+            assert!(app.boxes.is_enabled(b), "{b:?} should re-enable on Full");
+        }
+    }
+
+    #[test]
+    fn dirty_flag_set_by_event_and_input_cleared_by_take() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        // Starts dirty so the first frame paints.
+        assert!(app.take_dirty());
+        assert!(!app.take_dirty(), "consecutive take_dirty should clear");
+
+        app.apply_event(MetricEvent::Cpu(fake_cpu(0.3)));
+        assert!(app.take_dirty(), "apply_event must mark dirty");
+
+        let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_input(down);
+        assert!(app.take_dirty(), "handle_input on a recognized key must mark dirty");
+
+        // Quit-path keys don't matter for dirty (we exit immediately).
+        let _ = app.take_dirty();
+        let unrelated = Event::Key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        app.handle_input(unrelated);
+        // F12 hits the `_ => Continue` branch — that branch still marks dirty.
+        // We accept that as a small over-paint cost in exchange for not
+        // threading mark_dirty into every match arm.
+        assert!(app.take_dirty());
     }
 
     #[test]
