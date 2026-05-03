@@ -43,6 +43,7 @@ fn compile_bpf() {
             "-target",
             "bpf",
             "-D__TARGET_ARCH_x86",
+            "-mcpu=v3",
             "-c",
         ])
         .arg("-I")
@@ -54,9 +55,27 @@ fn compile_bpf() {
 
     match status {
         Ok(s) if s.success() => {
+            // Strip DWARF debug sections — keep `.BTF` / `.BTF.ext` because
+            // aya needs them, but drop `.debug_*` (DWARF) which aya 0.13's
+            // ELF parser rejects with "error parsing ELF data". `llvm-strip`
+            // ships with clang.
+            let strip_status = Command::new("llvm-strip")
+                .args(["--strip-debug"])
+                .arg(&obj)
+                .status()
+                .or_else(|_| {
+                    // Some distros only ship versioned llvm-strip binaries.
+                    Command::new("llvm-strip-19")
+                        .args(["--strip-debug"])
+                        .arg(&obj)
+                        .status()
+                });
+            if let Err(e) = strip_status {
+                println!(
+                    "cargo:warning=llvm-strip not available ({e}); aya may fail to load the BPF object — install LLVM"
+                );
+            }
             println!("cargo:rustc-env=BOBTOP_BPF_OBJ={}", obj.display());
-            // Convey build success to the loader via a cfg, so we don't need
-            // to runtime-check `BPF_OBJECT.is_empty()`.
             println!("cargo:rustc-cfg=bobtop_bpf_built");
         }
         Ok(s) => {

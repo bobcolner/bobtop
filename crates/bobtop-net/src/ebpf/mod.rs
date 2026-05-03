@@ -96,7 +96,18 @@ impl EbpfAttributor {
             return Err(NetError::MissingCapability("CAP_BPF or root"));
         }
 
-        let mut ebpf = aya::Ebpf::load(BPF_OBJECT)
+        // IMPORTANT: use `EbpfLoader` rather than the convenience
+        // `aya::Ebpf::load(...)`. Despite the docs claiming they're
+        // equivalent, the convenience function in aya 0.13.1 does an
+        // additional kernel-BTF probe at load time that fails on hosts
+        // whose kernel BTF doesn't match the BPF object exactly, returning
+        // the cryptic "error parsing ELF data". `EbpfLoader::new()` skips
+        // that probe and parses the bytes directly. Verified by sha256:
+        // identical bytes that this loader rejects, the standalone aya
+        // example accepts. Don't switch back without retesting on a host
+        // where this previously failed.
+        let mut ebpf = aya::EbpfLoader::new()
+            .load(BPF_OBJECT)
             .map_err(|e| NetError::Backend { backend: "aya-load", source: Box::new(e) })?;
 
         attach_kprobe(&mut ebpf, SEND_PROG, "tcp_sendmsg")?;

@@ -49,8 +49,15 @@ const BRAILLE_BIT: [[u8; DOTS_PER_CELL_Y]; DOTS_PER_CELL_X] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GraphStyle {
+    /// Standard fill-from-bottom braille trace.
     Braille,
+    /// Block-density characters (▁▂▃▄▅▆▇█) — TTY fallback.
     Blocks,
+    /// Trace blooms outward from a horizontal centerline. Value 0 = thin
+    /// 1-dot band at center, value 0.5 = fills middle 50%, value 1 = fills
+    /// the entire area. Color sampled by distance-from-center: gradient
+    /// `start` at the centerline, `end` at the edges.
+    CenteredBloom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +215,22 @@ impl Widget for &BrailleGraph {
                     // Block mode just overlays the second trace; no mirror.
                     render_blocks(buf, area, sec);
                 }
+            }
+            (GraphStyle::CenteredBloom, Some(sec), _) => {
+                // Dual-trace: split area at center. Top half = secondary
+                // (e.g. upload) blooming UP from center toward top edge;
+                // bottom half = primary (download) blooming DOWN from
+                // center toward bottom edge. Empty middle band when both
+                // are quiet.
+                let top_h = area.height / 2;
+                let bot_h = area.height - top_h;
+                let top = Rect { x: area.x, y: area.y, width: area.width, height: top_h };
+                let bot = Rect { x: area.x, y: area.y + top_h, width: area.width, height: bot_h };
+                render_braille_centered_half(buf, top, sec, /*grow_upward*/ true);
+                render_braille_centered_half(buf, bot, &self.primary, false);
+            }
+            (GraphStyle::CenteredBloom, None, _) => {
+                render_braille_centered(buf, area, &self.primary);
             }
         }
         render_overlays(self, area, buf);
@@ -503,6 +526,152 @@ fn trace_top_dots(trace: &Trace, dot_cols: usize, dot_rows: usize) -> Vec<usize>
         tops[c] = top;
     }
     tops
+}
+
+// ---------------------------------------------------------------------------
+// Centered-bloom braille
+// ---------------------------------------------------------------------------
+
+/// Render a trace as a "centered bloom" — for each dot column, the value
+/// determines how many dot rows are filled, anchored at the *center*
+/// horizontal line and growing symmetrically outward. Color is sampled by
+/// distance from center: `start` at the centerline, `end` at the edges.
+fn render_braille_centered(buf: &mut Buffer, area: Rect, trace: &Trace) {
+    let cells_w = area.width as usize;
+    let cells_h = area.height as usize;
+    let dot_cols = cells_w * DOTS_PER_CELL_X;
+    let dot_rows = cells_h * DOTS_PER_CELL_Y;
+    if dot_rows == 0 {
+        return;
+    }
+    let center = dot_rows as i32 / 2;
+
+    // Right-align data: newest sample on the right.
+    let n = trace.data.len();
+    let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
+    let pad = dot_cols.saturating_sub(n);
+
+    // Per-column fill range (lo..hi over dot rows).
+    let mut ranges: Vec<(i32, i32)> = Vec::with_capacity(dot_cols);
+    for c in 0..dot_cols {
+        let v = if c < pad {
+            0.0
+        } else {
+            trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
+        };
+        let v = v.clamp(0.0, 1.0);
+        // Total filled dots = round(v * dot_rows). Always at least 1 so a
+        // value of 0 still draws a thin centerline reference.
+        let total = ((v * dot_rows as f64).round() as i32).max(1);
+        let half = total / 2;
+        let extra = total - 2 * half; // 1 when total is odd, 0 when even
+        let lo = (center - half).max(0);
+        let hi = (center + half + extra).min(dot_rows as i32);
+        ranges.push((lo, hi));
+    }
+
+    for cell_x in 0..cells_w {
+        for cell_y in 0..cells_h {
+            let row_top = (cell_y * DOTS_PER_CELL_Y) as i32;
+
+            let mut bits: u8 = 0;
+            for ci in 0..DOTS_PER_CELL_X {
+                let dx = cell_x * DOTS_PER_CELL_X + ci;
+                let (lo, hi) = ranges[dx];
+                for ri in 0..DOTS_PER_CELL_Y {
+                    let dot_row = row_top + ri as i32;
+                    if dot_row >= lo && dot_row < hi {
+                        bits |= BRAILLE_BIT[ci][ri];
+                    }
+                }
+            }
+            if bits == 0 {
+                continue;
+            }
+            // Color by cell's vertical distance from the centerline.
+            let cell_center_dot = row_top + (DOTS_PER_CELL_Y as i32) / 2;
+            let dist = (cell_center_dot - center).abs() as f32;
+            let max_dist = ((dot_rows as i32) / 2).max(1) as f32;
+            let t = (dist / max_dist).clamp(0.0, 1.0);
+            let color = trace.gradient.sample(t);
+
+            let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
+            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+            cell.set_char(glyph);
+            cell.set_style(Style::default().fg(color));
+        }
+    }
+}
+
+/// Render a single trace into one half of the centered-split layout.
+/// `grow_upward = true`: the trace anchors at the BOTTOM edge of `area` and
+/// fills upward as value increases (used for the TOP half of a centered
+/// split — visually, the trace blooms upward away from the centerline).
+/// `grow_upward = false`: anchors at the TOP edge, fills downward.
+fn render_braille_centered_half(buf: &mut Buffer, area: Rect, trace: &Trace, grow_upward: bool) {
+    let cells_w = area.width as usize;
+    let cells_h = area.height as usize;
+    let dot_cols = cells_w * DOTS_PER_CELL_X;
+    let dot_rows = cells_h * DOTS_PER_CELL_Y;
+    if dot_rows == 0 {
+        return;
+    }
+    let n = trace.data.len();
+    let start_offset = if n >= dot_cols { n - dot_cols } else { 0 };
+    let pad = dot_cols.saturating_sub(n);
+
+    let mut spans: Vec<(i32, i32)> = Vec::with_capacity(dot_cols);
+    for c in 0..dot_cols {
+        let v = if c < pad {
+            0.0
+        } else {
+            trace.data.get(start_offset + (c - pad)).copied().unwrap_or(0.0)
+        };
+        let v = v.clamp(0.0, 1.0);
+        let filled = ((v * dot_rows as f64).round() as i32).min(dot_rows as i32);
+        if grow_upward {
+            // Anchor at bottom of this half (= centerline of the whole panel),
+            // grow upward.
+            let lo = (dot_rows as i32 - filled).max(0);
+            let hi = dot_rows as i32;
+            spans.push((lo, hi));
+        } else {
+            // Anchor at top of this half (= centerline), grow downward.
+            spans.push((0, filled));
+        }
+    }
+
+    for cell_x in 0..cells_w {
+        for cell_y in 0..cells_h {
+            let row_top = (cell_y * DOTS_PER_CELL_Y) as i32;
+            let mut bits: u8 = 0;
+            for ci in 0..DOTS_PER_CELL_X {
+                let dx = cell_x * DOTS_PER_CELL_X + ci;
+                let (lo, hi) = spans[dx];
+                for ri in 0..DOTS_PER_CELL_Y {
+                    let dot_row = row_top + ri as i32;
+                    if dot_row >= lo && dot_row < hi {
+                        bits |= BRAILLE_BIT[ci][ri];
+                    }
+                }
+            }
+            if bits == 0 {
+                continue;
+            }
+            // Color sampled by row's distance from the centerline (i.e. the
+            // edge of the half that's adjacent to the other half).
+            let cell_center_dot = row_top + (DOTS_PER_CELL_Y as i32) / 2;
+            let centerline_dot = if grow_upward { dot_rows as i32 } else { 0 };
+            let dist = (cell_center_dot - centerline_dot).abs() as f32;
+            let max_dist = (dot_rows as i32).max(1) as f32;
+            let t = (dist / max_dist).clamp(0.0, 1.0);
+            let color = trace.gradient.sample(t);
+            let glyph = char::from_u32(0x2800 + bits as u32).unwrap_or('⠀');
+            let cell = &mut buf[(area.x + cell_x as u16, area.y + cell_y as u16)];
+            cell.set_char(glyph);
+            cell.set_style(Style::default().fg(color));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

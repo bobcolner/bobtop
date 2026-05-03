@@ -14,13 +14,9 @@ use bobtop_net::{select as select_attributor, NetworkAttributor, SelectOptions};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
 use clap::Parser;
 
-mod app;
-mod cli;
-mod tui;
-mod ui;
-
-use crate::app::App;
-use crate::cli::{Cli, LayoutChoice};
+use bobtop_daemon::app::App;
+use bobtop_daemon::cli::{Cli, LayoutChoice};
+use bobtop_daemon::tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {

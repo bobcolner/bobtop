@@ -68,20 +68,19 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
     let graph_area = Rect::new(inner.x, inner.y, split, inner.height);
     let meters_area = Rect::new(inner.x + split, inner.y, inner.width - split, inner.height);
 
-    // Centered mirror: same trace fed into both primary (bottom-up) and
-    // secondary (top-down). Values bloom symmetrically from the center line.
+    // CenteredBloom: trace blooms outward from a horizontal centerline
+    // — value 0 = thin line at center, value 1 = full fill. Color sampled
+    // by distance-from-center: gradient.start at the line, .end at edges.
     let max_pts = (graph_area.width as usize) * 2;
     let mut graph = BrailleGraph::new(max_pts, app.theme.cpu)
         .with_value_fn(|v| format!("{:>5.1}%", v * 100.0))
-        .with_secondary(
-            bobtop_tui::widgets::Trace::new(max_pts, app.theme.cpu),
-            bobtop_tui::widgets::DualMode::MirroredSplit,
-        );
-    if app.tty_graphs {
-        graph = graph.with_style(GraphStyle::Blocks);
-    }
+        .with_style(if app.tty_graphs {
+            GraphStyle::Blocks
+        } else {
+            GraphStyle::CenteredBloom
+        });
     for v in app.cpu_history.iter().copied() {
-        graph.push_dual(v, v);
+        graph.push(v);
     }
     frame.render_widget(&graph, graph_area);
 
@@ -144,19 +143,17 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
         inner.y + inner.height - meters_y,
     );
 
-    // Centered mirror, like CPU + net — single trace blooms from center.
+    // CenteredBloom: trace blooms outward from horizontal centerline.
     let mem_max_pts = graph_area.width as usize * 2;
     let mut mem_graph = BrailleGraph::new(mem_max_pts, app.theme.used)
         .with_value_fn(|v| format!("{:>5.1}%", v * 100.0))
-        .with_secondary(
-            bobtop_tui::widgets::Trace::new(mem_max_pts, app.theme.used),
-            bobtop_tui::widgets::DualMode::MirroredSplit,
-        );
-    if app.tty_graphs {
-        mem_graph = mem_graph.with_style(GraphStyle::Blocks);
-    }
+        .with_style(if app.tty_graphs {
+            GraphStyle::Blocks
+        } else {
+            GraphStyle::CenteredBloom
+        });
     for v in app.mem_history.iter().copied() {
-        mem_graph.push_dual(v, v);
+        mem_graph.push(v);
     }
     frame.render_widget(&mem_graph, graph_area);
 
@@ -314,16 +311,17 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Centered split graph: top half = upload mirrored down from center,
-    // bottom half = download up from center. MirroredSplit handles the math.
-    let mut graph = BrailleGraph::new((inner.width as usize) * 2, app.theme.download)
-        .with_secondary(
-            Trace::new((inner.width as usize) * 2, app.theme.upload),
-            DualMode::MirroredSplit,
-        );
-    if app.tty_graphs {
-        graph = graph.with_style(GraphStyle::Blocks);
-    }
+    // CenteredBloom split: upload (secondary) blooms UP from the center
+    // line; download (primary) blooms DOWN from the center line. Idle
+    // network = thin band at center; busy = traces reach toward edges.
+    let max_pts = (inner.width as usize) * 2;
+    let mut graph = BrailleGraph::new(max_pts, app.theme.download)
+        .with_secondary(Trace::new(max_pts, app.theme.upload), DualMode::MirroredSplit)
+        .with_style(if app.tty_graphs {
+            GraphStyle::Blocks
+        } else {
+            GraphStyle::CenteredBloom
+        });
     for (rx, tx) in app.net_normalized_history() {
         graph.push_dual(rx, tx);
     }
