@@ -10,10 +10,16 @@
 use bobtop_core::sample::ProcessInfo;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use crate::Theme;
+
+/// How aggressively rows fade toward `inactive_fg` as their visible index
+/// grows. `0.0` = no fade (matches old behavior); `1.0` = bottom row fully
+/// at `inactive_fg`. btop uses a similar darkening pass for visual depth —
+/// keeping it modest so contrast on long lists doesn't get unreadable.
+const FADE_END: f32 = 0.55;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSort {
@@ -176,16 +182,23 @@ impl<'a> Widget for &ProcessTable<'a> {
             .skip(self.scroll_offset)
             .take(body_h);
 
+        let max_visible = body_h.max(1);
         for (i, (row_idx, p)) in visible.enumerate() {
             let y = body_top + i as u16;
             let is_selected = self.selected == Some(row_idx);
+
+            // Linear fade from main_fg toward inactive_fg, scaled by FADE_END.
+            // Selected row keeps its own (high-contrast) palette and is exempt
+            // from the fade so it stays scannable at the bottom of the list.
+            let fade_t = (i as f32 / max_visible as f32) * FADE_END;
+            let row_fg = lerp_color(self.theme.main_fg, self.theme.inactive_fg, fade_t);
 
             let base_style = if is_selected {
                 Style::default()
                     .bg(self.theme.selected_bg)
                     .fg(self.theme.selected_fg)
             } else {
-                Style::default().fg(self.theme.main_fg)
+                Style::default().fg(row_fg)
             };
 
             // Background fill on selected row across the entire row width.
@@ -207,9 +220,9 @@ impl<'a> Widget for &ProcessTable<'a> {
                 let mut style = base_style;
                 if !is_selected {
                     if cols[idx].title == "CPU%" {
-                        style = style.fg(cpu_color);
+                        style = style.fg(lerp_color(cpu_color, self.theme.inactive_fg, fade_t));
                     } else if cols[idx].title == "MEM" {
-                        style = style.fg(mem_color);
+                        style = style.fg(lerp_color(mem_color, self.theme.inactive_fg, fade_t));
                     } else if cols[idx].title == "Pid" {
                         style = style.fg(self.theme.inactive_fg);
                     }
@@ -217,6 +230,22 @@ impl<'a> Widget for &ProcessTable<'a> {
                 (s, style, cols[idx].right_align)
             });
         }
+    }
+}
+
+/// Linear interpolate between two terminal colors at `t ∈ [0,1]`.
+/// Operates on RGB; falls back to `a` for non-RGB enum variants so
+/// 256-color / named themes degrade gracefully (no fade, but no panic).
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let r = (ar as f32 + (br as f32 - ar as f32) * t).round() as u8;
+            let g = (ag as f32 + (bg as f32 - ag as f32) * t).round() as u8;
+            let b = (ab as f32 + (bb as f32 - ab as f32) * t).round() as u8;
+            Color::Rgb(r, g, b)
+        }
+        _ => a,
     }
 }
 

@@ -7,14 +7,32 @@ use bobtop_tui::widgets::{
 };
 use bobtop_tui::{compute_layout, BoxedPanel, Theme};
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::widgets::Widget;
 use ratatui::Frame;
 
 use crate::app::App;
 
+/// Header height in rows. Reserved at the top of the frame for the status
+/// bar (B1) — the rest of the layout flows beneath.
+const HEADER_H: u16 = 1;
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let layout = compute_layout(area, app.layout_preset);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let header = Rect::new(area.x, area.y, area.width, HEADER_H.min(area.height));
+    let body_y = area.y + header.height;
+    let body_h = area.height.saturating_sub(header.height);
+    let body = Rect::new(area.x, body_y, area.width, body_h);
+
+    draw_header(frame, header, app);
+
+    if body.height == 0 {
+        return;
+    }
+    let layout = compute_layout(body, app.layout_preset);
 
     draw_cpu(frame, layout.cpu, app);
     if let Some(mem_area) = layout.memory {
@@ -27,6 +45,136 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_network(frame, net_area, app);
     }
     draw_processes(frame, layout.processes, app);
+
+    if app.show_help {
+        draw_help_overlay(frame, area, app);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Header status bar
+// ---------------------------------------------------------------------------
+
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    // Background fill in the title color so the strip reads as a separate
+    // surface from the panels below.
+    let bg = app.theme.meter_bg;
+    let fg = app.theme.title;
+    let dim = app.theme.inactive_fg;
+    for x in 0..area.width {
+        let cell = &mut buf[(area.x + x, area.y)];
+        cell.set_char(' ');
+        cell.set_style(Style::default().bg(bg).fg(fg));
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    let uptime = format_uptime(app.started_at.elapsed());
+    let left = format!(
+        " bobtop v{version}  │  tier: {}  │  theme: {}",
+        app.net_tier.name(),
+        app.theme.name,
+    );
+    let right = format!("up {uptime} ");
+
+    write_str_at(buf, area.x, area.y, &left, Style::default().bg(bg).fg(fg));
+    let right_len = right.chars().count() as u16;
+    if right_len + 1 < area.width {
+        write_str_at(
+            buf,
+            area.x + area.width - right_len,
+            area.y,
+            &right,
+            Style::default().bg(bg).fg(dim),
+        );
+    }
+}
+
+fn format_uptime(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Help overlay (B2)
+// ---------------------------------------------------------------------------
+
+const HELP_LINES: &[(&str, &str)] = &[
+    ("?", "toggle this help"),
+    ("q / Ctrl-C", "quit"),
+    ("Esc", "close overlay (or quit when none open)"),
+    ("↑ / ↓ / k / j", "select process"),
+    ("PgUp / PgDn / Home / End", "jump in process list"),
+    ("← / → / h / l", "cycle sort column"),
+    ("r", "reverse sort direction"),
+    ("+ / -", "adjust global tick"),
+    ("1", "Full layout"),
+    ("m", "Minimal layout (CPU + processes only)"),
+];
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    // Sized to fit the longest line + padding; centered in the frame.
+    let inner_w: u16 = HELP_LINES
+        .iter()
+        .map(|(k, d)| (k.chars().count() + d.chars().count() + 4) as u16)
+        .max()
+        .unwrap_or(40);
+    let want_w = inner_w + 4;
+    let want_h = (HELP_LINES.len() as u16) + 4;
+    if area.width < want_w || area.height < want_h {
+        return;
+    }
+    let x = area.x + (area.width - want_w) / 2;
+    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
+    let modal = Rect::new(x, y, want_w, want_h);
+
+    let panel = BoxedPanel::new(app.theme.title, app.theme.title)
+        .with_title(" help — keybinds ".to_string());
+    frame.render_widget(&panel, modal);
+    let body = panel.inner(modal);
+    let buf = frame.buffer_mut();
+    // Clear the body cells so panels behind don't bleed through. `main_bg`
+    // is themed-optional (terminals with translucent backgrounds prefer
+    // None); fall back to `meter_bg` so the modal still has a solid panel.
+    let modal_bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
+    for yy in body.y..body.y + body.height {
+        for xx in body.x..body.x + body.width {
+            let cell = &mut buf[(xx, yy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(modal_bg).fg(app.theme.main_fg));
+        }
+    }
+    let key_w = HELP_LINES
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8) as u16;
+    for (i, (key, desc)) in HELP_LINES.iter().enumerate() {
+        let row_y = body.y + 1 + i as u16;
+        if row_y >= body.y + body.height {
+            break;
+        }
+        write_str_at(
+            buf,
+            body.x + 2,
+            row_y,
+            key,
+            Style::default().bg(modal_bg).fg(app.theme.hi_fg),
+        );
+        write_str_at(
+            buf,
+            body.x + 2 + key_w + 2,
+            row_y,
+            desc,
+            Style::default().bg(modal_bg).fg(app.theme.main_fg),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +446,9 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     let panel = BoxedPanel::new(app.theme.net_box, app.theme.title)
         .with_title(format!("{title}{bandwidth_note}"))
         .with_controls(format!(
-            "↑peak {}/s  ↓peak {}/s  scale {}/s",
+            "↑peak {}/s  ↓peak {}/s",
             format_rate(app.net_peak_tx()),
             format_rate(app.net_peak_rx()),
-            format_rate(scale),
         ));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -312,14 +459,19 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     // CenteredBloom split: upload (secondary) blooms UP from the center
     // line; download (primary) blooms DOWN from the center line. Idle
     // network = thin band at center; busy = traces reach toward edges.
+    // Y-axis labels show the actual scale ceiling so users can read
+    // "what does the top edge mean" without parsing the title — matches
+    // btop's auto-scale label placement.
     let max_pts = (inner.width as usize) * 2;
+    let scale_label = format!("{}/s", format_rate(scale));
     let mut graph = BrailleGraph::new(max_pts, app.theme.download)
         .with_secondary(Trace::new(max_pts, app.theme.upload), DualMode::MirroredSplit)
         .with_style(if app.tty_graphs {
             GraphStyle::Blocks
         } else {
             GraphStyle::CenteredBloom
-        });
+        })
+        .with_y_scale(scale_label.clone(), scale_label);
     for (rx, tx) in app.net_normalized_history() {
         graph.push_dual(rx, tx);
     }

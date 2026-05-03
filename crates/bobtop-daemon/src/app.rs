@@ -79,6 +79,9 @@ pub struct App {
     /// Sort direction for `proc_sort`. Toggled by `r`.
     pub proc_sort_descending: bool,
 
+    /// `?` toggles the centered help overlay listing keybinds (B2).
+    pub show_help: bool,
+
     /// Set by `apply_event` and `handle_input` whenever something
     /// observable to the renderer has changed. Cleared by `take_dirty`
     /// after the render loop calls `terminal.draw()`. Lets us render
@@ -118,6 +121,7 @@ impl App {
             scroll_offset: 0,
             proc_sort: ProcessSort::Cpu,
             proc_sort_descending: true,
+            show_help: false,
             // Start dirty so the very first frame paints something rather
             // than a blank alt-screen until the first sample lands.
             dirty: true,
@@ -309,7 +313,24 @@ impl App {
 
     fn handle_key(&mut self, k: KeyEvent) -> ControlFlow {
         let visible_rows = self.processes_sorted.len();
+        // When the help overlay is open, only `?` / Esc / `q` are routed —
+        // everything else is swallowed so the user doesn't accidentally
+        // mutate state while reading the keybinds.
+        if self.show_help {
+            match k.code {
+                KeyCode::Char('?') | KeyCode::Esc => {
+                    self.show_help = false;
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Char('q') => return ControlFlow::Quit,
+                _ => return ControlFlow::Continue,
+            }
+        }
         match k.code {
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                ControlFlow::Continue
+            }
             KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
             KeyCode::Char('1') => {
                 self.set_layout(LayoutPreset::Full);
