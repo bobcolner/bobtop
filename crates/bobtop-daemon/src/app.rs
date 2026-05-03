@@ -16,7 +16,7 @@ use bobtop_core::sample::{
 };
 use bobtop_core::{BoxesEnabled, MetricEvent};
 use bobtop_net::{AttributorTier, ProcessNetSample};
-use bobtop_tui::widgets::ProcessSort;
+use bobtop_tui::widgets::{CornerStyle, ProcessSort};
 use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -82,6 +82,9 @@ pub struct App {
     pub layout_preset: LayoutPreset,
     pub tty_graphs: bool,
     pub show_virtual_net: bool,
+    /// Border corner style applied to every BoxedPanel. Sourced from
+    /// the config file (B12). Default rounded matches btop's signature.
+    pub corner_style: CornerStyle,
 
     /// Per-box visibility shared with collectors. When a box is disabled,
     /// its collector tick wakes, checks the bit, and goes back to sleep
@@ -152,6 +155,7 @@ impl App {
             layout_preset,
             tty_graphs,
             show_virtual_net,
+            corner_style: CornerStyle::default(),
             boxes,
             started_at: Instant::now(),
             tick_ms,

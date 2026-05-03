@@ -22,6 +22,6 @@ pub use color::{dim, lerp_color, parse_btop_color, Gradient};
 pub use layout::{compute as compute_layout, LayoutAreas, LayoutPreset};
 pub use theme::{builtin_names, builtin_source, load as load_theme, Theme, DEFAULT_THEME_NAME};
 pub use widgets::{
-    BoxedPanel, BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessSort, ProcessTable,
-    Trace,
+    BoxedPanel, BrailleGraph, CornerStyle, DualMode, GraphStyle, Meter, MiniMeter, ProcessSort,
+    ProcessTable, Trace,
 };

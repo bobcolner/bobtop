@@ -13,7 +13,7 @@ pub mod meter;
 pub mod mini_meter;
 pub mod process_table;
 
-pub use boxed::BoxedPanel;
+pub use boxed::{BoxedPanel, CornerStyle};
 pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_FILL};
 pub use meter::Meter;
 pub use mini_meter::MiniMeter;

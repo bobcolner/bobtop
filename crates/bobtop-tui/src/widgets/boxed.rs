@@ -21,10 +21,22 @@ use ratatui::layout::Rect;
 use ratatui::style::{Style, Stylize};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
+/// Border corner style. `Rounded` is btop's signature look and the bobtop
+/// default; `Square` is a config-selectable alternative for users on
+/// fonts/terminals where rounded glyphs render poorly (some serial-console
+/// setups, certain monospace fonts that lack the rounded variants).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CornerStyle {
+    #[default]
+    Rounded,
+    Square,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BoxedPanel {
     pub border_color: ratatui::style::Color,
     pub title_color: ratatui::style::Color,
+    pub corner_style: CornerStyle,
     pub top_left: Option<String>,
     pub top_right: Option<String>,
     pub bottom: Option<String>,
@@ -35,10 +47,16 @@ impl BoxedPanel {
         Self {
             border_color,
             title_color,
+            corner_style: CornerStyle::default(),
             top_left: None,
             top_right: None,
             bottom: None,
         }
+    }
+
+    pub fn with_corner_style(mut self, style: CornerStyle) -> Self {
+        self.corner_style = style;
+        self
     }
 
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
@@ -59,9 +77,13 @@ impl BoxedPanel {
     /// The block we delegate border rendering to. Use `block.inner(area)` to
     /// get the area available to the inner content.
     pub fn block(&self) -> Block<'static> {
+        let bt = match self.corner_style {
+            CornerStyle::Rounded => BorderType::Rounded,
+            CornerStyle::Square => BorderType::Plain,
+        };
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(bt)
             .border_style(Style::default().fg(self.border_color))
     }
 
@@ -131,6 +153,19 @@ mod tests {
         assert_eq!(buf[(9, 0)].symbol(), "╮");
         assert_eq!(buf[(0, 3)].symbol(), "╰");
         assert_eq!(buf[(9, 3)].symbol(), "╯");
+    }
+
+    #[test]
+    fn square_corners_when_requested() {
+        let panel = BoxedPanel::new(Color::Reset, Color::Reset)
+            .with_corner_style(CornerStyle::Square);
+        let area = Rect::new(0, 0, 10, 4);
+        let mut buf = Buffer::empty(area);
+        (&panel).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "┌");
+        assert_eq!(buf[(9, 0)].symbol(), "┐");
+        assert_eq!(buf[(0, 3)].symbol(), "└");
+        assert_eq!(buf[(9, 3)].symbol(), "┘");
     }
 
     #[test]

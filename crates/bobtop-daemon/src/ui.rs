@@ -4,9 +4,9 @@
 use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample};
 use bobtop_core::Box as BoxKind;
 use bobtop_tui::widgets::{
-    BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
+    BoxedPanel, BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
 };
-use bobtop_tui::{compute_layout, BoxedPanel, Theme};
+use bobtop_tui::{compute_layout, Theme};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::Widget;
@@ -17,6 +17,15 @@ use crate::app::App;
 /// Header height in rows. Reserved at the top of the frame for the status
 /// bar (B1) — the rest of the layout flows beneath.
 const HEADER_H: u16 = 1;
+
+/// Construct a `BoxedPanel` with the user's configured corner style
+/// (rounded vs square — B12). Centralized so the corner choice doesn't
+/// have to be threaded through every `draw_*` function. Named with a
+/// `mk_` prefix so it doesn't shadow the local `let panel = ...` idiom
+/// the draw functions use.
+fn mk_panel(app: &App, border: ratatui::style::Color, title: ratatui::style::Color) -> BoxedPanel {
+    BoxedPanel::new(border, title).with_corner_style(app.corner_style)
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -81,7 +90,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_hidden_panel(frame: &mut Frame, area: Rect, app: &App, name: &str) {
-    let panel = BoxedPanel::new(app.theme.div_line, app.theme.inactive_fg)
+    let panel = mk_panel(app, app.theme.div_line, app.theme.inactive_fg)
         .with_title(format!("{name} — hidden"))
         .with_controls("press B to toggle");
     frame.render_widget(&panel, area);
@@ -152,7 +161,7 @@ fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let y = area.y + (area.height.saturating_sub(want_h)) / 2;
     let modal = Rect::new(x, y, want_w, want_h);
 
-    let panel = BoxedPanel::new(app.theme.title, app.theme.title)
+    let panel = mk_panel(app, app.theme.title, app.theme.title)
         .with_title(" boxes — show/hide panels ".to_string())
         .with_controls("space toggle  ↑↓ move  B/Esc close");
     frame.render_widget(&panel, modal);
@@ -249,7 +258,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let y = area.y + (area.height.saturating_sub(want_h)) / 2;
     let modal = Rect::new(x, y, want_w, want_h);
 
-    let panel = BoxedPanel::new(app.theme.title, app.theme.title)
+    let panel = mk_panel(app, app.theme.title, app.theme.title)
         .with_title(" help — keybinds ".to_string());
     frame.render_widget(&panel, modal);
     let body = panel.inner(modal);
@@ -315,7 +324,7 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "load — — —".into());
 
     let title = format!("¹cpu  CPU {:.1}%  Cores={}  {}", cpu_pct, cores, load);
-    let panel = BoxedPanel::new(app.theme.cpu_box, app.theme.title)
+    let panel = mk_panel(app, app.theme.cpu_box, app.theme.title)
         .with_title(title)
         .with_controls(format!("- {}ms +", app.tick_ms()));
     frame.render_widget(&panel, area);
@@ -385,7 +394,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
         .filter(|m| m.total_bytes > 0)
         .map(|m| (m.used_bytes as f64 / m.total_bytes as f64) * 100.0)
         .unwrap_or(0.0);
-    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title)
+    let panel = mk_panel(app, app.theme.mem_box, app.theme.title)
         .with_title(format!("²mem  {:.1}% used", used_pct));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -443,7 +452,7 @@ fn draw_disks(frame: &mut Frame, area: Rect, app: &App) {
         Some(n) if n > 0 => format!("²disks  {} mounts", n),
         _ => "²disks".to_string(),
     };
-    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title).with_title(title);
+    let panel = mk_panel(app, app.theme.mem_box, app.theme.title).with_title(title);
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 8 || inner.height < 2 {
@@ -558,7 +567,7 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "  (per-pid bw unavailable)"
     };
-    let panel = BoxedPanel::new(app.theme.net_box, app.theme.title)
+    let panel = mk_panel(app, app.theme.net_box, app.theme.title)
         .with_title(format!("{title}{bandwidth_note}"))
         .with_controls(format!(
             "↑peak {}/s  ↓peak {}/s",
@@ -704,7 +713,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         app.net_tier.name(),
         if has_bw { "" } else { " (build w/ --features ebpf or pcap)" },
     );
-    let panel = BoxedPanel::new(app.theme.proc_box, app.theme.title)
+    let panel = mk_panel(app, app.theme.proc_box, app.theme.title)
         .with_title(title)
         .with_keybinds("q quit  ↑↓ select  ←→ sort col  r reverse  +/- tick  1 full  m minimal");
     frame.render_widget(&panel, area);

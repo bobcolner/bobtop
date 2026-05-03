@@ -13,6 +13,23 @@ pub enum LayoutChoice {
     Minimal,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CornerChoice {
+    #[default]
+    Rounded,
+    Square,
+}
+
+impl From<CornerChoice> for bobtop_tui::widgets::CornerStyle {
+    fn from(c: CornerChoice) -> Self {
+        match c {
+            CornerChoice::Rounded => bobtop_tui::widgets::CornerStyle::Rounded,
+            CornerChoice::Square => bobtop_tui::widgets::CornerStyle::Square,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "bobtop", version, about = "A best-in-class terminal system monitor")]
 pub struct Cli {
@@ -51,6 +68,11 @@ pub struct Cli {
     /// to exclude them so the graph reflects "real" external traffic.
     #[arg(long)]
     pub show_virtual_net: bool,
+
+    /// Border corner style: `rounded` (default, btop signature look) or
+    /// `square` for fonts/terminals where rounded glyphs render poorly.
+    #[arg(long, value_enum, default_value_t = CornerChoice::Rounded)]
+    pub corners: CornerChoice,
 
     /// Print every available theme name and exit.
     #[arg(long)]

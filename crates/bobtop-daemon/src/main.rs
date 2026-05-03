@@ -13,6 +13,7 @@ use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, MetricEvent};
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 use tokio::sync::broadcast;
 
+use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
 use bobtop_net::{select as select_attributor, NetworkAttributor, SelectOptions};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
@@ -74,6 +75,7 @@ async fn main() -> Result<()> {
         eff.show_virtual_net,
     );
     app.net_tier = net_tier;
+    app.corner_style = eff.corners.into();
     let boxes = app.boxes.clone();
     let app = Arc::new(Mutex::new(app));
 
@@ -132,6 +134,7 @@ struct EffectiveConfig {
     no_pcap: bool,
     tty: bool,
     show_virtual_net: bool,
+    corners: CornerChoice,
 }
 
 impl EffectiveConfig {
@@ -186,6 +189,11 @@ fn resolve(cli: &Cli, matches: &clap::ArgMatches, cfg: &Config) -> EffectiveConf
             cli.show_virtual_net
         } else {
             cfg.show_virtual_net.unwrap_or(cli.show_virtual_net)
+        },
+        corners: if from_cli("corners") {
+            cli.corners
+        } else {
+            cfg.corners.unwrap_or(cli.corners)
         },
     }
 }

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::LayoutChoice;
+use crate::cli::{CornerChoice, LayoutChoice};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -29,6 +29,7 @@ pub struct Config {
     pub no_pcap: Option<bool>,
     pub tty: Option<bool>,
     pub show_virtual_net: Option<bool>,
+    pub corners: Option<CornerChoice>,
 }
 
 impl Config {
