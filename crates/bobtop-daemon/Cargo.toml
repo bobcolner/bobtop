@@ -29,7 +29,10 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 
 [features]
-default = []
+# eBPF on by default — build.rs in bobtop-net gracefully no-ops when
+# clang/libbpf-dev aren't present, so the daemon still builds on bare-bones
+# systems; it just falls through to Tier 2/1 attribution at runtime.
+default = ["ebpf"]
 ebpf = ["bobtop-net/ebpf"]
 pcap = ["bobtop-net/pcap"]
 nvidia = ["bobtop-collectors/nvidia"]

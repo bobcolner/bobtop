@@ -157,36 +157,31 @@ impl App {
             .collect()
     }
 
-    /// Number of samples used for rolling-max auto-scale. At the default
-    /// 500ms tick this is 30 seconds — short enough that a one-time burst
-    /// can't permanently squash later quieter traffic.
-    const NET_SCALE_WINDOW: usize = 60;
-
-    fn net_scale_window_iter(&self) -> impl Iterator<Item = &(f64, f64)> {
-        let n = self.net_history.len();
-        let start = n.saturating_sub(Self::NET_SCALE_WINDOW);
-        self.net_history.iter().skip(start)
-    }
-
     /// Auto-scale ceiling for the network graph: rolling-max across both
-    /// rx and tx in the recent window, plus 20% headroom, floored at 1 KiB/s.
+    /// rx and tx in the entire visible `net_history` (same bound as CPU
+    /// history — `HISTORY_CAP`), plus 20% headroom, floored at 1 KiB/s.
+    /// Aligning the scale window with the visible-graph window means the
+    /// scale label always reflects what's actually on screen.
     pub fn net_scale_bps(&self) -> f64 {
         let max_recent = self
-            .net_scale_window_iter()
+            .net_history
+            .iter()
             .flat_map(|(rx, tx)| [*rx, *tx])
             .fold(0.0_f64, |a, b| a.max(b));
         (max_recent * 1.2).max(1024.0)
     }
 
-    /// Rolling-max for download direction only (recent window). Used for corner labels.
+    /// Rolling-max for download direction only across the visible window.
     pub fn net_peak_rx(&self) -> f64 {
-        self.net_scale_window_iter()
+        self.net_history
+            .iter()
             .map(|(rx, _)| *rx)
             .fold(0.0_f64, |a, b| a.max(b))
     }
 
     pub fn net_peak_tx(&self) -> f64 {
-        self.net_scale_window_iter()
+        self.net_history
+            .iter()
             .map(|(_, tx)| *tx)
             .fold(0.0_f64, |a, b| a.max(b))
     }

@@ -11,7 +11,7 @@ use std::io::{self, Stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bobtop_core::{DataBus, MetricEvent};
+use bobtop_core::DataBus;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event};
 use crossterm::execute;
@@ -99,7 +99,10 @@ pub async fn run(
                 return Ok(());
             }
             _ = tick.tick() => {
-                // Drain pending bus events.
+                // Drain pending bus events. ALL event types apply — earlier
+                // versions had a separate "inter-tick" select arm that
+                // consumed events from the bus but only applied CPU/Mem/Process,
+                // silently dropping Network and Disk events. Removed.
                 loop {
                     match bus_rx.try_recv() {
                         Ok(ev) => {
@@ -126,16 +129,6 @@ pub async fn run(
                 // Render with a snapshot reference (lock held only for the draw).
                 let g = lock(&app);
                 term.draw(|f| ui::draw(f, &g))?;
-            }
-            // Also notice incoming bus events between frames to react fast on bursty
-            // collectors, but only to drain — render still on the tick.
-            ev = bus_rx.recv() => {
-                if let Ok(ev) = ev {
-                    if let MetricEvent::Cpu(_) | MetricEvent::Memory(_) | MetricEvent::Process(_) = &ev {
-                        let mut g = lock(&app);
-                        g.apply_event(ev);
-                    }
-                }
             }
         }
     }
