@@ -48,6 +48,15 @@ async fn main() -> Result<()> {
         allow_pcap: !cli.no_pcap,
     }));
     let net_tier = attributor.tier();
+    // Self-diagnosing startup line — always logged at warn so users see it
+    // even at default RUST_LOG. Helps explain why per-pid net columns are
+    // empty without requiring `RUST_LOG=info`.
+    tracing::warn!(
+        compiled_features = features_str(),
+        selected_tier = net_tier.name(),
+        per_pid_bandwidth = net_tier.has_bandwidth(),
+        "bobtop start"
+    );
 
     let bus = DataBus::default();
     let tick_ms = Arc::new(AtomicU64::new(cli.tick().as_millis() as u64));
@@ -88,6 +97,16 @@ async fn main() -> Result<()> {
     tui::restore_terminal(&mut term)?;
 
     result.map_err(Into::into)
+}
+
+fn features_str() -> &'static str {
+    // Compile-time enumeration of which optional features are baked in.
+    match (cfg!(feature = "ebpf"), cfg!(feature = "pcap")) {
+        (true, true) => "ebpf,pcap",
+        (true, false) => "ebpf",
+        (false, true) => "pcap",
+        (false, false) => "none (build with --features ebpf,pcap for per-pid net)",
+    }
 }
 
 fn init_tracing() {
@@ -142,7 +161,7 @@ fn spawn_attributor_loop(
                     let mut g = app.lock().unwrap_or_else(|p| p.into_inner());
                     g.apply_net(samples, tier);
                 }
-                Err(e) => tracing::trace!(error = %e, "net attributor sample failed"),
+                Err(e) => tracing::warn!(error = %e, "net attributor sample failed"),
             }
         }
     });

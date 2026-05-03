@@ -68,17 +68,20 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
     let graph_area = Rect::new(inner.x, inner.y, split, inner.height);
     let meters_area = Rect::new(inner.x + split, inner.y, inner.width - split, inner.height);
 
-    let mut graph = BrailleGraph::new(
-        (graph_area.width as usize) * 2,
-        app.theme.cpu,
-    );
-    graph = graph.with_value_fn(|v| format!("{:>5.1}%", v * 100.0));
+    // Centered mirror: same trace fed into both primary (bottom-up) and
+    // secondary (top-down). Values bloom symmetrically from the center line.
+    let max_pts = (graph_area.width as usize) * 2;
+    let mut graph = BrailleGraph::new(max_pts, app.theme.cpu)
+        .with_value_fn(|v| format!("{:>5.1}%", v * 100.0))
+        .with_secondary(
+            bobtop_tui::widgets::Trace::new(max_pts, app.theme.cpu),
+            bobtop_tui::widgets::DualMode::MirroredSplit,
+        );
     if app.tty_graphs {
         graph = graph.with_style(GraphStyle::Blocks);
     }
-    // Replay history.
     for v in app.cpu_history.iter().copied() {
-        graph.push(v);
+        graph.push_dual(v, v);
     }
     frame.render_widget(&graph, graph_area);
 
@@ -141,13 +144,19 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
         inner.y + inner.height - meters_y,
     );
 
-    let mut mem_graph = BrailleGraph::new(graph_area.width as usize * 2, app.theme.used)
-        .with_value_fn(|v| format!("{:>5.1}%", v * 100.0));
+    // Centered mirror, like CPU + net — single trace blooms from center.
+    let mem_max_pts = graph_area.width as usize * 2;
+    let mut mem_graph = BrailleGraph::new(mem_max_pts, app.theme.used)
+        .with_value_fn(|v| format!("{:>5.1}%", v * 100.0))
+        .with_secondary(
+            bobtop_tui::widgets::Trace::new(mem_max_pts, app.theme.used),
+            bobtop_tui::widgets::DualMode::MirroredSplit,
+        );
     if app.tty_graphs {
         mem_graph = mem_graph.with_style(GraphStyle::Blocks);
     }
     for v in app.mem_history.iter().copied() {
-        mem_graph.push(v);
+        mem_graph.push_dual(v, v);
     }
     frame.render_widget(&mem_graph, graph_area);
 
@@ -423,11 +432,14 @@ fn interface_counts(app: &App) -> (usize, usize) {
 
 fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     let arrow = if app.proc_sort_descending { '↓' } else { '↑' };
+    let has_bw = app.net_tier.has_bandwidth();
     let title = format!(
-        "⁴proc  {} processes  sort: ←{}{}→",
+        "⁴proc  {} procs  ←{}{}→  rx/tx: {}{}",
         app.processes_sorted.len(),
         app.proc_sort.label(),
         arrow,
+        app.net_tier.name(),
+        if has_bw { "" } else { " (build w/ --features ebpf or pcap)" },
     );
     let panel = BoxedPanel::new(app.theme.proc_box, app.theme.title)
         .with_title(title)
@@ -440,6 +452,12 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
 
     // Join per-process net data (when available) into a working list so the
     // table can show RX/TX columns sourced from the active tier.
+    //
+    // When the active tier provides bandwidth, processes that aren't in the
+    // attributor's map (no recent TCP traffic) get a synthesized `Some(0.0)`
+    // so the column shows "0" instead of "-" — otherwise the column looks
+    // dead because only the ~handful of currently-transmitting pids ever
+    // appear in the BPF map / pcap accumulator.
     let net_index: HashMap<u32, &bobtop_net::ProcessNetSample> = app
         .net_samples
         .iter()
@@ -453,6 +471,9 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
             if let Some(n) = net_index.get(&p.pid) {
                 q.net_rx_bytes_per_sec = n.rx_bytes_per_sec;
                 q.net_tx_bytes_per_sec = n.tx_bytes_per_sec;
+            } else if has_bw {
+                q.net_rx_bytes_per_sec = Some(0.0);
+                q.net_tx_bytes_per_sec = Some(0.0);
             }
             q
         })
