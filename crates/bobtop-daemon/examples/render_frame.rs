@@ -142,6 +142,11 @@ fn main() -> anyhow::Result<()> {
         processes: procs,
     }));
 
+    // Switch to NetRx sort to verify the sort fix: pid 1234 (active-app)
+    // should now jump to row 0 because it's the only pid with non-zero rx.
+    app.proc_sort = bobtop_tui::widgets::ProcessSort::NetRx;
+    app.cycle_sort(0); // re-sort with the new key
+
     let backend = TestBackend::new(180, 50);
     let mut term = Terminal::new(backend)?;
     term.draw(|f| bobtop_daemon::ui::draw(f, &app))?;

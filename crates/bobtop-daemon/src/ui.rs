@@ -1,9 +1,7 @@
 //! Pure frame composition. `draw` is the single render function called by
 //! the TUI loop on every frame.
 
-use std::collections::HashMap;
-
-use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample, ProcessInfo};
+use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample};
 use bobtop_tui::widgets::{
     BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
 };
@@ -448,42 +446,15 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Join per-process net data (when available) into a working list so the
-    // table can show RX/TX columns sourced from the active tier.
-    //
-    // When the active tier provides bandwidth, processes that aren't in the
-    // attributor's map (no recent TCP traffic) get a synthesized `Some(0.0)`
-    // so the column shows "0" instead of "-" — otherwise the column looks
-    // dead because only the ~handful of currently-transmitting pids ever
-    // appear in the BPF map / pcap accumulator.
-    let net_index: HashMap<u32, &bobtop_net::ProcessNetSample> = app
-        .net_samples
-        .iter()
-        .map(|s| (s.pid, s))
-        .collect();
-    let with_net: Vec<ProcessInfo> = app
-        .processes_sorted
-        .iter()
-        .map(|p| {
-            let mut q = p.clone();
-            if let Some(n) = net_index.get(&p.pid) {
-                q.net_rx_bytes_per_sec = n.rx_bytes_per_sec;
-                q.net_tx_bytes_per_sec = n.tx_bytes_per_sec;
-            } else if has_bw {
-                q.net_rx_bytes_per_sec = Some(0.0);
-                q.net_tx_bytes_per_sec = Some(0.0);
-            }
-            q
-        })
-        .collect();
-
+    // App.processes_sorted already has the net join + sort applied at apply
+    // time. Render uses it directly — no per-frame re-cloning.
     let body_h = inner.height.saturating_sub(1) as usize;
     let mut scroll_offset = app.scroll_offset;
     if app.selected_proc >= scroll_offset + body_h && body_h > 0 {
         scroll_offset = app.selected_proc + 1 - body_h;
     }
 
-    let mut table = ProcessTable::new(&with_net, &app.theme)
+    let mut table = ProcessTable::new(&app.processes_sorted, &app.theme)
         .with_selection(Some(app.selected_proc), scroll_offset)
         .with_net_columns(app.net_tier.has_bandwidth())
         .with_direction(app.proc_sort_descending);

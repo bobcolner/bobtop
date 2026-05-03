@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::collections::HashMap;
+
 use bobtop_core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
 };
@@ -125,13 +127,8 @@ impl App {
                 self.latest_mem = Some(s);
             }
             MetricEvent::Process(s) => {
-                self.latest_processes = Some(s.clone());
-                let mut sorted = s.processes;
-                sort_processes(&mut sorted, self.proc_sort, self.proc_sort_descending);
-                if !sorted.is_empty() && self.selected_proc >= sorted.len() {
-                    self.selected_proc = sorted.len() - 1;
-                }
-                self.processes_sorted = sorted;
+                self.latest_processes = Some(s);
+                self.rebuild_sorted();
             }
             MetricEvent::Network(s) => {
                 let (rx, tx) = aggregate_net_rates(&s, self.show_virtual_net);
@@ -189,6 +186,36 @@ impl App {
     pub fn apply_net(&mut self, samples: Vec<ProcessNetSample>, tier: AttributorTier) {
         self.net_samples = samples;
         self.net_tier = tier;
+        self.rebuild_sorted();
+    }
+
+    /// Rebuild `processes_sorted` from `latest_processes`, joining in
+    /// per-pid net samples (so sorting by NetRx/NetTx works against real
+    /// values rather than `None`s). Always called when either a Process
+    /// sample, a net attributor sample, or the active sort changes.
+    fn rebuild_sorted(&mut self) {
+        let mut joined: Vec<ProcessInfo> = self
+            .latest_processes
+            .as_ref()
+            .map(|s| s.processes.clone())
+            .unwrap_or_default();
+        let net_idx: HashMap<u32, &ProcessNetSample> =
+            self.net_samples.iter().map(|s| (s.pid, s)).collect();
+        let has_bw = self.net_tier.has_bandwidth();
+        for p in joined.iter_mut() {
+            if let Some(n) = net_idx.get(&p.pid) {
+                p.net_rx_bytes_per_sec = n.rx_bytes_per_sec;
+                p.net_tx_bytes_per_sec = n.tx_bytes_per_sec;
+            } else if has_bw {
+                p.net_rx_bytes_per_sec = Some(0.0);
+                p.net_tx_bytes_per_sec = Some(0.0);
+            }
+        }
+        sort_processes(&mut joined, self.proc_sort, self.proc_sort_descending);
+        if !joined.is_empty() && self.selected_proc >= joined.len() {
+            self.selected_proc = joined.len() - 1;
+        }
+        self.processes_sorted = joined;
     }
 
     /// Current global update tick in milliseconds.
@@ -214,6 +241,9 @@ impl App {
         let len = cycle.len() as i32;
         let new_idx = ((cur_idx + delta) % len + len) % len;
         self.proc_sort = cycle[new_idx as usize];
+        // Re-sort the already-joined processes_sorted in place rather than
+        // calling rebuild_sorted (avoids re-cloning + re-joining). The net
+        // join state is the same; only the sort key changed.
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
     }
 
