@@ -32,6 +32,203 @@ pub enum ControlFlow {
     Quit,
 }
 
+/// Editable working copy of `Config`, plus a cursor identifying which
+/// field is currently being edited. The fields here intentionally mirror
+/// the on-disk Config — when the user hits Enter we Serialize this back
+/// out via `Config::save`. On Esc we throw the snapshot away.
+#[derive(Debug, Clone)]
+pub struct OptionsState {
+    pub cursor: usize,
+    pub theme: String,
+    pub tick_ms: u64,
+    pub layout: crate::cli::LayoutChoice,
+    pub corners: crate::cli::CornerChoice,
+    pub no_ebpf: bool,
+    pub no_pcap: bool,
+    pub tty: bool,
+    pub show_virtual_net: bool,
+    /// Snapshot of the available theme names so cycling is just an index
+    /// step rather than refetching the registry on every keystroke.
+    pub themes: Vec<String>,
+}
+
+impl OptionsState {
+    pub const FIELD_COUNT: usize = 8;
+
+    /// Cycle the field at `self.cursor` by `delta` (-1 = previous,
+    /// +1 = next). For booleans, any non-zero delta toggles. For
+    /// numerics (tick_ms), step is ±100 ms clamped to the global
+    /// MIN/MAX bounds.
+    pub fn cycle_field(&mut self, delta: i32) {
+        use crate::cli::{CornerChoice, LayoutChoice};
+        match self.cursor {
+            0 => {
+                // theme
+                if self.themes.is_empty() {
+                    return;
+                }
+                let cur = self
+                    .themes
+                    .iter()
+                    .position(|n| n == &self.theme)
+                    .unwrap_or(0) as i32;
+                let n = self.themes.len() as i32;
+                let next = ((cur + delta) % n + n) % n;
+                self.theme = self.themes[next as usize].clone();
+            }
+            1 => {
+                // tick_ms ±100 within bounds
+                let step: i64 = 100 * delta as i64;
+                let new = (self.tick_ms as i64 + step)
+                    .clamp(crate::cli::MIN_TICK_MS as i64, crate::cli::MAX_TICK_MS as i64);
+                self.tick_ms = new as u64;
+            }
+            2 => {
+                self.layout = match self.layout {
+                    LayoutChoice::Full => LayoutChoice::Minimal,
+                    LayoutChoice::Minimal => LayoutChoice::Full,
+                };
+            }
+            3 => {
+                self.corners = match self.corners {
+                    CornerChoice::Rounded => CornerChoice::Square,
+                    CornerChoice::Square => CornerChoice::Rounded,
+                };
+            }
+            4 => self.no_ebpf = !self.no_ebpf,
+            5 => self.no_pcap = !self.no_pcap,
+            6 => self.tty = !self.tty,
+            7 => self.show_virtual_net = !self.show_virtual_net,
+            _ => {}
+        }
+    }
+
+    pub fn to_config(&self) -> crate::config::Config {
+        crate::config::Config {
+            theme: Some(self.theme.clone()),
+            tick_ms: Some(self.tick_ms),
+            layout: Some(self.layout),
+            corners: Some(self.corners),
+            no_ebpf: Some(self.no_ebpf),
+            no_pcap: Some(self.no_pcap),
+            tty: Some(self.tty),
+            show_virtual_net: Some(self.show_virtual_net),
+        }
+    }
+}
+
+/// Snapshot of /proc data shown in the detail modal (B3d). Captured
+/// once when the user presses `Enter`; no live refresh — the modal is
+/// for inspection, not monitoring. Fields that fail to read (perm denied,
+/// process gone) get an explanatory placeholder rather than aborting.
+#[derive(Debug, Clone)]
+pub struct ProcessDetail {
+    pub pid: u32,
+    pub name: String,
+    pub cmdline: String,
+    pub status_lines: Vec<String>,
+    pub fd_count: Result<usize, String>,
+    pub io_lines: Vec<String>,
+}
+
+impl ProcessDetail {
+    /// Read the relevant /proc entries for `pid`. All errors are folded
+    /// into placeholders inside the returned struct — the modal opens
+    /// even when individual fields are unavailable (kthreads, perms).
+    pub fn read(pid: u32, name: &str) -> Self {
+        let base = format!("/proc/{pid}");
+        let cmdline = std::fs::read(format!("{base}/cmdline"))
+            .map(|bytes| {
+                // /proc cmdline uses NUL separators between argv entries.
+                bytes
+                    .split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_else(|e| format!("(cmdline unavailable: {e})"));
+
+        let status_lines = std::fs::read_to_string(format!("{base}/status"))
+            .map(|s| {
+                // Pull the rows users actually care about; full status is 50+ lines.
+                s.lines()
+                    .filter(|l| {
+                        let key = l.split(':').next().unwrap_or("");
+                        matches!(
+                            key,
+                            "Name"
+                                | "State"
+                                | "Tgid"
+                                | "Pid"
+                                | "PPid"
+                                | "Uid"
+                                | "Gid"
+                                | "Threads"
+                                | "VmRSS"
+                                | "VmSize"
+                                | "voluntary_ctxt_switches"
+                                | "nonvoluntary_ctxt_switches"
+                        )
+                    })
+                    .map(|l| l.to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|e| vec![format!("(status unavailable: {e})")]);
+
+        let fd_count = std::fs::read_dir(format!("{base}/fd"))
+            .map(|it| it.count())
+            .map_err(|e| e.to_string());
+
+        let io_lines = std::fs::read_to_string(format!("{base}/io"))
+            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_else(|e| vec![format!("(io unavailable: {e})")]);
+
+        Self {
+            pid,
+            name: name.to_string(),
+            cmdline,
+            status_lines,
+            fd_count,
+            io_lines,
+        }
+    }
+}
+
+/// Pending kill confirmation — when `App.pending_kill` is `Some`, the
+/// kill modal is showing and the user is one keypress away from sending
+/// the signal. `name` is captured at request time so the modal still
+/// reads sensibly if the process disappears between request + confirm.
+#[derive(Debug, Clone)]
+pub struct KillRequest {
+    pub pid: u32,
+    pub name: String,
+    pub signal: KillSignal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillSignal {
+    /// SIGTERM — polite "please exit." Process can catch and clean up.
+    Term,
+    /// SIGKILL — immediate, uncatchable. Last resort.
+    Kill,
+}
+
+impl KillSignal {
+    pub fn label(self) -> &'static str {
+        match self {
+            KillSignal::Term => "SIGTERM",
+            KillSignal::Kill => "SIGKILL",
+        }
+    }
+    pub fn libc_value(self) -> i32 {
+        match self {
+            KillSignal::Term => libc::SIGTERM,
+            KillSignal::Kill => libc::SIGKILL,
+        }
+    }
+}
+
 /// One "preset" — a complete saved view that the user can recall with a
 /// single keystroke. btop calls these "presets" and binds them to 1–4;
 /// we ship the same 4-slot scheme. Each preset bundles the layout, the
@@ -134,6 +331,36 @@ pub struct App {
     /// Cursor row inside the boxes overlay (index into `bobtop_core::Box::ALL`).
     pub boxes_overlay_cursor: usize,
 
+    /// `f` opens the process filter input (B3b). While `filter_active`,
+    /// keystrokes append to `filter_text`; rebuild_sorted hides processes
+    /// whose name and cmdline both miss the substring (case-insensitive).
+    /// `filter_text` persists across edit-mode toggles so the user can
+    /// briefly switch focus and come back without re-typing.
+    pub filter_active: bool,
+    pub filter_text: String,
+
+    /// `k` (SIGTERM) / `K` (SIGKILL) opens a confirm dialog targeting the
+    /// currently-selected process (B3c). `Some(req)` = modal showing.
+    /// Enter sends the signal via libc::kill; Esc cancels.
+    pub pending_kill: Option<KillRequest>,
+    /// Most recent kill outcome — drives a brief one-line toast in the
+    /// status bar so the user gets feedback (success / errno).
+    pub last_kill_msg: Option<String>,
+
+    /// `Enter` opens a read-only detail modal for the selected pid (B3d).
+    /// Lazy-populated from /proc on open; not refreshed every tick because
+    /// most fields (cmdline, environ, fd count) don't churn at human speed.
+    pub detail: Option<ProcessDetail>,
+
+    /// `O` opens the options overlay (B11b). When `Some`, the user is
+    /// editing a snapshot of the persisted Config; ←/→ cycles the field
+    /// at the cursor, ↑/↓ moves cursor, Enter saves to disk + applies
+    /// live, Esc closes without saving.
+    pub options: Option<OptionsState>,
+    /// Status line shown in the header strip after a save attempt
+    /// (success path or error). Cleared on next user action.
+    pub last_options_msg: Option<String>,
+
     /// Set by `apply_event` and `handle_input` whenever something
     /// observable to the renderer has changed. Cleared by `take_dirty`
     /// after the render loop calls `terminal.draw()`. Lets us render
@@ -177,6 +404,13 @@ impl App {
             show_help: false,
             show_boxes_overlay: false,
             boxes_overlay_cursor: 0,
+            filter_active: false,
+            filter_text: String::new(),
+            pending_kill: None,
+            last_kill_msg: None,
+            detail: None,
+            options: None,
+            last_options_msg: None,
             // Start dirty so the very first frame paints something rather
             // than a blank alt-screen until the first sample lands.
             dirty: true,
@@ -302,9 +536,20 @@ impl App {
                 p.net_tx_bytes_per_sec = Some(0.0);
             }
         }
+        // Apply text filter (B3b) if any. Match name OR cmdline,
+        // case-insensitive. Empty filter passes everything.
+        if !self.filter_text.is_empty() {
+            let needle = self.filter_text.to_lowercase();
+            joined.retain(|p| {
+                p.name.to_lowercase().contains(&needle)
+                    || p.cmdline.to_lowercase().contains(&needle)
+            });
+        }
         sort_processes(&mut joined, self.proc_sort, self.proc_sort_descending);
         if !joined.is_empty() && self.selected_proc >= joined.len() {
             self.selected_proc = joined.len() - 1;
+        } else if joined.is_empty() {
+            self.selected_proc = 0;
         }
         self.processes_sorted = joined;
     }
@@ -331,10 +576,14 @@ impl App {
         let cur_idx = cycle.iter().position(|&s| s == self.proc_sort).unwrap_or(0) as i32;
         let len = cycle.len() as i32;
         let new_idx = ((cur_idx + delta) % len + len) % len;
-        self.proc_sort = cycle[new_idx as usize];
-        // Re-sort the already-joined processes_sorted in place rather than
-        // calling rebuild_sorted (avoids re-cloning + re-joining). The net
-        // join state is the same; only the sort key changed.
+        self.set_sort(cycle[new_idx as usize]);
+    }
+
+    /// Set the sort column directly (used by the `n`/`m`/`p`/`c` direct-sort
+    /// keybinds). Re-sorts in place — the join state hasn't changed, only
+    /// the comparator has.
+    pub fn set_sort(&mut self, sort: ProcessSort) {
+        self.proc_sort = sort;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
     }
 
@@ -354,6 +603,77 @@ impl App {
         self.proc_sort = p.sort;
         self.proc_sort_descending = p.descending;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+    }
+
+    /// Open the options overlay (B11b) with a snapshot of the current
+    /// settings. Theme list is queried from the bobtop-tui builtin
+    /// registry once at open time.
+    pub fn open_options(&mut self) {
+        let themes: Vec<String> =
+            bobtop_tui::builtin_names().map(|s| s.to_string()).collect();
+        self.options = Some(OptionsState {
+            cursor: 0,
+            theme: self.theme.name.clone(),
+            tick_ms: self.tick_ms(),
+            layout: match self.layout_preset {
+                LayoutPreset::Full => crate::cli::LayoutChoice::Full,
+                LayoutPreset::Minimal => crate::cli::LayoutChoice::Minimal,
+            },
+            corners: match self.corner_style {
+                CornerStyle::Rounded => crate::cli::CornerChoice::Rounded,
+                CornerStyle::Square => crate::cli::CornerChoice::Square,
+            },
+            // Sticky bools — we don't have these on App today, default to
+            // false. After first save they'll round-trip correctly.
+            no_ebpf: false,
+            no_pcap: false,
+            tty: self.tty_graphs,
+            show_virtual_net: self.show_virtual_net,
+            themes,
+        });
+    }
+
+    /// Apply the staged options to the live App and persist to disk. The
+    /// returned message is for the header toast — Ok = "saved to PATH"
+    /// or "save failed: …".
+    pub fn save_options(&mut self) -> String {
+        let Some(opts) = self.options.take() else {
+            return "no options to save".into();
+        };
+        // Live-apply the changes that mutate render state immediately so
+        // the user sees the effect before we even disk-write. Theme,
+        // corners, tick_ms, layout, tty_graphs, show_virtual_net.
+        if let Some(t) = bobtop_tui::theme::find_source(&opts.theme) {
+            self.theme = bobtop_tui::theme::Theme::from_source(t.0, &t.1);
+        } else {
+            self.theme = bobtop_tui::load_theme(&opts.theme);
+        }
+        self.corner_style = opts.corners.into();
+        self.tick_ms.store(opts.tick_ms, Ordering::Relaxed);
+        self.set_layout(match opts.layout {
+            crate::cli::LayoutChoice::Full => LayoutPreset::Full,
+            crate::cli::LayoutChoice::Minimal => LayoutPreset::Minimal,
+        });
+        self.tty_graphs = opts.tty;
+        self.show_virtual_net = opts.show_virtual_net;
+        // Then persist.
+        match opts.to_config().save() {
+            Ok(p) => format!("saved {}", p.display()),
+            Err(e) => format!("save failed: {e}"),
+        }
+    }
+
+    /// Stage a kill request for the currently-selected process. No signal
+    /// is sent yet — the user has to confirm via Enter in the modal. If
+    /// no process is selected (empty list) this is a silent no-op.
+    pub fn request_kill(&mut self, signal: KillSignal) {
+        if let Some(p) = self.processes_sorted.get(self.selected_proc) {
+            self.pending_kill = Some(KillRequest {
+                pid: p.pid,
+                name: p.name.clone(),
+                signal,
+            });
+        }
     }
 
     pub fn toggle_sort_direction(&mut self) {
@@ -378,6 +698,116 @@ impl App {
 
     fn handle_key(&mut self, k: KeyEvent) -> ControlFlow {
         let visible_rows = self.processes_sorted.len();
+
+        // Options overlay (B11b) — modal. ↑/↓ moves cursor, ←/→ cycles
+        // the value at the cursor, Enter saves to disk + applies live,
+        // Esc closes without saving. Routed before everything else so
+        // the rest of the keybinds can't fire while the user is editing.
+        if self.options.is_some() {
+            match k.code {
+                KeyCode::Esc => {
+                    self.options = None;
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Enter => {
+                    let msg = self.save_options();
+                    self.last_options_msg = Some(msg);
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Up => {
+                    if let Some(o) = self.options.as_mut() {
+                        if o.cursor > 0 {
+                            o.cursor -= 1;
+                        }
+                    }
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Down => {
+                    if let Some(o) = self.options.as_mut() {
+                        if o.cursor + 1 < OptionsState::FIELD_COUNT {
+                            o.cursor += 1;
+                        }
+                    }
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Left => {
+                    if let Some(o) = self.options.as_mut() {
+                        o.cycle_field(-1);
+                    }
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Right | KeyCode::Char(' ') => {
+                    if let Some(o) = self.options.as_mut() {
+                        o.cycle_field(1);
+                    }
+                    return ControlFlow::Continue;
+                }
+                _ => return ControlFlow::Continue,
+            }
+        }
+
+        // Detail modal (B3d) — Esc closes. While open the rest of the
+        // UI is read-only so we don't lose the user's place if they
+        // accidentally press a sort key.
+        if self.detail.is_some() {
+            match k.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.detail = None;
+                    return ControlFlow::Continue;
+                }
+                _ => return ControlFlow::Continue,
+            }
+        }
+
+        // Kill confirm dialog (B3c) — modal. Enter sends the signal,
+        // Esc/n cancels. We route this first so the user can't
+        // accidentally take other action with the modal up.
+        if let Some(req) = self.pending_kill.clone() {
+            match k.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let outcome = send_signal(req.pid, req.signal);
+                    self.last_kill_msg = Some(outcome);
+                    self.pending_kill = None;
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.pending_kill = None;
+                    return ControlFlow::Continue;
+                }
+                _ => return ControlFlow::Continue,
+            }
+        }
+
+        // Filter input (B3b) — when active, every keystroke goes into the
+        // filter text. Esc cancels the filter entirely; Enter commits and
+        // exits edit mode (filter stays applied). This must come BEFORE
+        // any other modal so e.g. `q` / `B` while typing don't quit/open menus.
+        if self.filter_active {
+            match k.code {
+                KeyCode::Esc => {
+                    self.filter_active = false;
+                    self.filter_text.clear();
+                    self.rebuild_sorted();
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Enter => {
+                    self.filter_active = false;
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Backspace => {
+                    self.filter_text.pop();
+                    self.rebuild_sorted();
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Char(c) => {
+                    self.filter_text.push(c);
+                    self.rebuild_sorted();
+                    return ControlFlow::Continue;
+                }
+                _ => return ControlFlow::Continue,
+            }
+        }
+
         // When the help overlay is open, only `?` / Esc / `q` are routed —
         // everything else is swallowed so the user doesn't accidentally
         // mutate state while reading the keybinds.
@@ -403,13 +833,13 @@ impl App {
                     self.show_boxes_overlay = false;
                     return ControlFlow::Continue;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if self.boxes_overlay_cursor > 0 {
                         self.boxes_overlay_cursor -= 1;
                     }
                     return ControlFlow::Continue;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if self.boxes_overlay_cursor + 1 < n {
                         self.boxes_overlay_cursor += 1;
                     }
@@ -436,6 +866,33 @@ impl App {
                 self.boxes_overlay_cursor = 0;
                 ControlFlow::Continue
             }
+            KeyCode::Char('f') => {
+                // Open the filter input (B3b). If a filter is already applied
+                // (text non-empty, but not in edit mode), `f` re-enters edit
+                // mode so the user can refine it.
+                self.filter_active = true;
+                ControlFlow::Continue
+            }
+            KeyCode::Char('k') => {
+                self.request_kill(KillSignal::Term);
+                ControlFlow::Continue
+            }
+            KeyCode::Char('K') => {
+                self.request_kill(KillSignal::Kill);
+                ControlFlow::Continue
+            }
+            KeyCode::Enter => {
+                // Open detail modal for the selected pid. Reads /proc on
+                // open (B3d). No-op when the list is empty.
+                if let Some(p) = self.processes_sorted.get(self.selected_proc) {
+                    self.detail = Some(ProcessDetail::read(p.pid, &p.name));
+                }
+                ControlFlow::Continue
+            }
+            KeyCode::Char('O') => {
+                self.open_options();
+                ControlFlow::Continue
+            }
             KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
             KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => {
                 let idx = (c as u8 - b'1') as usize;
@@ -444,10 +901,23 @@ impl App {
                 }
                 ControlFlow::Continue
             }
-            // `m` is a legacy alias for the minimal preset (slot 4) — kept
-            // because earlier docs referenced it and muscle memory matters.
+            // Direct sort shortcuts (B3a). `m` used to alias preset 4
+            // (minimal); that alias is dropped in favor of the more useful
+            // sort-by-mem binding — preset 4 is still reachable via `4`.
+            KeyCode::Char('p') => {
+                self.set_sort(ProcessSort::Pid);
+                ControlFlow::Continue
+            }
+            KeyCode::Char('n') => {
+                self.set_sort(ProcessSort::Name);
+                ControlFlow::Continue
+            }
             KeyCode::Char('m') => {
-                self.apply_preset(&DEFAULT_PRESETS[3]);
+                self.set_sort(ProcessSort::Mem);
+                ControlFlow::Continue
+            }
+            KeyCode::Char('c') => {
+                self.set_sort(ProcessSort::Cpu);
                 ControlFlow::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -471,7 +941,10 @@ impl App {
                 self.toggle_sort_direction();
                 ControlFlow::Continue
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
+                // Note: vim-style `k` for up was dropped after B3a/B3c —
+                // `k` now sends SIGTERM and `j` `n` `m` etc. carry sort
+                // shortcuts. Use the actual arrow keys for cursor movement.
                 if self.selected_proc > 0 {
                     self.selected_proc -= 1;
                     if self.selected_proc < self.scroll_offset {
@@ -480,7 +953,7 @@ impl App {
                 }
                 ControlFlow::Continue
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 if self.selected_proc + 1 < visible_rows {
                     self.selected_proc += 1;
                 }
@@ -547,6 +1020,24 @@ fn sort_processes(rows: &mut [ProcessInfo], sort: ProcessSort, descending: bool)
         };
         if descending { ord.reverse() } else { ord }
     });
+}
+
+/// Send `signal` to `pid` via libc::kill. Returns a short human-readable
+/// outcome ("sent SIGTERM to pid 1234" / "kill(1234) failed: EPERM") for
+/// the status-bar toast. Errors are surfaced to the user but never
+/// propagated up — kill failures are routine (perm denied, race with
+/// process exit) and should not crash the TUI.
+fn send_signal(pid: u32, signal: KillSignal) -> String {
+    // SAFETY: libc::kill is async-signal-safe; we pass a valid (positive)
+    // pid_t and a known constant signal number. Worst case the kernel
+    // returns EINVAL/EPERM/ESRCH, which we surface as a string.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal.libc_value()) };
+    if rc == 0 {
+        format!("sent {} to pid {}", signal.label(), pid)
+    } else {
+        let err = std::io::Error::last_os_error();
+        format!("kill(pid={pid}, {sig}) failed: {err}", sig = signal.label())
+    }
 }
 
 fn aggregate_net_rates(s: &NetworkSample, include_virtual: bool) -> (f64, f64) {
@@ -705,12 +1196,91 @@ mod tests {
         assert!(app.boxes.is_enabled(BoxKind::Cpu));
         assert!(app.boxes.is_enabled(BoxKind::Process));
 
-        // `m` is the legacy alias for slot 4 — should still work.
-        app.apply_preset(&DEFAULT_PRESETS[0]); // back to slot 1
+        // After B3a, `m` is the direct sort-by-mem shortcut, not the
+        // preset-4 alias. Verify it sorts (and does NOT change layout).
+        app.apply_preset(&DEFAULT_PRESETS[0]); // back to slot 1 (sort: Cpu)
         assert_eq!(app.layout_preset, LayoutPreset::Full);
+        assert_eq!(app.proc_sort, ProcessSort::Cpu);
         let m = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         app.handle_input(m);
-        assert_eq!(app.layout_preset, LayoutPreset::Minimal);
+        assert_eq!(app.proc_sort, ProcessSort::Mem);
+        assert_eq!(app.layout_preset, LayoutPreset::Full); // not changed
+    }
+
+    #[test]
+    fn kill_key_stages_request_then_cancel_clears_it() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![fake_proc(4242, "victim", 0.0)],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+        app.selected_proc = 0;
+
+        // Press `k` → SIGTERM staged for selected pid.
+        let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_input(press('k'));
+        let req = app.pending_kill.as_ref().expect("kill staged");
+        assert_eq!(req.pid, 4242);
+        assert_eq!(req.signal, KillSignal::Term);
+
+        // Esc cancels — no signal sent (no last_kill_msg), pending cleared.
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input(esc);
+        assert!(app.pending_kill.is_none());
+        assert!(app.last_kill_msg.is_none());
+
+        // Press `K` (capital) → SIGKILL staged.
+        app.handle_input(press('K'));
+        let req = app.pending_kill.as_ref().expect("kill staged");
+        assert_eq!(req.signal, KillSignal::Kill);
+    }
+
+    #[test]
+    fn filter_typing_narrows_processes_sorted() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc(1, "firefox", 0.10),
+                fake_proc(2, "chrome", 0.20),
+                fake_proc(3, "chromium", 0.30),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+        assert_eq!(app.processes_sorted.len(), 3);
+
+        // Open filter, type "chrom" → should keep "chrome" + "chromium".
+        let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_input(press('f'));
+        assert!(app.filter_active);
+        for c in "chrom".chars() {
+            app.handle_input(press(c));
+        }
+        assert_eq!(app.filter_text, "chrom");
+        assert_eq!(app.processes_sorted.len(), 2);
+        assert!(app.processes_sorted.iter().all(|p| p.name.contains("chrom")));
+
+        // Esc clears the filter and exits edit mode.
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input(esc);
+        assert!(!app.filter_active);
+        assert_eq!(app.filter_text, "");
+        assert_eq!(app.processes_sorted.len(), 3);
+    }
+
+    #[test]
+    fn direct_sort_keys_set_sort_columns() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_input(press('p'));
+        assert_eq!(app.proc_sort, ProcessSort::Pid);
+        app.handle_input(press('n'));
+        assert_eq!(app.proc_sort, ProcessSort::Name);
+        app.handle_input(press('m'));
+        assert_eq!(app.proc_sort, ProcessSort::Mem);
+        app.handle_input(press('c'));
+        assert_eq!(app.proc_sort, ProcessSort::Cpu);
     }
 
     #[test]

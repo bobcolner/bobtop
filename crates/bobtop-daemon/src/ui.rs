@@ -84,6 +84,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_boxes_overlay {
         draw_boxes_overlay(frame, area, app);
     }
+    if app.pending_kill.is_some() {
+        draw_kill_dialog(frame, area, app);
+    }
+    if app.detail.is_some() {
+        draw_detail_modal(frame, area, app);
+    }
+    if app.options.is_some() {
+        draw_options_overlay(frame, area, app);
+    }
     if app.show_help {
         draw_help_overlay(frame, area, app);
     }
@@ -118,14 +127,21 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
     let version = env!("CARGO_PKG_VERSION");
     let uptime = format_uptime(app.started_at.elapsed());
-    let left = format!(
-        " bobtop v{version}  │  tier: {}  │  theme: {}",
-        app.net_tier.name(),
-        app.theme.name,
-    );
+    // last_options_msg wins over last_kill_msg if both are set, since the
+    // options-save toast is rarer and the user just took action.
+    let toast = app.last_options_msg.as_ref().or(app.last_kill_msg.as_ref());
+    let left = match toast {
+        Some(msg) => format!(" {msg} "),
+        None => format!(
+            " bobtop v{version}  │  tier: {}  │  theme: {}",
+            app.net_tier.name(),
+            app.theme.name,
+        ),
+    };
     let right = format!("up {uptime} ");
 
-    write_str_at(buf, area.x, area.y, &left, Style::default().bg(bg).fg(fg));
+    let left_fg = if toast.is_some() { app.theme.hi_fg } else { fg };
+    write_str_at(buf, area.x, area.y, &left, Style::default().bg(bg).fg(left_fg));
     let right_len = right.chars().count() as u16;
     if right_len + 1 < area.width {
         write_str_at(
@@ -223,6 +239,222 @@ fn box_label(b: BoxKind) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Options overlay (B11b)
+// ---------------------------------------------------------------------------
+
+fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(opts) = &app.options else { return };
+    let want_w: u16 = 56;
+    let want_h: u16 = (crate::app::OptionsState::FIELD_COUNT as u16) + 6;
+    if area.width < want_w || area.height < want_h {
+        return;
+    }
+    let x = area.x + (area.width - want_w) / 2;
+    let y = area.y + (area.height - want_h) / 2;
+    let modal = Rect::new(x, y, want_w, want_h);
+
+    let panel = mk_panel(app, app.theme.title, app.theme.title)
+        .with_title(" options ".to_string())
+        .with_keybinds(" ↑↓ field   ←→ value   Enter save+apply   Esc cancel ");
+    frame.render_widget(&panel, modal);
+    let body = panel.inner(modal);
+    let buf = frame.buffer_mut();
+    let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
+    for yy in body.y..body.y + body.height {
+        for xx in body.x..body.x + body.width {
+            let cell = &mut buf[(xx, yy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
+        }
+    }
+
+    let rows: [(&str, String); crate::app::OptionsState::FIELD_COUNT] = [
+        ("theme", opts.theme.clone()),
+        ("tick_ms", format!("{} ms", opts.tick_ms)),
+        ("layout", format!("{:?}", opts.layout).to_lowercase()),
+        ("corners", format!("{:?}", opts.corners).to_lowercase()),
+        ("no_ebpf", bool_label(opts.no_ebpf)),
+        ("no_pcap", bool_label(opts.no_pcap)),
+        ("tty (block graphs)", bool_label(opts.tty)),
+        ("show_virtual_net", bool_label(opts.show_virtual_net)),
+    ];
+    let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(8) as u16;
+    write_str_at(
+        buf,
+        body.x + 2,
+        body.y + 1,
+        "(saved to ~/.config/bobtop/bobtop.toml on Enter)",
+        Style::default().bg(bg).fg(app.theme.inactive_fg),
+    );
+    for (i, (label, value)) in rows.iter().enumerate() {
+        let row_y = body.y + 3 + i as u16;
+        if row_y >= body.y + body.height {
+            break;
+        }
+        let is_cursor = i == opts.cursor;
+        if is_cursor {
+            for xx in body.x + 1..body.x + body.width - 1 {
+                buf[(xx, row_y)].set_style(Style::default().bg(app.theme.selected_bg));
+            }
+        }
+        let prefix = if is_cursor { "▶ " } else { "  " };
+        let row_bg = if is_cursor { app.theme.selected_bg } else { bg };
+        let row_fg = if is_cursor { app.theme.selected_fg } else { app.theme.main_fg };
+        let line = format!(
+            "{prefix}{:<width$}  ◀ {value} ▶",
+            label,
+            width = label_w as usize,
+        );
+        write_str_at(buf, body.x + 2, row_y, &line, Style::default().bg(row_bg).fg(row_fg));
+    }
+}
+
+fn bool_label(b: bool) -> String {
+    if b { "yes".into() } else { "no".into() }
+}
+
+// ---------------------------------------------------------------------------
+// Process detail modal (B3d)
+// ---------------------------------------------------------------------------
+
+fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(d) = &app.detail else { return };
+    // Take ~70% width / ~70% height, centered.
+    let want_w = (area.width * 7 / 10).max(50).min(area.width);
+    let want_h = (area.height * 7 / 10).max(14).min(area.height);
+    let x = area.x + (area.width - want_w) / 2;
+    let y = area.y + (area.height - want_h) / 2;
+    let modal = Rect::new(x, y, want_w, want_h);
+
+    let panel = mk_panel(app, app.theme.proc_box, app.theme.title)
+        .with_title(format!(" {} (pid {}) ", d.name, d.pid))
+        .with_keybinds(" Esc / Enter close ");
+    frame.render_widget(&panel, modal);
+    let body = panel.inner(modal);
+    let buf = frame.buffer_mut();
+    let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
+    for yy in body.y..body.y + body.height {
+        for xx in body.x..body.x + body.width {
+            let cell = &mut buf[(xx, yy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
+        }
+    }
+
+    // Section header writer: highlight color, then a divider in dim.
+    let mut row = body.y;
+    let max_row = body.y + body.height;
+    let write_section = |buf: &mut ratatui::buffer::Buffer, row: u16, name: &str| {
+        write_str_at(
+            buf,
+            body.x + 1,
+            row,
+            &format!("── {name} "),
+            Style::default().bg(bg).fg(app.theme.hi_fg),
+        );
+    };
+    let write_line = |buf: &mut ratatui::buffer::Buffer, row: u16, s: &str| {
+        let s = if s.chars().count() > body.width as usize - 4 {
+            let mut t: String = s.chars().take(body.width as usize - 5).collect();
+            t.push('…');
+            t
+        } else {
+            s.to_string()
+        };
+        write_str_at(
+            buf,
+            body.x + 2,
+            row,
+            &s,
+            Style::default().bg(bg).fg(app.theme.main_fg),
+        );
+    };
+
+    write_section(buf, row, "cmdline");
+    row += 1;
+    if row < max_row {
+        let cmd = if d.cmdline.is_empty() { "(no cmdline)" } else { &d.cmdline };
+        write_line(buf, row, cmd);
+        row += 2;
+    }
+
+    if row < max_row {
+        write_section(buf, row, "status");
+        row += 1;
+        for line in &d.status_lines {
+            if row >= max_row {
+                break;
+            }
+            write_line(buf, row, line);
+            row += 1;
+        }
+        row += 1;
+    }
+
+    if row < max_row {
+        write_section(buf, row, "fd");
+        row += 1;
+        let fd_text = match &d.fd_count {
+            Ok(n) => format!("open file descriptors: {n}"),
+            Err(e) => format!("(unavailable: {e})"),
+        };
+        write_line(buf, row, &fd_text);
+        row += 2;
+    }
+
+    if row < max_row {
+        write_section(buf, row, "io");
+        row += 1;
+        for line in &d.io_lines {
+            if row >= max_row {
+                break;
+            }
+            write_line(buf, row, line);
+            row += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kill confirm dialog (B3c)
+// ---------------------------------------------------------------------------
+
+fn draw_kill_dialog(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(req) = &app.pending_kill else { return };
+    let line1 = format!(" Send {} to pid {} ({})?", req.signal.label(), req.pid, req.name);
+    let line2 = " [Enter / y]  confirm    [Esc / n]  cancel ";
+    let want_w = (line1.chars().count().max(line2.chars().count()) + 4) as u16;
+    let want_h: u16 = 6;
+    if area.width < want_w || area.height < want_h {
+        return;
+    }
+    let x = area.x + (area.width - want_w) / 2;
+    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
+    let modal = Rect::new(x, y, want_w, want_h);
+
+    // Reuse the proc panel's accent color for the title — danger reads as
+    // a clearly differentiated overlay.
+    let title = match req.signal {
+        crate::app::KillSignal::Term => " confirm — SIGTERM ".to_string(),
+        crate::app::KillSignal::Kill => " ⚠ confirm — SIGKILL ".to_string(),
+    };
+    let panel = mk_panel(app, app.theme.proc_box, app.theme.title).with_title(title);
+    frame.render_widget(&panel, modal);
+    let body = panel.inner(modal);
+    let buf = frame.buffer_mut();
+    let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
+    for yy in body.y..body.y + body.height {
+        for xx in body.x..body.x + body.width {
+            let cell = &mut buf[(xx, yy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
+        }
+    }
+    write_str_at(buf, body.x + 1, body.y + 1, &line1, Style::default().bg(bg).fg(app.theme.hi_fg));
+    write_str_at(buf, body.x + 1, body.y + 3, line2, Style::default().bg(bg).fg(app.theme.inactive_fg));
+}
+
+// ---------------------------------------------------------------------------
 // Help overlay (B2)
 // ---------------------------------------------------------------------------
 
@@ -233,16 +465,21 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
-    ("↑ / ↓ / k / j", "select process"),
+    ("↑ / ↓", "select process"),
     ("PgUp / PgDn / Home / End", "jump in process list"),
-    ("← / → / h / l", "cycle sort column"),
+    ("← / →", "cycle sort column"),
     ("r", "reverse sort direction"),
     ("+ / -", "adjust global tick"),
     ("1", "preset 1 — full, sort by CPU"),
     ("2", "preset 2 — full, sort by MEM"),
     ("3", "preset 3 — full, sort by NET RX"),
-    ("4 / m", "preset 4 — minimal (CPU + processes only)"),
+    ("4", "preset 4 — minimal (CPU + processes only)"),
+    ("p / n / m / c", "sort by Pid / Name / Mem / Cpu"),
     ("B", "boxes — show/hide individual panels"),
+    ("f", "filter processes by name/cmdline"),
+    ("k / K", "kill (SIGTERM / SIGKILL) — confirm dialog"),
+    ("Enter", "process detail (read-only)"),
+    ("O", "options — edit config + save to disk"),
 ];
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
@@ -739,26 +976,46 @@ fn interface_counts(app: &App) -> (usize, usize) {
 fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     let arrow = if app.proc_sort_descending { '↓' } else { '↑' };
     let has_bw = app.net_tier.has_bandwidth();
+    let filter_tag = if !app.filter_text.is_empty() {
+        format!("  filter:\"{}\"", app.filter_text)
+    } else {
+        String::new()
+    };
     let title = format!(
-        "⁴proc  {} procs  ←{}{}→  rx/tx: {}{}",
+        "⁴proc  {} procs  ←{}{}→  rx/tx: {}{}{}",
         app.processes_sorted.len(),
         app.proc_sort.label(),
         arrow,
         app.net_tier.name(),
         if has_bw { "" } else { " (build w/ --features ebpf or pcap)" },
+        filter_tag,
     );
     let panel = mk_panel(app, app.theme.proc_box, app.theme.title)
         .with_title(title)
-        .with_keybinds("q quit  ↑↓ select  ←→ sort col  r reverse  +/- tick  1 full  m minimal");
+        .with_keybinds(
+            "q quit  ↑↓ select  ←→ sort col  r reverse  f filter  k/K kill  Enter detail  ?",
+        );
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 20 || inner.height < 2 {
         return;
     }
 
+    // Reserve a footer row for the filter input bar when active. Otherwise
+    // the table claims the full inner area.
+    let (table_area, filter_bar) = if app.filter_active {
+        let body_h = inner.height.saturating_sub(1);
+        (
+            Rect::new(inner.x, inner.y, inner.width, body_h),
+            Some(Rect::new(inner.x, inner.y + body_h, inner.width, 1)),
+        )
+    } else {
+        (inner, None)
+    };
+
     // App.processes_sorted already has the net join + sort applied at apply
     // time. Render uses it directly — no per-frame re-cloning.
-    let body_h = inner.height.saturating_sub(1) as usize;
+    let body_h = table_area.height.saturating_sub(1) as usize;
     let mut scroll_offset = app.scroll_offset;
     if app.selected_proc >= scroll_offset + body_h && body_h > 0 {
         scroll_offset = app.selected_proc + 1 - body_h;
@@ -769,7 +1026,30 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         .with_net_columns(app.net_tier.has_bandwidth())
         .with_direction(app.proc_sort_descending);
     table.sort = app.proc_sort;
-    frame.render_widget(&table, inner);
+    frame.render_widget(&table, table_area);
+
+    if let Some(bar) = filter_bar {
+        let buf = frame.buffer_mut();
+        let bg = app.theme.meter_bg;
+        for x in 0..bar.width {
+            let cell = &mut buf[(bar.x + x, bar.y)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(bg).fg(app.theme.title));
+        }
+        let label = format!(" filter: {}█  ", app.filter_text);
+        write_str_at(buf, bar.x, bar.y, &label, Style::default().bg(bg).fg(app.theme.hi_fg));
+        let hint = " Enter=apply  Esc=clear ";
+        let len = hint.chars().count() as u16;
+        if len + 2 < bar.width {
+            write_str_at(
+                buf,
+                bar.x + bar.width.saturating_sub(len + 1),
+                bar.y,
+                hint,
+                Style::default().bg(bg).fg(app.theme.inactive_fg),
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

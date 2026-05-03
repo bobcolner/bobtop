@@ -33,6 +33,31 @@ pub struct Config {
 }
 
 impl Config {
+    /// Atomic write to the canonical config path. Creates the parent
+    /// directory if missing. Writes through a sibling `.tmp` file then
+    /// renames into place so a partially-written file can never be
+    /// loaded by a subsequent run. Returns the resolved path on success.
+    pub fn save(&self) -> std::io::Result<PathBuf> {
+        let path = Self::default_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no $HOME / $XDG_CONFIG_HOME — cannot write config",
+            )
+        })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = toml::to_string_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?;
+        // Tempfile in the same directory so rename is atomic on POSIX.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
+        tracing::info!(path = %path.display(), "saved config");
+        Ok(path)
+    }
+
     /// Resolved file path: `$XDG_CONFIG_HOME/bobtop/bobtop.toml`, falling
     /// back to `$HOME/.config/bobtop/bobtop.toml`. Returns `None` when no
     /// home directory is discoverable (extremely unusual — sandboxed daemons
@@ -129,6 +154,27 @@ totally_made_up = 42"#;
         let path = std::path::Path::new("/no/such/file/anywhere.toml");
         let c = Config::load_from(path).unwrap();
         assert!(c.theme.is_none());
+    }
+
+    #[test]
+    fn save_then_reload_round_trips() {
+        // Use a unique XDG_CONFIG_HOME under temp dir so we don't stomp
+        // a real user config and parallel test runs don't collide.
+        let xdg = std::env::temp_dir().join(format!("bobtop_save_{}", std::process::id()));
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let cfg = Config {
+            theme: Some("nord".into()),
+            tick_ms: Some(2000),
+            corners: Some(crate::cli::CornerChoice::Square),
+            ..Default::default()
+        };
+        let path = cfg.save().expect("save");
+        let back = Config::load_from(&path).expect("reload");
+        assert_eq!(back.theme.as_deref(), Some("nord"));
+        assert_eq!(back.tick_ms, Some(2000));
+        assert_eq!(back.corners, Some(crate::cli::CornerChoice::Square));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
