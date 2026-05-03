@@ -77,6 +77,11 @@ pub struct Cli {
     /// Print every available theme name and exit.
     #[arg(long)]
     pub list_themes: bool,
+
+    /// Print the keybind list and exit. Uses the same source-of-truth
+    /// table the in-app `?` overlay reads, so the two cannot drift.
+    #[arg(long)]
+    pub help_keys: bool,
 }
 
 impl Cli {

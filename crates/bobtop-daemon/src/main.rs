@@ -38,6 +38,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.help_keys {
+        print_help_keys();
+        return Ok(());
+    }
+
     let cfg = Config::load_or_default();
     let eff = resolve(&cli, &matches, &cfg);
 
@@ -195,6 +200,20 @@ fn resolve(cli: &Cli, matches: &clap::ArgMatches, cfg: &Config) -> EffectiveConf
         } else {
             cfg.corners.unwrap_or(cli.corners)
         },
+    }
+}
+
+fn print_help_keys() {
+    // Right-align keys to the longest, separated from descriptions by 2
+    // spaces. Same data the `?` overlay reads.
+    let key_w = bobtop_daemon::ui::HELP_LINES
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8);
+    println!("bobtop keybinds:");
+    for (k, d) in bobtop_daemon::ui::HELP_LINES {
+        println!("  {:>width$}  {}", k, d, width = key_w);
     }
 }
 

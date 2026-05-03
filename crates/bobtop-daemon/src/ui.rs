@@ -226,7 +226,10 @@ fn box_label(b: BoxKind) -> &'static str {
 // Help overlay (B2)
 // ---------------------------------------------------------------------------
 
-const HELP_LINES: &[(&str, &str)] = &[
+/// Authoritative keybind list — used both by the in-app `?` overlay and
+/// the `--help-keys` CLI flag (see `main.rs::print_help_keys`). One source
+/// of truth so the flag and the overlay can never drift apart.
+pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
@@ -316,6 +319,11 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|s| s.cores.len())
         .unwrap_or(0);
+    let freq = app
+        .latest_cpu
+        .as_ref()
+        .map(|s| avg_frequency_label(s))
+        .unwrap_or_default();
     let load = app
         .latest_cpu
         .as_ref()
@@ -323,7 +331,7 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
         .map(|l| format!("load {:.2} {:.2} {:.2}", l.one, l.five, l.fifteen))
         .unwrap_or_else(|| "load — — —".into());
 
-    let title = format!("¹cpu  CPU {:.1}%  Cores={}  {}", cpu_pct, cores, load);
+    let title = format!("¹cpu  CPU {:.1}%{}  Cores={}  {}", cpu_pct, freq, cores, load);
     let panel = mk_panel(app, app.theme.cpu_box, app.theme.title)
         .with_title(title)
         .with_controls(format!("- {}ms +", app.tick_ms()));
@@ -356,6 +364,32 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
 
     if let Some(s) = &app.latest_cpu {
         draw_core_meters(frame, meters_area, s, &app.theme);
+    }
+}
+
+/// Average per-core frequency formatted for the CPU panel title.
+/// Returns `"  3.2 GHz"` (leading 2-space separator) when at least one core
+/// reports a frequency, or empty when no core reports it (some VMs / WSL
+/// expose 0 for `frequency_mhz`). Empty avoids ugly `(0 MHz)` artifacts.
+fn avg_frequency_label(s: &bobtop_core::sample::CpuSample) -> String {
+    let mut sum_mhz: u64 = 0;
+    let mut n: u64 = 0;
+    for c in &s.cores {
+        if let Some(f) = c.frequency_mhz {
+            if f > 0 {
+                sum_mhz += f as u64;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return String::new();
+    }
+    let avg = (sum_mhz / n) as f64;
+    if avg >= 1000.0 {
+        format!("  {:.1} GHz", avg / 1000.0)
+    } else {
+        format!("  {:.0} MHz", avg)
     }
 }
 
