@@ -1,0 +1,350 @@
+//! CPU utilization collector.
+//!
+//! - **Linux:** parses `/proc/stat` for per-core jiffy counters, computes
+//!   busy/total deltas vs. the previous snapshot, reads `/proc/loadavg` for
+//!   load average, and best-effort reads `cpufreq/scaling_cur_freq` per core.
+//! - **macOS:** placeholder — returns [`bobtop_core::CoreError::Unsupported`].
+//!   Real impl will use `host_processor_info` from the mach kernel API.
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use bobtop_core::sample::{CoreSample, CpuSample, LoadAverage};
+use bobtop_core::{Collector, CoreError, Result};
+
+const DEFAULT_INTERVAL_MS: u64 = 1000;
+
+/// Periodic CPU sampler.
+///
+/// Stateful: holds the previous jiffy snapshot so each `collect()` can
+/// compute a utilization delta. The first call after construction returns a
+/// zero-utilization sample (we have no baseline to compare against yet) and
+/// stores the current snapshot for use on the next call.
+#[derive(Debug)]
+pub struct CpuCollector {
+    interval: Duration,
+    state: Mutex<Option<Snapshot>>,
+}
+
+#[derive(Debug, Clone)]
+struct Snapshot {
+    aggregate: CpuTimes,
+    cores: Vec<CpuTimes>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuTimes {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+}
+
+impl CpuTimes {
+    fn total(&self) -> u64 {
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
+    }
+
+    fn idle_total(&self) -> u64 {
+        self.idle + self.iowait
+    }
+}
+
+impl CpuCollector {
+    pub fn new() -> Self {
+        Self::with_interval(Duration::from_millis(DEFAULT_INTERVAL_MS))
+    }
+
+    pub fn with_interval(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(None),
+        }
+    }
+}
+
+impl Default for CpuCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Collector for CpuCollector {
+    type Sample = CpuSample;
+
+    async fn collect(&self) -> Result<CpuSample> {
+        let snapshot = read_snapshot()?;
+        let load = read_loadavg().ok();
+        let frequencies = read_core_frequencies(snapshot.cores.len());
+
+        // Lock briefly to swap previous-state. On poison (another thread
+        // panicked while holding it) take the inner value and continue —
+        // utilization math is stateless modulo the previous snapshot.
+        let prev = match self.state.lock() {
+            Ok(mut g) => g.replace(snapshot.clone()),
+            Err(poisoned) => {
+                let mut g = poisoned.into_inner();
+                g.replace(snapshot.clone())
+            }
+        };
+
+        let cores = build_core_samples(&snapshot, prev.as_ref(), &frequencies);
+        let aggregate_utilization = match prev.as_ref() {
+            Some(p) => utilization_fraction(p.aggregate, snapshot.aggregate),
+            None => 0.0,
+        };
+
+        Ok(CpuSample {
+            timestamp: Instant::now(),
+            aggregate_utilization,
+            cores,
+            load_average: load,
+        })
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    fn name(&self) -> &'static str {
+        "cpu"
+    }
+}
+
+fn build_core_samples(
+    cur: &Snapshot,
+    prev: Option<&Snapshot>,
+    frequencies: &[Option<u32>],
+) -> Vec<CoreSample> {
+    cur.cores
+        .iter()
+        .enumerate()
+        .map(|(i, &times)| {
+            let utilization = match prev {
+                Some(p) if p.cores.len() == cur.cores.len() => {
+                    utilization_fraction(p.cores[i], times)
+                }
+                _ => 0.0,
+            };
+            CoreSample {
+                id: i as u32,
+                utilization,
+                frequency_mhz: frequencies.get(i).copied().flatten(),
+                temperature_c: None,
+            }
+        })
+        .collect()
+}
+
+fn utilization_fraction(prev: CpuTimes, cur: CpuTimes) -> f32 {
+    let total = cur.total().saturating_sub(prev.total());
+    let idle = cur.idle_total().saturating_sub(prev.idle_total());
+    if total == 0 {
+        return 0.0;
+    }
+    let busy = total.saturating_sub(idle);
+    (busy as f64 / total as f64).clamp(0.0, 1.0) as f32
+}
+
+// -------------------------------------------------------------------------
+// Linux readers
+// -------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn read_snapshot() -> Result<Snapshot> {
+    let text = std::fs::read_to_string("/proc/stat")?;
+    parse_proc_stat(&text)
+        .ok_or_else(|| CoreError::parse("/proc/stat: missing aggregate `cpu` line"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_loadavg() -> Result<LoadAverage> {
+    let text = std::fs::read_to_string("/proc/loadavg")?;
+    parse_loadavg(&text).ok_or_else(|| CoreError::parse("/proc/loadavg malformed"))
+}
+
+#[cfg(target_os = "linux")]
+fn read_core_frequencies(n: usize) -> Vec<Option<u32>> {
+    (0..n)
+        .map(|i| {
+            let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq");
+            std::fs::read_to_string(path).ok().and_then(|s| {
+                // File holds frequency in kHz.
+                s.trim().parse::<u64>().ok().map(|khz| (khz / 1000) as u32)
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(text: &str) -> Option<Snapshot> {
+    let mut aggregate: Option<CpuTimes> = None;
+    let mut cores: Vec<CpuTimes> = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_ascii_whitespace();
+        let label = it.next()?;
+        if !label.starts_with("cpu") {
+            // /proc/stat continues with `intr`, `ctxt`, etc. — done with cpu rows.
+            if aggregate.is_some() {
+                break;
+            }
+            continue;
+        }
+        let times = parse_cpu_times(it)?;
+        if label == "cpu" {
+            aggregate = Some(times);
+        } else {
+            // label is "cpuN" — push into `cores` ordered by appearance.
+            cores.push(times);
+        }
+    }
+    Some(Snapshot {
+        aggregate: aggregate?,
+        cores,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpu_times<'a, I: Iterator<Item = &'a str>>(mut fields: I) -> Option<CpuTimes> {
+    // Fields after the label: user nice system idle iowait irq softirq steal [guest guest_nice]
+    let user: u64 = fields.next()?.parse().ok()?;
+    let nice: u64 = fields.next()?.parse().ok()?;
+    let system: u64 = fields.next()?.parse().ok()?;
+    let idle: u64 = fields.next()?.parse().ok()?;
+    let iowait: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let irq: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let softirq: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let steal: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(CpuTimes {
+        user,
+        nice,
+        system,
+        idle,
+        iowait,
+        irq,
+        softirq,
+        steal,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_loadavg(text: &str) -> Option<LoadAverage> {
+    let mut it = text.split_ascii_whitespace();
+    let one: f32 = it.next()?.parse().ok()?;
+    let five: f32 = it.next()?.parse().ok()?;
+    let fifteen: f32 = it.next()?.parse().ok()?;
+    Some(LoadAverage {
+        one,
+        five,
+        fifteen,
+    })
+}
+
+// -------------------------------------------------------------------------
+// macOS placeholder
+// -------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
+fn read_snapshot() -> Result<Snapshot> {
+    Err(CoreError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_loadavg() -> Result<LoadAverage> {
+    Err(CoreError::Unsupported)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_core_frequencies(_n: usize) -> Vec<Option<u32>> {
+    Vec::new()
+}
+
+// -------------------------------------------------------------------------
+// Tests
+// -------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "cpu  100 5 50 800 10 0 5 0 0 0\ncpu0 50 2 25 400 5 0 2 0 0 0\ncpu1 50 3 25 400 5 0 3 0 0 0\nintr 1234\nctxt 5678\n";
+
+    #[test]
+    fn parses_aggregate_and_per_core() {
+        let snap = parse_proc_stat(SAMPLE).expect("parse");
+        assert_eq!(snap.cores.len(), 2);
+        assert_eq!(snap.aggregate.user, 100);
+        assert_eq!(snap.aggregate.idle, 800);
+        assert_eq!(snap.cores[1].system, 25);
+    }
+
+    #[test]
+    fn utilization_zero_when_no_movement() {
+        let t = CpuTimes {
+            user: 100,
+            idle: 800,
+            ..Default::default()
+        };
+        assert_eq!(utilization_fraction(t, t), 0.0);
+    }
+
+    #[test]
+    fn utilization_correct_for_known_delta() {
+        let prev = CpuTimes {
+            user: 0,
+            idle: 0,
+            ..Default::default()
+        };
+        let cur = CpuTimes {
+            user: 30,
+            idle: 70,
+            ..Default::default()
+        };
+        // 30 busy out of 100 total = 0.30
+        let u = utilization_fraction(prev, cur);
+        assert!((u - 0.30).abs() < 1e-5, "got {u}");
+    }
+
+    #[test]
+    fn loadavg_roundtrip() {
+        let l = parse_loadavg("0.42 0.48 0.55 1/512 12345\n").unwrap();
+        assert!((l.one - 0.42).abs() < 1e-3);
+        assert!((l.fifteen - 0.55).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn first_collect_returns_zero_then_subsequent_returns_real() {
+        let c = CpuCollector::new();
+        let first = c.collect().await.expect("first");
+        assert_eq!(first.aggregate_utilization, 0.0);
+        assert!(!first.cores.is_empty(), "should report at least one core");
+
+        // Burn a bit of CPU so the second sample sees non-zero busy time.
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        let mut x: u64 = 1;
+        while std::time::Instant::now() < deadline {
+            x = x.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+
+        let second = c.collect().await.expect("second");
+        assert!(
+            (0.0..=1.0).contains(&second.aggregate_utilization),
+            "utilization out of range: {}",
+            second.aggregate_utilization
+        );
+    }
+}

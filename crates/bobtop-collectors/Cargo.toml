@@ -1,0 +1,27 @@
+[package]
+name = "bobtop-collectors"
+description = "Per-subsystem data collectors for bobtop (CPU, memory, disk, network, processes, GPU)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bobtop-core = { workspace = true }
+bobtop-net = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sysinfo = { workspace = true }
+libc = { workspace = true }
+
+# Optional: NVIDIA GPU stats via NVML.
+nvml-wrapper = { workspace = true, optional = true }
+
+[features]
+default = []
+nvidia = ["dep:nvml-wrapper"]

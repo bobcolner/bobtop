@@ -1,0 +1,33 @@
+[package]
+name = "bobtop-net"
+description = "Tiered per-process network attribution for bobtop (proc inode, libpcap, eBPF)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bobtop-core = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+
+# Optional: Tier 2 — userspace packet capture.
+pcap = { workspace = true, optional = true }
+
+# Tier 3 — eBPF userspace loader. Linux-only at the source level; gating on
+# `cfg(target_os = "linux")` keeps macOS builds clean even when the `ebpf`
+# feature is requested by mistake.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { workspace = true, optional = true }
+
+[features]
+default = []
+pcap = ["dep:pcap"]
+ebpf = ["dep:aya"]

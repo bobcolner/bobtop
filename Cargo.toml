@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bobtop-core",
+    "crates/bobtop-collectors",
+    "crates/bobtop-net",
+    "crates/bobtop-tui",
+    "crates/bobtop-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bobcolner/bobtop"
+authors = ["bobtop contributors"]
+
+[workspace.dependencies]
+# First-party crates (path-resolved within the workspace)
+bobtop-core = { path = "crates/bobtop-core" }
+bobtop-collectors = { path = "crates/bobtop-collectors" }
+bobtop-net = { path = "crates/bobtop-net" }
+bobtop-tui = { path = "crates/bobtop-tui" }
+
+# TUI rendering
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# System data sources
+sysinfo = "0.32"
+pcap = "2.0"
+nvml-wrapper = "0.10"
+libc = "0.2"
+
+# eBPF userspace loader (Linux only, gated by `ebpf` feature on bobtop-net).
+# NOTE: the kernel-side `aya-ebpf` crate is intentionally NOT listed here —
+# it must live in a separate crate compiled to the bpfel-unknown-none target,
+# and will be added when Tier 3 is implemented.
+aya = "0.13"
+
+# Errors & logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config / serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+opt-level = 3
+
+[profile.dev]
+opt-level = 0
+debug = true

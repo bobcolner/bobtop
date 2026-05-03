@@ -1,0 +1,68 @@
+//! Command-line argument parsing.
+
+use std::time::Duration;
+
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum LayoutChoice {
+    #[default]
+    Full,
+    Minimal,
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "bobtop", version, about = "A best-in-class terminal system monitor")]
+pub struct Cli {
+    /// Theme name to load. Searches built-ins, then ~/.config/bobtop/themes/,
+    /// then ~/.config/btop/themes/.
+    #[arg(long, default_value = "dracula")]
+    pub theme: String,
+
+    /// Global update tick in milliseconds. Every collector — CPU, memory,
+    /// network, disk, processes — samples on this single cadence (matches
+    /// btop's `update_ms` model). Live-tunable in the TUI with `+` / `-`.
+    #[arg(long, alias = "interval-ms", default_value_t = 500)]
+    pub tick_ms: u64,
+
+    /// Layout preset.
+    #[arg(long, value_enum, default_value_t = LayoutChoice::Full)]
+    pub layout: LayoutChoice,
+
+    /// Disable eBPF tier of network attribution even if available.
+    #[arg(long)]
+    pub no_ebpf: bool,
+
+    /// Disable libpcap tier of network attribution even if available.
+    #[arg(long)]
+    pub no_pcap: bool,
+
+    /// Force the block-character TTY fallback for graphs (use on Linux VTs
+    /// or terminals without braille support).
+    #[arg(long)]
+    pub tty: bool,
+
+    /// Include virtual / container / VPN interfaces in the network panel
+    /// aggregate (lo, docker*, veth*, virbr*, tun*, tap*, br-*). Default is
+    /// to exclude them so the graph reflects "real" external traffic.
+    #[arg(long)]
+    pub show_virtual_net: bool,
+
+    /// Print every available theme name and exit.
+    #[arg(long)]
+    pub list_themes: bool,
+}
+
+impl Cli {
+    pub fn tick(&self) -> Duration {
+        Duration::from_millis(self.tick_ms.clamp(MIN_TICK_MS, MAX_TICK_MS))
+    }
+}
+
+/// Lower clamp on the global update tick. Below this, /proc parsing starts to
+/// dominate CPU on busy systems.
+pub const MIN_TICK_MS: u64 = 50;
+/// Upper clamp on the global update tick. Above this and the TUI feels stale.
+pub const MAX_TICK_MS: u64 = 10_000;
+/// Single ±step applied by the `+` / `-` keys.
+pub const TICK_STEP_MS: u64 = 100;

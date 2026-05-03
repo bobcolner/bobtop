@@ -1,0 +1,35 @@
+[package]
+name = "bobtop-daemon"
+description = "bobtop binary — wires collectors, the data bus, and the TUI together"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bobtop"
+path = "src/main.rs"
+
+[dependencies]
+bobtop-core = { workspace = true }
+bobtop-collectors = { workspace = true }
+bobtop-net = { workspace = true }
+bobtop-tui = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+[features]
+default = []
+ebpf = ["bobtop-net/ebpf"]
+pcap = ["bobtop-net/pcap"]
+nvidia = ["bobtop-collectors/nvidia"]
