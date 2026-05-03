@@ -26,7 +26,7 @@ pub use collector::Collector;
 pub use error::{CoreError, Result};
 pub use event::MetricEvent;
 pub use sample::{
-    ConnectionDirection, CoreSample, CpuSample, DiskDeviceSample, DiskSample, GpuDeviceSample,
-    GpuSample, HugePages, InterfaceSample, LoadAverage, MemorySample, NetworkSample, ProcessInfo,
-    ProcessSample, ProcessState,
+    ConnectionDirection, CoreSample, CpuSample, DiskDeviceSample, DiskSample, FilesystemSample,
+    GpuDeviceSample, GpuSample, HugePages, InterfaceSample, LoadAverage, MemorySample,
+    NetworkSample, ProcessInfo, ProcessSample, ProcessState,
 };

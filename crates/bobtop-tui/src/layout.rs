@@ -1,12 +1,28 @@
 //! Layout engine — slices a frame into named panels.
 //!
-//! Two presets are supported, matching the original spec:
-//! - [`LayoutPreset::Full`] — CPU on top, Memory + Network side-by-side in
-//!   the middle, Process table fills the rest.
-//! - [`LayoutPreset::Minimal`] — CPU on top, Process table below.
+//! ## `LayoutPreset::Full` (matches btop's normal.png)
 //!
-//! [`compute`] is pure and side-effect free; the daemon owns the state and
-//! calls it once per render.
+//! ```text
+//! ┌────────────────────────────────────────────────┐
+//! │                       CPU                      │
+//! ├────────────────┬────────────────┬──────────────┤
+//! │      MEM       │     DISKS      │              │
+//! │                │                │              │
+//! ├────────────────┴────────────────┤    PROC      │
+//! │                                 │              │
+//! │              NET                │              │
+//! │                                 │              │
+//! └─────────────────────────────────┴──────────────┘
+//! ```
+//!
+//! - CPU spans full width, 30 % of height.
+//! - The remaining 70 % is split horizontally 50/50.
+//! - The left half subdivides: top row = MEM | DISKS (50/50), bottom row = NET (full width).
+//! - PROC fills the right half (full bottom-row height).
+//!
+//! ## `LayoutPreset::Minimal`
+//!
+//! Just CPU on top + PROC below — useful at narrow terminal widths.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
@@ -20,14 +36,11 @@ pub enum LayoutPreset {
 pub struct LayoutAreas {
     pub cpu: Rect,
     pub memory: Option<Rect>,
+    pub disks: Option<Rect>,
     pub network: Option<Rect>,
     pub processes: Rect,
 }
 
-/// Slice `area` into panel rects for the chosen preset.
-///
-/// Heights are tuned to match btop's defaults: CPU ≈ 30% of vertical space,
-/// the middle row (when present) ≈ 35%, processes get the remainder.
 pub fn compute(area: Rect, preset: LayoutPreset) -> LayoutAreas {
     match preset {
         LayoutPreset::Minimal => compute_minimal(area),
@@ -43,6 +56,7 @@ fn compute_minimal(area: Rect) -> LayoutAreas {
     LayoutAreas {
         cpu: parts[0],
         memory: None,
+        disks: None,
         network: None,
         processes: parts[1],
     }
@@ -51,23 +65,31 @@ fn compute_minimal(area: Rect) -> LayoutAreas {
 fn compute_full(area: Rect) -> LayoutAreas {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(35),
-            Constraint::Min(1),
-        ])
+        .constraints([Constraint::Percentage(30), Constraint::Min(1)])
         .split(area);
 
-    let mid = Layout::default()
+    let bottom_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
 
+    // Left column subdivides vertically into the mem/disks row + the net row.
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(bottom_cols[0]);
+
+    let mem_disks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(left_rows[0]);
+
     LayoutAreas {
         cpu: rows[0],
-        memory: Some(mid[0]),
-        network: Some(mid[1]),
-        processes: rows[2],
+        memory: Some(mem_disks[0]),
+        disks: Some(mem_disks[1]),
+        network: Some(left_rows[1]),
+        processes: bottom_cols[1],
     }
 }
 
@@ -92,22 +114,43 @@ mod tests {
         let total = Rect::new(0, 0, 200, 60);
         let l = compute(total, LayoutPreset::Full);
         let mem = l.memory.unwrap();
+        let disks = l.disks.unwrap();
         let net = l.network.unwrap();
-        assert!(!rects_overlap(l.cpu, mem));
-        assert!(!rects_overlap(l.cpu, net));
-        assert!(!rects_overlap(l.cpu, l.processes));
-        assert!(!rects_overlap(mem, net));
-        assert!(!rects_overlap(mem, l.processes));
-        assert!(!rects_overlap(net, l.processes));
+        let panels = [l.cpu, mem, disks, net, l.processes];
+        for (i, a) in panels.iter().enumerate() {
+            for (j, b) in panels.iter().enumerate() {
+                if i != j {
+                    assert!(!rects_overlap(*a, *b), "panels {i} and {j} overlap");
+                }
+            }
+        }
         let total_area = rect_area(total);
-        let panels_area = rect_area(l.cpu) + rect_area(mem) + rect_area(net) + rect_area(l.processes);
+        let panels_area: u32 = panels.iter().map(|r| rect_area(*r)).sum();
         assert_eq!(panels_area, total_area);
+    }
+
+    #[test]
+    fn full_layout_disks_sits_right_of_mem_and_above_net() {
+        let l = compute(Rect::new(0, 0, 200, 60), LayoutPreset::Full);
+        let mem = l.memory.unwrap();
+        let disks = l.disks.unwrap();
+        let net = l.network.unwrap();
+        // mem and disks share the same y-row.
+        assert_eq!(mem.y, disks.y);
+        assert_eq!(mem.height, disks.height);
+        assert!(disks.x > mem.x, "disks must be to the right of mem");
+        // net sits below them.
+        assert_eq!(net.y, mem.y + mem.height);
+        // net spans full left column width.
+        assert_eq!(net.x, mem.x);
+        assert_eq!(net.width, mem.width + disks.width);
     }
 
     #[test]
     fn minimal_layout_has_no_middle_row() {
         let l = compute(Rect::new(0, 0, 100, 30), LayoutPreset::Minimal);
         assert!(l.memory.is_none());
+        assert!(l.disks.is_none());
         assert!(l.network.is_none());
         assert!(l.cpu.height + l.processes.height == 30);
     }

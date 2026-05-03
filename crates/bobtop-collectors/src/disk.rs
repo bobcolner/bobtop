@@ -13,10 +13,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bobtop_core::sample::{DiskDeviceSample, DiskSample};
+use bobtop_core::sample::{DiskDeviceSample, DiskSample, FilesystemSample};
 use bobtop_core::{Collector, Result};
 #[cfg(not(target_os = "linux"))]
 use bobtop_core::CoreError;
+use sysinfo::Disks;
 
 const DEFAULT_INTERVAL_MS: u64 = 1000;
 const SECTOR_BYTES: u64 = 512;
@@ -34,6 +35,10 @@ struct RawDisk {
 pub struct DiskCollector {
     interval: Duration,
     last: Mutex<HashMap<String, (RawDisk, Instant)>>,
+    /// Mountpoint capacity is queried via sysinfo (statvfs under the hood).
+    /// Held in a Mutex so refreshes can mutate it without re-allocating the
+    /// entire `Disks` registry on every tick.
+    fs_disks: Mutex<Disks>,
 }
 
 impl DiskCollector {
@@ -45,6 +50,7 @@ impl DiskCollector {
         Self {
             interval,
             last: Mutex::new(HashMap::new()),
+            fs_disks: Mutex::new(Disks::new_with_refreshed_list()),
         }
     }
 }
@@ -105,9 +111,51 @@ impl Collector for DiskCollector {
         }
         devices.sort_by(|a, b| a.name.cmp(&b.name));
 
+        // Filesystem capacity (separate API surface from /proc/diskstats).
+        let mut fs_disks = self
+            .fs_disks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        fs_disks.refresh();
+        let mut filesystems = Vec::with_capacity(fs_disks.len());
+        for d in fs_disks.iter() {
+            // Skip pseudo / read-only system mounts that just clutter the panel.
+            let mp = d.mount_point().to_string_lossy().to_string();
+            if is_uninteresting_mount(&mp) {
+                continue;
+            }
+            let total = d.total_space();
+            let avail = d.available_space();
+            let used = total.saturating_sub(avail);
+            let device = d
+                .name()
+                .to_string_lossy()
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            // Try to attach IO utilization from the device-level sample.
+            let io = devices
+                .iter()
+                .find(|dev| dev.name == device || device.starts_with(&dev.name))
+                .map(|dev| dev.utilization);
+            filesystems.push(FilesystemSample {
+                label: short_mount_label(&mp),
+                device,
+                mount_point: mp,
+                total_bytes: total,
+                used_bytes: used,
+                available_bytes: avail,
+                io_utilization: io,
+            });
+        }
+        // Sort largest first so the panel shows the most relevant disks first.
+        filesystems.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+
         Ok(DiskSample {
             timestamp: now,
             devices,
+            filesystems,
         })
     }
 
@@ -122,6 +170,31 @@ impl Collector for DiskCollector {
 
 fn sub(cur: u64, prev: u64) -> u64 {
     cur.saturating_sub(prev)
+}
+
+fn is_uninteresting_mount(mp: &str) -> bool {
+    matches!(
+        mp,
+        "/proc" | "/sys" | "/dev" | "/run" | "/snap" | "/boot/efi"
+    ) || mp.starts_with("/snap/")
+        || mp.starts_with("/sys/")
+        || mp.starts_with("/proc/")
+        || mp.starts_with("/run/")
+        || mp.starts_with("/var/lib/docker/")
+}
+
+fn short_mount_label(mp: &str) -> String {
+    if mp == "/" {
+        "root".to_string()
+    } else if let Some(name) = mp.rsplit('/').next() {
+        if name.is_empty() {
+            mp.to_string()
+        } else {
+            name.to_string()
+        }
+    } else {
+        mp.to_string()
+    }
 }
 
 #[cfg(target_os = "linux")]

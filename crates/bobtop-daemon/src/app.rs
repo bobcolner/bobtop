@@ -14,6 +14,7 @@ use bobtop_core::sample::{
 };
 use bobtop_core::MetricEvent;
 use bobtop_net::{AttributorTier, ProcessNetSample};
+use bobtop_tui::widgets::ProcessSort;
 use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -65,6 +66,11 @@ pub struct App {
 
     pub selected_proc: usize,
     pub scroll_offset: usize,
+
+    /// Active sort column for the process table — driven by `←` / `→`.
+    pub proc_sort: ProcessSort,
+    /// Sort direction for `proc_sort`. Toggled by `r`.
+    pub proc_sort_descending: bool,
 }
 
 impl App {
@@ -95,6 +101,8 @@ impl App {
             processes_sorted: Vec::new(),
             selected_proc: 0,
             scroll_offset: 0,
+            proc_sort: ProcessSort::Cpu,
+            proc_sort_descending: true,
         }
     }
 
@@ -111,12 +119,7 @@ impl App {
             MetricEvent::Process(s) => {
                 self.latest_processes = Some(s.clone());
                 let mut sorted = s.processes;
-                sorted.sort_by(|a, b| {
-                    b.cpu_fraction
-                        .partial_cmp(&a.cpu_fraction)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                // Keep selection in bounds when the list shrinks.
+                sort_processes(&mut sorted, self.proc_sort, self.proc_sort_descending);
                 if !sorted.is_empty() && self.selected_proc >= sorted.len() {
                     self.selected_proc = sorted.len() - 1;
                 }
@@ -170,6 +173,23 @@ impl App {
         new
     }
 
+    /// Step the active sort column by `delta` (-1 = previous, +1 = next),
+    /// wrapping around. Re-sorts the existing process list in place so the
+    /// change is visible immediately rather than waiting for the next sample.
+    pub fn cycle_sort(&mut self, delta: i32) {
+        let cycle = ProcessSort::cycle(self.net_tier.has_bandwidth());
+        let cur_idx = cycle.iter().position(|&s| s == self.proc_sort).unwrap_or(0) as i32;
+        let len = cycle.len() as i32;
+        let new_idx = ((cur_idx + delta) % len + len) % len;
+        self.proc_sort = cycle[new_idx as usize];
+        sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+    }
+
+    pub fn toggle_sort_direction(&mut self) {
+        self.proc_sort_descending = !self.proc_sort_descending;
+        sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+    }
+
     pub fn handle_input(&mut self, ev: Event) -> ControlFlow {
         let Event::Key(k) = ev else { return ControlFlow::Continue };
         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
@@ -197,6 +217,18 @@ impl App {
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 self.nudge_tick(-(TICK_STEP_MS as i64));
+                ControlFlow::Continue
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.cycle_sort(-1);
+                ControlFlow::Continue
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.cycle_sort(1);
+                ControlFlow::Continue
+            }
+            KeyCode::Char('r') => {
+                self.toggle_sort_direction();
                 ControlFlow::Continue
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -237,6 +269,34 @@ impl App {
             _ => ControlFlow::Continue,
         }
     }
+}
+
+fn sort_processes(rows: &mut [ProcessInfo], sort: ProcessSort, descending: bool) {
+    use std::cmp::Ordering;
+    rows.sort_by(|a, b| {
+        let ord = match sort {
+            ProcessSort::Pid => a.pid.cmp(&b.pid),
+            ProcessSort::Name => a.name.cmp(&b.name),
+            ProcessSort::User => a.user.cmp(&b.user),
+            ProcessSort::Threads => a.threads.cmp(&b.threads),
+            ProcessSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
+            ProcessSort::Cpu => a
+                .cpu_fraction
+                .partial_cmp(&b.cpu_fraction)
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::NetRx => a
+                .net_rx_bytes_per_sec
+                .unwrap_or(0.0)
+                .partial_cmp(&b.net_rx_bytes_per_sec.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::NetTx => a
+                .net_tx_bytes_per_sec
+                .unwrap_or(0.0)
+                .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+        };
+        if descending { ord.reverse() } else { ord }
+    });
 }
 
 fn aggregate_net_rates(s: &NetworkSample, include_virtual: bool) -> (f64, f64) {

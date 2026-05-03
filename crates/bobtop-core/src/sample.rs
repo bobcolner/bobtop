@@ -89,6 +89,9 @@ pub struct InterfaceSample {
 pub struct DiskSample {
     pub timestamp: Instant,
     pub devices: Vec<DiskDeviceSample>,
+    /// Filesystem-level capacity per mountpoint, sourced separately from
+    /// per-device IO counters (different kernel APIs).
+    pub filesystems: Vec<FilesystemSample>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +103,21 @@ pub struct DiskDeviceSample {
     pub write_iops: f64,
     /// Fraction of wall-clock time the device was busy, 0.0..=1.0.
     pub utilization: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilesystemSample {
+    /// Display name — shortened mountpoint ("/", "/home", "swap", ...).
+    pub label: String,
+    /// Backing block-device basename when known (sda1, nvme0n1p2, "swap").
+    pub device: String,
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    /// Mirrored from the matching [`DiskDeviceSample::utilization`] when the
+    /// daemon can join them; `None` otherwise.
+    pub io_utilization: Option<f32>,
 }
 
 // ---------------------------------------------------------------------------

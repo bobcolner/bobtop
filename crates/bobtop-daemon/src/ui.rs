@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use bobtop_core::sample::{CpuSample, MemorySample, ProcessInfo};
+use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample, ProcessInfo};
 use bobtop_tui::widgets::{
     BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
 };
@@ -21,6 +21,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_cpu(frame, layout.cpu, app);
     if let Some(mem_area) = layout.memory {
         draw_memory(frame, mem_area, app);
+    }
+    if let Some(disks_area) = layout.disks {
+        draw_disks(frame, disks_area, app);
     }
     if let Some(net_area) = layout.network {
         draw_network(frame, net_area, app);
@@ -113,22 +116,7 @@ fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &CpuSample, theme: &T
 // ---------------------------------------------------------------------------
 
 fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
-    // Top-disk badge in the title when we have data.
-    let disk_summary = app.latest_disk.as_ref().and_then(|d| {
-        d.devices
-            .iter()
-            .max_by(|a, b| {
-                a.utilization
-                    .partial_cmp(&b.utilization)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|d| format!("  {} {:.0}%", d.name, d.utilization * 100.0))
-    });
-    let title = match disk_summary {
-        Some(s) => format!("²mem +disk {}", s),
-        None => "²mem".to_string(),
-    };
-    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title).with_title(title);
+    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title).with_title("²mem");
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
 
@@ -136,33 +124,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let mut categories = build_memory_categories(s, &app.theme);
-    // Append disk meters (top device by utilization, then by write rate) so
-    // mem + disk share one panel until we extend the layout to a dedicated box.
-    if let Some(disk) = &app.latest_disk {
-        let mut top_disks: Vec<_> = disk.devices.iter().collect();
-        top_disks.sort_by(|a, b| {
-            (b.read_bytes_per_sec + b.write_bytes_per_sec)
-                .partial_cmp(&(a.read_bytes_per_sec + a.write_bytes_per_sec))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for d in top_disks.iter().take(2) {
-            let total = d.read_bytes_per_sec + d.write_bytes_per_sec;
-            let value = format!(
-                "↓{}/s ↑{}/s",
-                format_rate(d.read_bytes_per_sec),
-                format_rate(d.write_bytes_per_sec),
-            );
-            categories.push(
-                Meter::new(format!("{}:", d.name), value, d.utilization as f64)
-                    .with_gradient(app.theme.cached)
-                    .with_meter_bg(app.theme.meter_bg)
-                    .with_text_colors(app.theme.main_fg, app.theme.title),
-            );
-            let _ = total; // total unused, kept in case we want it in label later
-        }
-    }
-
+    let categories = build_memory_categories(s, &app.theme);
     if categories.is_empty() || inner.height < 3 {
         return;
     }
@@ -175,6 +137,64 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
         let r = Rect::new(inner.x, y, inner.width, row_h);
         m.render(r, frame.buffer_mut());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Disks
+// ---------------------------------------------------------------------------
+
+fn draw_disks(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match app.latest_disk.as_ref().map(|d| d.filesystems.len()) {
+        Some(n) if n > 0 => format!("²disks  {} mounts", n),
+        _ => "²disks".to_string(),
+    };
+    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title).with_title(title);
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.width < 8 || inner.height < 2 {
+        return;
+    }
+
+    let Some(disk) = &app.latest_disk else { return };
+    if disk.filesystems.is_empty() {
+        return;
+    }
+
+    let meters: Vec<Meter> = disk
+        .filesystems
+        .iter()
+        .map(|fs| build_disk_meter(fs, &app.theme))
+        .collect();
+    let row_h = (inner.height / meters.len().max(1) as u16).max(3);
+    for (i, m) in meters.iter().enumerate() {
+        let y = inner.y + (i as u16) * row_h;
+        if y + 3 > inner.y + inner.height {
+            break;
+        }
+        let r = Rect::new(inner.x, y, inner.width, row_h);
+        m.render(r, frame.buffer_mut());
+    }
+}
+
+fn build_disk_meter(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {
+    let frac = if fs.total_bytes > 0 {
+        fs.used_bytes as f64 / fs.total_bytes as f64
+    } else {
+        0.0
+    };
+    let value = format!(
+        "{} / {}",
+        format_bytes(fs.used_bytes),
+        format_bytes(fs.total_bytes),
+    );
+    let label = match fs.io_utilization {
+        Some(io) if io > 0.05 => format!("{}: io {:.0}%", fs.label, io * 100.0),
+        _ => format!("{}:", fs.label),
+    };
+    Meter::new(label, value, frac)
+        .with_gradient(theme.used)
+        .with_meter_bg(theme.meter_bg)
+        .with_text_colors(theme.main_fg, theme.title)
 }
 
 fn build_memory_categories(s: &MemorySample, theme: &Theme) -> Vec<Meter> {
@@ -219,42 +239,43 @@ fn build_memory_categories(s: &MemorySample, theme: &Theme) -> Vec<Meter> {
 // ---------------------------------------------------------------------------
 
 fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
-    // Aggregate current rates from the latest NetworkSample (real per-interface
-    // counters), excluding loopback / virtual interfaces (unless --show-virtual-net).
     let (rx_now, tx_now) = current_real_rates(app);
     let (counted, total) = interface_counts(app);
-    let filter_note = if !app.show_virtual_net && counted < total {
-        format!("  [{counted}/{total} ifaces — pass --show-virtual-net to include virtual]")
-    } else if total == 0 {
-        "  [no interfaces — check /proc/net/dev]".to_string()
+    let title = if total == 0 {
+        "³net  [no interfaces — check /proc/net/dev]".to_string()
+    } else if !app.show_virtual_net && counted < total {
+        format!("³net  {counted}/{total} ifaces  attributor: {}", app.net_tier.name())
     } else {
-        format!("  [{counted}/{total} ifaces]")
+        format!("³net  {counted} ifaces  attributor: {}", app.net_tier.name())
     };
-    let title = format!(
-        "³net  ↓{}/s  ↑{}/s  attributor: {}{}{}",
-        format_rate(rx_now),
-        format_rate(tx_now),
-        app.net_tier.name(),
-        if app.net_tier.has_bandwidth() {
-            ""
-        } else {
-            " (no per-pid bw)"
-        },
-        filter_note,
-    );
+    let bandwidth_note = if app.net_tier.has_bandwidth() {
+        ""
+    } else {
+        "  (per-pid bw unavailable)"
+    };
     let panel = BoxedPanel::new(app.theme.net_box, app.theme.title)
-        .with_title(title)
-        .with_controls(format!("scale {}/s", format_rate(app.net_scale_bps)));
+        .with_title(format!("{title}{bandwidth_note}"))
+        .with_controls(format!("peak {}/s", format_rate(app.net_scale_bps)));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
-    if inner.width < 4 || inner.height < 2 {
+    if inner.width < 12 || inner.height < 4 {
         return;
     }
 
-    let mut graph = BrailleGraph::new((inner.width as usize) * 2, app.theme.download)
-        .with_y_scale(format!("↑{}/s", format_rate(app.net_scale_bps)), format!("↓{}/s", format_rate(app.net_scale_bps)))
+    // Split the inner area: graph on the left, summary panel on the right.
+    let side_w = (inner.width / 4).clamp(18, 32);
+    let graph_w = inner.width.saturating_sub(side_w + 1);
+    let graph_area = Rect::new(inner.x, inner.y, graph_w, inner.height);
+    let side_area = Rect::new(inner.x + graph_w + 1, inner.y, side_w, inner.height);
+
+    // Build graph with mirrored split: download top, upload bottom (mirrored).
+    let mut graph = BrailleGraph::new((graph_area.width as usize) * 2, app.theme.download)
+        .with_y_scale(
+            format!("↑ {}/s", format_rate(app.net_scale_bps)),
+            format!("↓ {}/s", format_rate(app.net_scale_bps)),
+        )
         .with_secondary(
-            Trace::new((inner.width as usize) * 2, app.theme.upload),
+            Trace::new((graph_area.width as usize) * 2, app.theme.upload),
             DualMode::MirroredSplit,
         );
     if app.tty_graphs {
@@ -263,7 +284,52 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     for (rx, tx) in app.net_normalized_history() {
         graph.push_dual(rx, tx);
     }
-    frame.render_widget(&graph, inner);
+    frame.render_widget(&graph, graph_area);
+
+    // Side panel: clear current rates with bps + total.
+    draw_net_side(frame, side_area, app, rx_now, tx_now);
+}
+
+fn draw_net_side(frame: &mut Frame, area: Rect, app: &App, rx_now: f64, tx_now: f64) {
+    let buf = frame.buffer_mut();
+    let dim = ratatui::style::Style::default().fg(app.theme.inactive_fg);
+    let dl = ratatui::style::Style::default().fg(app.theme.download.end);
+    let ul = ratatui::style::Style::default().fg(app.theme.upload.end);
+    let txt = ratatui::style::Style::default().fg(app.theme.main_fg);
+
+    let lines: Vec<(ratatui::style::Style, String)> = vec![
+        (dim, "▼ download".to_string()),
+        (dl, format!("  {}/s", format_rate(rx_now))),
+        (txt, format!("  ({} bps)", format_bps(rx_now))),
+        (ratatui::style::Style::default(), String::new()),
+        (dim, "▲ upload".to_string()),
+        (ul, format!("  {}/s", format_rate(tx_now))),
+        (txt, format!("  ({} bps)", format_bps(tx_now))),
+    ];
+    for (i, (style, s)) in lines.iter().enumerate() {
+        if i as u16 >= area.height {
+            break;
+        }
+        let y = area.y + i as u16;
+        let mut x = area.x;
+        for ch in s.chars().take(area.width as usize) {
+            let cell = &mut buf[(x, y)];
+            cell.set_char(ch);
+            cell.set_style(*style);
+            x = x.saturating_add(1);
+        }
+    }
+}
+
+fn format_bps(bytes_per_sec: f64) -> String {
+    let bps = bytes_per_sec * 8.0;
+    if bps >= 1_000_000.0 {
+        format!("{:.1}M", bps / 1_000_000.0)
+    } else if bps >= 1_000.0 {
+        format!("{:.1}K", bps / 1_000.0)
+    } else {
+        format!("{:.0}", bps)
+    }
 }
 
 fn current_real_rates(app: &App) -> (f64, f64) {
@@ -303,10 +369,16 @@ fn interface_counts(app: &App) -> (usize, usize) {
 // ---------------------------------------------------------------------------
 
 fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
-    let title = format!("⁴proc  {} processes", app.processes_sorted.len());
+    let arrow = if app.proc_sort_descending { '↓' } else { '↑' };
+    let title = format!(
+        "⁴proc  {} processes  sort: ←{}{}→",
+        app.processes_sorted.len(),
+        app.proc_sort.label(),
+        arrow,
+    );
     let panel = BoxedPanel::new(app.theme.proc_box, app.theme.title)
         .with_title(title)
-        .with_keybinds("q quit  ↑↓ select  1 full  m minimal  +/- tick  PgUp/PgDn jump");
+        .with_keybinds("q quit  ↑↓ select  ←→ sort col  r reverse  +/- tick  1 full  m minimal");
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 20 || inner.height < 2 {
@@ -339,9 +411,11 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         scroll_offset = app.selected_proc + 1 - body_h;
     }
 
-    let table = ProcessTable::new(&with_net, &app.theme)
+    let mut table = ProcessTable::new(&with_net, &app.theme)
         .with_selection(Some(app.selected_proc), scroll_offset)
-        .with_net_columns(app.net_tier.has_bandwidth());
+        .with_net_columns(app.net_tier.has_bandwidth())
+        .with_direction(app.proc_sort_descending);
+    table.sort = app.proc_sort;
     frame.render_widget(&table, inner);
 }
 

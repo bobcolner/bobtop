@@ -18,11 +18,55 @@ use crate::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSort {
     Pid,
-    Cpu,
-    Mem,
     Name,
+    User,
+    Threads,
+    Mem,
+    Cpu,
     NetRx,
     NetTx,
+}
+
+impl ProcessSort {
+    /// Cycle order for the `←` / `→` keybinds. Match the on-screen left-to-right
+    /// column order so the selection visually tracks the arrow key.
+    pub fn cycle(show_net: bool) -> &'static [ProcessSort] {
+        if show_net {
+            &[
+                ProcessSort::Pid,
+                ProcessSort::Name,
+                ProcessSort::User,
+                ProcessSort::Threads,
+                ProcessSort::Mem,
+                ProcessSort::Cpu,
+                ProcessSort::NetRx,
+                ProcessSort::NetTx,
+            ]
+        } else {
+            &[
+                ProcessSort::Pid,
+                ProcessSort::Name,
+                ProcessSort::User,
+                ProcessSort::Threads,
+                ProcessSort::Mem,
+                ProcessSort::Cpu,
+            ]
+        }
+    }
+
+    /// Stable label for the panel-title indicator (e.g. `[cpu↓]`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ProcessSort::Pid => "pid",
+            ProcessSort::Name => "name",
+            ProcessSort::User => "user",
+            ProcessSort::Threads => "threads",
+            ProcessSort::Mem => "mem",
+            ProcessSort::Cpu => "cpu",
+            ProcessSort::NetRx => "rx",
+            ProcessSort::NetTx => "tx",
+        }
+    }
 }
 
 pub struct ProcessTable<'a> {
@@ -32,6 +76,7 @@ pub struct ProcessTable<'a> {
     pub theme: &'a Theme,
     pub show_net_columns: bool,
     pub sort: ProcessSort,
+    pub sort_descending: bool,
 }
 
 impl<'a> ProcessTable<'a> {
@@ -43,7 +88,13 @@ impl<'a> ProcessTable<'a> {
             theme,
             show_net_columns: false,
             sort: ProcessSort::Cpu,
+            sort_descending: true,
         }
+    }
+
+    pub fn with_direction(mut self, descending: bool) -> Self {
+        self.sort_descending = descending;
+        self
     }
 
     pub fn with_selection(mut self, selected: Option<usize>, scroll_offset: usize) -> Self {
@@ -77,20 +128,24 @@ impl<'a> Widget for &ProcessTable<'a> {
             return;
         }
 
-        let mut cols: Vec<ColSpec> = Vec::with_capacity(8);
-        cols.push(ColSpec { title: "Pid", sort: Some(ProcessSort::Pid), width: 8, right_align: true });
-        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name), width: 16, right_align: false });
-        cols.push(ColSpec { title: "User", sort: None, width: 10, right_align: false });
-        cols.push(ColSpec { title: "Th", sort: None, width: 4, right_align: true });
-        cols.push(ColSpec { title: "MEM", sort: Some(ProcessSort::Mem), width: 8, right_align: true });
-        cols.push(ColSpec { title: "CPU%", sort: Some(ProcessSort::Cpu), width: 6, right_align: true });
+        let mut cols: Vec<ColSpec> = Vec::with_capacity(9);
+        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),     width: 7,  right_align: true });
+        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),    width: 16, right_align: false });
+        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),    width: 8,  right_align: false });
+        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads), width: 4,  right_align: true });
+        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),     width: 8,  right_align: true });
+        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),     width: 6,  right_align: true });
         if self.show_net_columns {
-            cols.push(ColSpec { title: "RX/s", sort: Some(ProcessSort::NetRx), width: 9, right_align: true });
-            cols.push(ColSpec { title: "TX/s", sort: Some(ProcessSort::NetTx), width: 9, right_align: true });
+            cols.push(ColSpec { title: "RX/s", sort: Some(ProcessSort::NetRx), width: 8, right_align: true });
+            cols.push(ColSpec { title: "TX/s", sort: Some(ProcessSort::NetTx), width: 8, right_align: true });
         }
+        // Command soaks up remaining width — placed last on purpose.
+        cols.push(ColSpec { title: "Command", sort: None, width: u16::MAX, right_align: false });
 
-        // Header row.
+        // Header row. Active sort column gets bracketed + arrow indicator.
         let header_style = Style::default().fg(self.theme.title).add_modifier(Modifier::BOLD);
+        let active_style = Style::default().fg(self.theme.hi_fg).add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        let arrow = if self.sort_descending { '↓' } else { '↑' };
         render_row(
             buf,
             area.x,
@@ -99,12 +154,14 @@ impl<'a> Widget for &ProcessTable<'a> {
             &cols,
             |idx| {
                 let c = &cols[idx];
-                let tag = if Some(self.sort) == c.sort.map(Some).flatten() {
-                    format!("▼{}", c.title)
+                let is_active = c.sort.map(|s| s == self.sort).unwrap_or(false);
+                let tag = if is_active {
+                    format!("{}{}", c.title, arrow)
                 } else {
                     c.title.to_string()
                 };
-                (tag, header_style, c.right_align)
+                let style = if is_active { active_style } else { header_style };
+                (tag, style, c.right_align)
             },
         );
 
@@ -163,17 +220,32 @@ impl<'a> Widget for &ProcessTable<'a> {
 }
 
 fn build_row_cells(p: &ProcessInfo, show_net: bool) -> Vec<String> {
-    let mut out = Vec::with_capacity(8);
+    let mut out = Vec::with_capacity(9);
     out.push(p.pid.to_string());
     out.push(truncate(&p.name, 16));
-    out.push(truncate(&p.user, 10));
+    out.push(truncate(&p.user, 8));
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
     if show_net {
-        out.push(p.net_rx_bytes_per_sec.map(|v| format_rate(v)).unwrap_or_else(|| "-".into()));
-        out.push(p.net_tx_bytes_per_sec.map(|v| format_rate(v)).unwrap_or_else(|| "-".into()));
+        out.push(
+            p.net_rx_bytes_per_sec
+                .map(format_rate)
+                .unwrap_or_else(|| "-".into()),
+        );
+        out.push(
+            p.net_tx_bytes_per_sec
+                .map(format_rate)
+                .unwrap_or_else(|| "-".into()),
+        );
     }
+    // Command soaks up trailing width. Empty cmdline → fall back to name.
+    let cmd = if p.cmdline.is_empty() {
+        p.name.clone()
+    } else {
+        p.cmdline.clone()
+    };
+    out.push(cmd);
     out
 }
 
@@ -181,17 +253,35 @@ fn render_row<F>(buf: &mut Buffer, x0: u16, y: u16, total_width: u16, cols: &[Co
 where
     F: FnMut(usize) -> (String, Style, bool),
 {
-    let total_col_width: u16 = cols.iter().map(|c| c.width).sum();
-    if total_col_width == 0 || total_width == 0 {
+    if total_width == 0 || cols.is_empty() {
         return;
     }
-    let mut cursor = x0;
     let right_limit = x0.saturating_add(total_width);
+    // Sum the *fixed* column widths (Command uses u16::MAX as a sentinel that
+    // means "soak up the remainder"). One-cell gutter between columns.
+    let n = cols.len() as u16;
+    let fixed_total: u16 = cols
+        .iter()
+        .filter(|c| c.width != u16::MAX)
+        .map(|c| c.width)
+        .sum::<u16>()
+        .saturating_add(n.saturating_sub(1));
+    let flex_remaining = total_width.saturating_sub(fixed_total);
+
+    let mut cursor = x0;
     for (i, col) in cols.iter().enumerate() {
         if cursor >= right_limit {
             break;
         }
-        let avail = right_limit.saturating_sub(cursor).min(col.width);
+        let col_width = if col.width == u16::MAX {
+            flex_remaining
+        } else {
+            col.width
+        };
+        let avail = right_limit.saturating_sub(cursor).min(col_width);
+        if avail == 0 {
+            break;
+        }
         let (text, style, right_align) = cell_fn(i);
         let len = text.chars().count() as u16;
         let (text_x, text) = if right_align && len < avail {
@@ -202,7 +292,7 @@ where
             (cursor, text)
         };
         write_str(buf, text_x, y, &text, avail as usize, style);
-        cursor = cursor.saturating_add(col.width).saturating_add(1);
+        cursor = cursor.saturating_add(col_width).saturating_add(1);
     }
 }
 
