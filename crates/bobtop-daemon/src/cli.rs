@@ -3,8 +3,10 @@
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, ValueEnum, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LayoutChoice {
     #[default]
     Full,

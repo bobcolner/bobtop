@@ -2,6 +2,7 @@
 //! the TUI loop on every frame.
 
 use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample};
+use bobtop_core::Box as BoxKind;
 use bobtop_tui::widgets::{
     BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
 };
@@ -34,21 +35,56 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     let layout = compute_layout(body, app.layout_preset);
 
-    draw_cpu(frame, layout.cpu, app);
+    // Each panel checks its bit in `app.boxes`; a hidden panel renders a
+    // small "[hidden — press B to show]" placeholder so the layout shape
+    // stays stable and the user has a hint about how to reveal it. The
+    // collector for that box is also paused via A3, so the hidden state
+    // really is free.
+    if app.boxes.is_enabled(BoxKind::Cpu) {
+        draw_cpu(frame, layout.cpu, app);
+    } else {
+        draw_hidden_panel(frame, layout.cpu, app, "cpu");
+    }
     if let Some(mem_area) = layout.memory {
-        draw_memory(frame, mem_area, app);
+        if app.boxes.is_enabled(BoxKind::Memory) {
+            draw_memory(frame, mem_area, app);
+        } else {
+            draw_hidden_panel(frame, mem_area, app, "mem");
+        }
     }
     if let Some(disks_area) = layout.disks {
-        draw_disks(frame, disks_area, app);
+        if app.boxes.is_enabled(BoxKind::Disk) {
+            draw_disks(frame, disks_area, app);
+        } else {
+            draw_hidden_panel(frame, disks_area, app, "disks");
+        }
     }
     if let Some(net_area) = layout.network {
-        draw_network(frame, net_area, app);
+        if app.boxes.is_enabled(BoxKind::Network) {
+            draw_network(frame, net_area, app);
+        } else {
+            draw_hidden_panel(frame, net_area, app, "net");
+        }
     }
-    draw_processes(frame, layout.processes, app);
+    if app.boxes.is_enabled(BoxKind::Process) {
+        draw_processes(frame, layout.processes, app);
+    } else {
+        draw_hidden_panel(frame, layout.processes, app, "proc");
+    }
 
+    if app.show_boxes_overlay {
+        draw_boxes_overlay(frame, area, app);
+    }
     if app.show_help {
         draw_help_overlay(frame, area, app);
     }
+}
+
+fn draw_hidden_panel(frame: &mut Frame, area: Rect, app: &App, name: &str) {
+    let panel = BoxedPanel::new(app.theme.div_line, app.theme.inactive_fg)
+        .with_title(format!("{name} — hidden"))
+        .with_controls("press B to toggle");
+    frame.render_widget(&panel, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +138,82 @@ fn format_uptime(d: std::time::Duration) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Boxes overlay (B5) — show/hide individual panels live
+// ---------------------------------------------------------------------------
+
+fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    // Compact modal — one row per box plus 2 lines of header/footer.
+    let want_w: u16 = 38;
+    let want_h: u16 = (BoxKind::ALL.len() as u16) + 5;
+    if area.width < want_w || area.height < want_h {
+        return;
+    }
+    let x = area.x + (area.width - want_w) / 2;
+    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
+    let modal = Rect::new(x, y, want_w, want_h);
+
+    let panel = BoxedPanel::new(app.theme.title, app.theme.title)
+        .with_title(" boxes — show/hide panels ".to_string())
+        .with_controls("space toggle  ↑↓ move  B/Esc close");
+    frame.render_widget(&panel, modal);
+    let body = panel.inner(modal);
+    let buf = frame.buffer_mut();
+    let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
+    for yy in body.y..body.y + body.height {
+        for xx in body.x..body.x + body.width {
+            let cell = &mut buf[(xx, yy)];
+            cell.set_char(' ');
+            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
+        }
+    }
+
+    write_str_at(
+        buf,
+        body.x + 2,
+        body.y + 1,
+        "(panel changes are live — collectors pause too)",
+        Style::default().bg(bg).fg(app.theme.inactive_fg),
+    );
+
+    for (i, b) in BoxKind::ALL.iter().enumerate() {
+        let row_y = body.y + 3 + i as u16;
+        if row_y + 1 >= body.y + body.height {
+            break;
+        }
+        let enabled = app.boxes.is_enabled(*b);
+        let mark = if enabled { "[x]" } else { "[ ]" };
+        let label = box_label(*b);
+        let is_cursor = i == app.boxes_overlay_cursor;
+        let prefix = if is_cursor { "▶ " } else { "  " };
+        let line = format!("{prefix}{mark}  {label}");
+        let row_style = if is_cursor {
+            Style::default().bg(app.theme.selected_bg).fg(app.theme.selected_fg)
+        } else if enabled {
+            Style::default().bg(bg).fg(app.theme.main_fg)
+        } else {
+            Style::default().bg(bg).fg(app.theme.inactive_fg)
+        };
+        // Selected row gets a full-width fill; non-selected rows use modal bg.
+        if is_cursor {
+            for xx in body.x + 1..body.x + body.width - 1 {
+                buf[(xx, row_y)].set_style(Style::default().bg(app.theme.selected_bg));
+            }
+        }
+        write_str_at(buf, body.x + 2, row_y, &line, row_style);
+    }
+}
+
+fn box_label(b: BoxKind) -> &'static str {
+    match b {
+        BoxKind::Cpu => "CPU",
+        BoxKind::Memory => "MEM",
+        BoxKind::Disk => "DISKS",
+        BoxKind::Network => "NET",
+        BoxKind::Process => "PROC",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Help overlay (B2)
 // ---------------------------------------------------------------------------
 
@@ -114,8 +226,11 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("← / → / h / l", "cycle sort column"),
     ("r", "reverse sort direction"),
     ("+ / -", "adjust global tick"),
-    ("1", "Full layout"),
-    ("m", "Minimal layout (CPU + processes only)"),
+    ("1", "preset 1 — full, sort by CPU"),
+    ("2", "preset 2 — full, sort by MEM"),
+    ("3", "preset 3 — full, sort by NET RX"),
+    ("4 / m", "preset 4 — minimal (CPU + processes only)"),
+    ("B", "boxes — show/hide individual panels"),
 ];
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {

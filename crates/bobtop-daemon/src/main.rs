@@ -10,10 +10,12 @@ use bobtop_collectors::{
     CpuCollector, DiskCollector, MemoryCollector, NetworkGlobalCollector, ProcessCollector,
 };
 use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, MetricEvent};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 use tokio::sync::broadcast;
+
+use bobtop_daemon::config::Config;
 use bobtop_net::{select as select_attributor, NetworkAttributor, SelectOptions};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
-use clap::Parser;
 
 use bobtop_daemon::app::App;
 use bobtop_daemon::cli::{Cli, LayoutChoice};
@@ -21,7 +23,11 @@ use bobtop_daemon::tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse CLI via get_matches() so we can ask clap which fields the user
+    // actually set on the command line vs. left at the default. That lets
+    // us implement strict CLI > config-file > default precedence below.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).expect("parsed Cli matches");
     init_tracing();
 
     if cli.list_themes {
@@ -31,18 +37,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let theme = load_theme(&cli.theme);
+    let cfg = Config::load_or_default();
+    let eff = resolve(&cli, &matches, &cfg);
+
+    let theme = load_theme(&eff.theme);
     tracing::info!(theme = %theme.name, "loaded theme");
 
-    let layout_preset = match cli.layout {
+    let layout_preset = match eff.layout {
         LayoutChoice::Full => LayoutPreset::Full,
         LayoutChoice::Minimal => LayoutPreset::Minimal,
     };
 
     // Capability detection — pick the highest-tier network attributor available.
     let attributor: Arc<dyn NetworkAttributor> = Arc::from(select_attributor(SelectOptions {
-        allow_ebpf: !cli.no_ebpf,
-        allow_pcap: !cli.no_pcap,
+        allow_ebpf: !eff.no_ebpf,
+        allow_pcap: !eff.no_pcap,
     }));
     let net_tier = attributor.tier();
     // Self-diagnosing startup line — always logged at warn so users see it
@@ -56,13 +65,13 @@ async fn main() -> Result<()> {
     );
 
     let bus = DataBus::default();
-    let tick_ms = Arc::new(AtomicU64::new(cli.tick().as_millis() as u64));
+    let tick_ms = Arc::new(AtomicU64::new(eff.tick_ms_clamped()));
     let mut app = App::new(
         theme,
         layout_preset,
         Arc::clone(&tick_ms),
-        cli.tty,
-        cli.show_virtual_net,
+        eff.tty,
+        eff.show_virtual_net,
     );
     app.net_tier = net_tier;
     let boxes = app.boxes.clone();
@@ -110,6 +119,75 @@ async fn main() -> Result<()> {
     tui::restore_terminal(&mut term)?;
 
     result.map_err(Into::into)
+}
+
+/// Resolved settings after merging CLI > config-file > clap defaults.
+/// Each field has a single concrete value (no Option) so downstream code
+/// doesn't repeat the override-logic. Constructed via `resolve()`.
+struct EffectiveConfig {
+    theme: String,
+    tick_ms: u64,
+    layout: LayoutChoice,
+    no_ebpf: bool,
+    no_pcap: bool,
+    tty: bool,
+    show_virtual_net: bool,
+}
+
+impl EffectiveConfig {
+    fn tick_ms_clamped(&self) -> u64 {
+        self.tick_ms
+            .clamp(bobtop_daemon::cli::MIN_TICK_MS, bobtop_daemon::cli::MAX_TICK_MS)
+    }
+}
+
+/// Merge CLI > config-file > clap-default per field. Uses clap's
+/// `value_source` to detect "user passed this on the command line" vs.
+/// "clap filled in the default" — the file should override defaults but
+/// not user input.
+fn resolve(cli: &Cli, matches: &clap::ArgMatches, cfg: &Config) -> EffectiveConfig {
+    let from_cli = |name: &str| {
+        matches.value_source(name) == Some(ValueSource::CommandLine)
+    };
+    EffectiveConfig {
+        theme: if from_cli("theme") {
+            cli.theme.clone()
+        } else {
+            cfg.theme.clone().unwrap_or_else(|| cli.theme.clone())
+        },
+        tick_ms: if from_cli("tick_ms") {
+            cli.tick_ms
+        } else {
+            cfg.tick_ms.unwrap_or(cli.tick_ms)
+        },
+        layout: if from_cli("layout") {
+            cli.layout
+        } else {
+            cfg.layout.unwrap_or(cli.layout)
+        },
+        // Bool flags: CLI sets-true. If CLI didn't pass, fall to config; if
+        // config silent, fall to false (the clap default for missing flag).
+        no_ebpf: if from_cli("no_ebpf") {
+            cli.no_ebpf
+        } else {
+            cfg.no_ebpf.unwrap_or(cli.no_ebpf)
+        },
+        no_pcap: if from_cli("no_pcap") {
+            cli.no_pcap
+        } else {
+            cfg.no_pcap.unwrap_or(cli.no_pcap)
+        },
+        tty: if from_cli("tty") {
+            cli.tty
+        } else {
+            cfg.tty.unwrap_or(cli.tty)
+        },
+        show_virtual_net: if from_cli("show_virtual_net") {
+            cli.show_virtual_net
+        } else {
+            cfg.show_virtual_net.unwrap_or(cli.show_virtual_net)
+        },
+    }
 }
 
 fn features_str() -> &'static str {

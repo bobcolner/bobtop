@@ -32,6 +32,50 @@ pub enum ControlFlow {
     Quit,
 }
 
+/// One "preset" — a complete saved view that the user can recall with a
+/// single keystroke. btop calls these "presets" and binds them to 1–4;
+/// we ship the same 4-slot scheme. Each preset bundles the layout, the
+/// process-table sort key, and the sort direction. (Theme is intentionally
+/// *not* in here — it's a per-session choice that survives preset swaps.)
+#[derive(Debug, Clone, Copy)]
+pub struct Preset {
+    pub label: &'static str,
+    pub layout: LayoutPreset,
+    pub sort: ProcessSort,
+    pub descending: bool,
+}
+
+/// Default 4-slot preset bank. Slot 0 (key `1`) is the "everything-on"
+/// view; slots 1–3 (keys `2`/`3`/`4`) sharpen focus on memory, network,
+/// and minimal layouts respectively. Once B10 (config file) lands these
+/// will be user-overridable; for now they're a sensible fixed bank.
+pub const DEFAULT_PRESETS: [Preset; 4] = [
+    Preset {
+        label: "all panels, sort by CPU",
+        layout: LayoutPreset::Full,
+        sort: ProcessSort::Cpu,
+        descending: true,
+    },
+    Preset {
+        label: "all panels, sort by MEM",
+        layout: LayoutPreset::Full,
+        sort: ProcessSort::Mem,
+        descending: true,
+    },
+    Preset {
+        label: "all panels, sort by NET RX",
+        layout: LayoutPreset::Full,
+        sort: ProcessSort::NetRx,
+        descending: true,
+    },
+    Preset {
+        label: "minimal (CPU + processes only)",
+        layout: LayoutPreset::Minimal,
+        sort: ProcessSort::Cpu,
+        descending: true,
+    },
+];
+
 #[derive(Debug)]
 pub struct App {
     pub theme: Theme,
@@ -82,6 +126,11 @@ pub struct App {
     /// `?` toggles the centered help overlay listing keybinds (B2).
     pub show_help: bool,
 
+    /// `B` toggles the boxes overlay — show/hide individual panels (B5).
+    pub show_boxes_overlay: bool,
+    /// Cursor row inside the boxes overlay (index into `bobtop_core::Box::ALL`).
+    pub boxes_overlay_cursor: usize,
+
     /// Set by `apply_event` and `handle_input` whenever something
     /// observable to the renderer has changed. Cleared by `take_dirty`
     /// after the render loop calls `terminal.draw()`. Lets us render
@@ -122,6 +171,8 @@ impl App {
             proc_sort: ProcessSort::Cpu,
             proc_sort_descending: true,
             show_help: false,
+            show_boxes_overlay: false,
+            boxes_overlay_cursor: 0,
             // Start dirty so the very first frame paints something rather
             // than a blank alt-screen until the first sample lands.
             dirty: true,
@@ -291,6 +342,16 @@ impl App {
         self.boxes.replace(preset.enabled_boxes());
     }
 
+    /// Apply a full preset (layout + sort + direction) in one shot.
+    /// Re-sorts in place if the new sort matches the existing one, otherwise
+    /// re-applies via `set_sort` (which re-sorts the joined list).
+    pub fn apply_preset(&mut self, p: &Preset) {
+        self.set_layout(p.layout);
+        self.proc_sort = p.sort;
+        self.proc_sort_descending = p.descending;
+        sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+    }
+
     pub fn toggle_sort_direction(&mut self) {
         self.proc_sort_descending = !self.proc_sort_descending;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
@@ -326,18 +387,63 @@ impl App {
                 _ => return ControlFlow::Continue,
             }
         }
+        // Boxes overlay (B5): ↑/↓ moves cursor, space toggles, B/Esc closes.
+        // Other keys pass through (so e.g. `+`/`-` still tunes tick while
+        // the overlay is visible) — that matches btop's modal-but-permissive
+        // boxes menu.
+        if self.show_boxes_overlay {
+            use bobtop_core::Box as BoxKind;
+            let n = BoxKind::ALL.len();
+            match k.code {
+                KeyCode::Char('B') | KeyCode::Char('b') | KeyCode::Esc => {
+                    self.show_boxes_overlay = false;
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.boxes_overlay_cursor > 0 {
+                        self.boxes_overlay_cursor -= 1;
+                    }
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.boxes_overlay_cursor + 1 < n {
+                        self.boxes_overlay_cursor += 1;
+                    }
+                    return ControlFlow::Continue;
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    let b = BoxKind::ALL[self.boxes_overlay_cursor];
+                    let cur = self.boxes.is_enabled(b);
+                    self.boxes.set(b, !cur);
+                    return ControlFlow::Continue;
+                }
+                _ => {} // fall through to normal handling
+            }
+        }
         match k.code {
             KeyCode::Char('?') => {
                 self.show_help = true;
                 ControlFlow::Continue
             }
-            KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
-            KeyCode::Char('1') => {
-                self.set_layout(LayoutPreset::Full);
+            KeyCode::Char('B') => {
+                // Capital B opens the boxes overlay. Lowercase `b` is left
+                // free for future use (btop's `b` cycles network interfaces).
+                self.show_boxes_overlay = true;
+                self.boxes_overlay_cursor = 0;
                 ControlFlow::Continue
             }
+            KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => {
+                let idx = (c as u8 - b'1') as usize;
+                if let Some(preset) = DEFAULT_PRESETS.get(idx) {
+                    self.apply_preset(preset);
+                }
+                ControlFlow::Continue
+            }
+            // `m` is a legacy alias for the minimal preset (slot 4) — kept
+            // because earlier docs referenced it and muscle memory matters.
             KeyCode::Char('m') => {
-                self.set_layout(LayoutPreset::Minimal);
+                self.apply_preset(&DEFAULT_PRESETS[3]);
                 ControlFlow::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -531,6 +637,76 @@ mod tests {
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         let ev = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(app.handle_input(ev), ControlFlow::Quit);
+    }
+
+    #[test]
+    fn boxes_overlay_toggles_a_box_and_closes() {
+        use bobtop_core::Box as BoxKind;
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        // All boxes start enabled in Full.
+        assert!(app.boxes.is_enabled(BoxKind::Cpu));
+
+        // Open overlay with capital B.
+        let open = Event::Key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
+        app.handle_input(open);
+        assert!(app.show_boxes_overlay);
+        assert_eq!(app.boxes_overlay_cursor, 0); // first row = CPU
+
+        // Space toggles the cursor's box (CPU at index 0).
+        let space = || Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.handle_input(space());
+        assert!(!app.boxes.is_enabled(BoxKind::Cpu));
+
+        // Down moves cursor to MEM, space disables it too.
+        let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_input(down);
+        assert_eq!(app.boxes_overlay_cursor, 1);
+        app.handle_input(space());
+        assert!(!app.boxes.is_enabled(BoxKind::Memory));
+
+        // Esc closes; CPU/MEM stay disabled (overlay state was just visibility).
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input(esc);
+        assert!(!app.show_boxes_overlay);
+        assert!(!app.boxes.is_enabled(BoxKind::Cpu));
+    }
+
+    #[test]
+    fn preset_keys_swap_layout_and_sort() {
+        use bobtop_core::Box as BoxKind;
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        // Seed with a Process sample so apply_preset has something to sort.
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc(1, "a", 0.10),
+                fake_proc(2, "b", 0.95),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+
+        // Preset 2 (key '2') = Full + sort by Mem.
+        let two = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        app.handle_input(two);
+        assert_eq!(app.layout_preset, LayoutPreset::Full);
+        assert_eq!(app.proc_sort, ProcessSort::Mem);
+
+        // Preset 4 (key '4') = Minimal — should disable MEM/DISK/NET boxes.
+        let four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        app.handle_input(four);
+        assert_eq!(app.layout_preset, LayoutPreset::Minimal);
+        assert_eq!(app.proc_sort, ProcessSort::Cpu);
+        assert!(!app.boxes.is_enabled(BoxKind::Memory));
+        assert!(!app.boxes.is_enabled(BoxKind::Network));
+        assert!(app.boxes.is_enabled(BoxKind::Cpu));
+        assert!(app.boxes.is_enabled(BoxKind::Process));
+
+        // `m` is the legacy alias for slot 4 — should still work.
+        app.apply_preset(&DEFAULT_PRESETS[0]); // back to slot 1
+        assert_eq!(app.layout_preset, LayoutPreset::Full);
+        let m = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.handle_input(m);
+        assert_eq!(app.layout_preset, LayoutPreset::Minimal);
     }
 
     #[test]
