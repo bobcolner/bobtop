@@ -156,6 +156,12 @@ pub struct ProcessInfo {
     /// since Linux 2.6.20 with CONFIG_TASK_IO_ACCOUNTING).
     pub disk_read_bytes_per_sec: Option<f64>,
     pub disk_write_bytes_per_sec: Option<f64>,
+    /// Last segment of the process's cgroup v2 path, e.g.
+    /// `firefox.service`, `user@1000.service`, `docker-<sha>.scope`.
+    /// Read from `/proc/[pid]/cgroup` — drives the "group by cgroup"
+    /// view (the actually-useful clustering on modern systemd hosts).
+    /// `None` on non-Linux or when the file is unreadable.
+    pub cgroup: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

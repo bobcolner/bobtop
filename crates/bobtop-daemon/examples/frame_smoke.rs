@@ -102,7 +102,17 @@ fn main() {
         .with_keybinds("+ select  info  terminate  kill  signals");
     (&proc_panel).render(layout.processes, &mut buf);
     let proc_inner = proc_panel.inner(layout.processes);
-    let rows = sample_processes();
+    let rows: Vec<bobtop_tui::widgets::DisplayRow> = sample_processes()
+        .into_iter()
+        .map(|info| {
+            bobtop_tui::widgets::DisplayRow::Process(bobtop_tui::widgets::ProcessRowMeta {
+                info,
+                depth: 0,
+                is_last_sibling: false,
+                ancestor_continues: Vec::new(),
+            })
+        })
+        .collect();
     let table = ProcessTable::new(&rows, &theme).with_selection(Some(2), 0);
     (&table).render(proc_inner, &mut buf);
 
@@ -147,6 +157,7 @@ fn sample_processes() -> Vec<ProcessInfo> {
             net_tx_bytes_per_sec: None,
             disk_read_bytes_per_sec: None,
             disk_write_bytes_per_sec: None,
+            cgroup: None,
         })
         .collect()
 }

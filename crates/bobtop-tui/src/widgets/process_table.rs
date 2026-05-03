@@ -15,6 +15,41 @@ use ratatui::widgets::Widget;
 
 use crate::Theme;
 
+/// One row the renderer paints. Headers carry aggregates (group total
+/// CPU/MEM/etc); processes carry their own info plus depth/branch info
+/// for tree-mode indentation. Built by `bobtop_daemon::group::build_display`.
+#[derive(Debug, Clone)]
+pub enum DisplayRow {
+    Header(GroupHeader),
+    Process(ProcessRowMeta),
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupHeader {
+    pub key: String,
+    pub label: String,
+    pub proc_count: usize,
+    pub cpu_fraction_total: f32,
+    pub mem_rss_total: u64,
+    pub net_rx_total: Option<f64>,
+    pub net_tx_total: Option<f64>,
+    pub disk_read_total: Option<f64>,
+    pub disk_write_total: Option<f64>,
+    pub expanded: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessRowMeta {
+    pub info: ProcessInfo,
+    /// 0 = top-level. 1+ = nested under a group header or a tree parent.
+    pub depth: u8,
+    /// True when this row is the last sibling at its depth (drives └ vs ├).
+    pub is_last_sibling: bool,
+    /// Per-ancestor-depth, true if that ancestor has a continuing sibling
+    /// (drives │ vs space at column d).
+    pub ancestor_continues: Vec<bool>,
+}
+
 /// How aggressively rows fade toward `inactive_fg` as their visible index
 /// grows. `0.0` = no fade (matches old behavior); `1.0` = bottom row fully
 /// at `inactive_fg`. btop uses a similar darkening pass for visual depth —
@@ -73,17 +108,22 @@ impl ProcessSort {
 }
 
 pub struct ProcessTable<'a> {
-    pub rows: &'a [ProcessInfo],
+    pub rows: &'a [DisplayRow],
     pub selected: Option<usize>,
     pub scroll_offset: usize,
     pub theme: &'a Theme,
     pub show_net_columns: bool,
     pub sort: ProcessSort,
     pub sort_descending: bool,
+    /// True when the active group mode is `ByParent` (tree). The widget
+    /// uses this to decide whether to draw branch glyphs (├ │ └) in the
+    /// Program column. In flat / executable / cgroup modes children are
+    /// indented with a simple two-space prefix instead.
+    pub tree_mode: bool,
 }
 
 impl<'a> ProcessTable<'a> {
-    pub fn new(rows: &'a [ProcessInfo], theme: &'a Theme) -> Self {
+    pub fn new(rows: &'a [DisplayRow], theme: &'a Theme) -> Self {
         Self {
             rows,
             selected: None,
@@ -92,7 +132,13 @@ impl<'a> ProcessTable<'a> {
             show_net_columns: false,
             sort: ProcessSort::Cpu,
             sort_descending: true,
+            tree_mode: false,
         }
+    }
+
+    pub fn with_tree_mode(mut self, on: bool) -> Self {
+        self.tree_mode = on;
+        self
     }
 
     pub fn with_direction(mut self, descending: bool) -> Self {
@@ -183,54 +229,161 @@ impl<'a> Widget for &ProcessTable<'a> {
             .take(body_h);
 
         let max_visible = body_h.max(1);
-        for (i, (row_idx, p)) in visible.enumerate() {
+        for (i, (row_idx, row)) in visible.enumerate() {
             let y = body_top + i as u16;
             let is_selected = self.selected == Some(row_idx);
-
-            // Linear fade from main_fg toward inactive_fg, scaled by FADE_END.
-            // Selected row keeps its own (high-contrast) palette and is exempt
-            // from the fade so it stays scannable at the bottom of the list.
             let fade_t = (i as f32 / max_visible as f32) * FADE_END;
-            let row_fg = lerp_color(self.theme.main_fg, self.theme.inactive_fg, fade_t);
 
-            let base_style = if is_selected {
-                Style::default()
-                    .bg(self.theme.selected_bg)
-                    .fg(self.theme.selected_fg)
-            } else {
-                Style::default().fg(row_fg)
-            };
-
-            // Background fill on selected row across the entire row width.
+            // Selection background fill applies to either kind.
             if is_selected {
                 for x in area.x..area.x + area.width {
                     buf[(x, y)].set_style(Style::default().bg(self.theme.selected_bg));
                 }
             }
 
-            let cpu_color = self.theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0));
-            let mem_color = self.theme.used.sample(
-                (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0))
-                    .min(1.0) as f32,
-            );
-
-            let cells = build_row_cells(p, true);
-            render_row(buf, area.x, y, area.width, &cols, |idx| {
-                let s = cells[idx].clone();
-                let mut style = base_style;
-                if !is_selected {
-                    if cols[idx].title == "CPU%" {
-                        style = style.fg(lerp_color(cpu_color, self.theme.inactive_fg, fade_t));
-                    } else if cols[idx].title == "MEM" {
-                        style = style.fg(lerp_color(mem_color, self.theme.inactive_fg, fade_t));
-                    } else if cols[idx].title == "Pid" {
-                        style = style.fg(self.theme.inactive_fg);
-                    }
+            match row {
+                DisplayRow::Header(h) => {
+                    self.render_header_row(buf, area, y, h, is_selected, &cols);
                 }
-                (s, style, cols[idx].right_align)
-            });
+                DisplayRow::Process(p) => {
+                    self.render_process_row(
+                        buf,
+                        area,
+                        y,
+                        p,
+                        is_selected,
+                        fade_t,
+                        &cols,
+                    );
+                }
+            }
         }
     }
+}
+
+impl<'a> ProcessTable<'a> {
+    fn render_header_row(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        y: u16,
+        h: &GroupHeader,
+        is_selected: bool,
+        cols: &[ColSpec],
+    ) {
+        let glyph = if h.expanded { '▼' } else { '▶' };
+        let label = format!("{glyph} {}", h.label);
+        // Right side: aggregate metrics formatted like the data row's
+        // CPU%/MEM/RX/TX/DR/DW columns. We reuse the same column widths
+        // so the values line up under their headers.
+        let cells: Vec<String> = vec![
+            String::new(),                                     // Pid (blank)
+            String::new(),                                     // Program — overlaid below
+            String::new(),                                     // User
+            String::new(),                                     // Th
+            format_bytes(h.mem_rss_total),                     // MEM
+            format!("{:.1}", h.cpu_fraction_total * 100.0),   // CPU%
+            opt_rate(h.net_rx_total),
+            opt_rate(h.net_tx_total),
+            opt_rate(h.disk_read_total),
+            opt_rate(h.disk_write_total),
+            String::new(),                                     // Command
+        ];
+        let bg = if is_selected { Some(self.theme.selected_bg) } else { None };
+        let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
+        let style = match bg {
+            Some(b) => Style::default().bg(b).fg(fg).add_modifier(Modifier::BOLD),
+            None => Style::default().fg(fg).add_modifier(Modifier::BOLD),
+        };
+        render_row(buf, area.x, y, area.width, cols, |idx| {
+            let s = cells[idx].clone();
+            (s, style, cols[idx].right_align)
+        });
+        // Overwrite the Program column with the chevron + label. We do
+        // this after the table render so it spans the column properly.
+        write_str(
+            buf,
+            area.x + cols[0].width + 1,
+            y,
+            &label,
+            cols[1].width as usize,
+            style,
+        );
+    }
+
+    fn render_process_row(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        y: u16,
+        meta: &ProcessRowMeta,
+        is_selected: bool,
+        fade_t: f32,
+        cols: &[ColSpec],
+    ) {
+        let p = &meta.info;
+        let row_fg = lerp_color(self.theme.main_fg, self.theme.inactive_fg, fade_t);
+        let base_style = if is_selected {
+            Style::default()
+                .bg(self.theme.selected_bg)
+                .fg(self.theme.selected_fg)
+        } else {
+            Style::default().fg(row_fg)
+        };
+
+        let cpu_color = self.theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0));
+        let mem_color = self.theme.used.sample(
+            (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).min(1.0) as f32,
+        );
+
+        // Build the indent prefix. Tree mode draws branch glyphs; grouped
+        // modes use a flat 2-space-per-depth indent.
+        let prefix = if self.tree_mode {
+            tree_prefix(meta)
+        } else {
+            "  ".repeat(meta.depth as usize)
+        };
+
+        let mut cells = build_row_cells(p, true);
+        // Replace the Program cell with prefix + name (truncated to fit
+        // the column allowance after the prefix).
+        let prog_avail = (cols[1].width as usize).saturating_sub(prefix.chars().count());
+        cells[1] = format!("{prefix}{}", truncate(&p.name, prog_avail.max(1)));
+
+        render_row(buf, area.x, y, area.width, cols, |idx| {
+            let s = cells[idx].clone();
+            let mut style = base_style;
+            if !is_selected {
+                if cols[idx].title == "CPU%" {
+                    style = style.fg(lerp_color(cpu_color, self.theme.inactive_fg, fade_t));
+                } else if cols[idx].title == "MEM" {
+                    style = style.fg(lerp_color(mem_color, self.theme.inactive_fg, fade_t));
+                } else if cols[idx].title == "Pid" {
+                    style = style.fg(self.theme.inactive_fg);
+                }
+            }
+            (s, style, cols[idx].right_align)
+        });
+    }
+}
+
+/// Build a tree branch prefix for a process row using its
+/// ancestor-continues bitmap and last-sibling flag. Examples:
+///   depth=0:           ""
+///   depth=1, last:     "└─ "
+///   depth=1, mid:      "├─ "
+///   depth=2, last,
+///     parent had more: "│  └─ "
+fn tree_prefix(meta: &ProcessRowMeta) -> String {
+    if meta.depth == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for &cont in &meta.ancestor_continues {
+        out.push_str(if cont { "│  " } else { "   " });
+    }
+    out.push_str(if meta.is_last_sibling { "└─ " } else { "├─ " });
+    out
 }
 
 /// Linear interpolate between two terminal colors at `t ∈ [0,1]`.
@@ -400,13 +553,27 @@ mod tests {
             net_tx_bytes_per_sec: None,
             disk_read_bytes_per_sec: None,
             disk_write_bytes_per_sec: None,
+            cgroup: None,
         }
+    }
+
+    fn flat_rows(ps: Vec<ProcessInfo>) -> Vec<DisplayRow> {
+        ps.into_iter()
+            .map(|info| {
+                DisplayRow::Process(ProcessRowMeta {
+                    info,
+                    depth: 0,
+                    is_last_sibling: false,
+                    ancestor_continues: Vec::new(),
+                })
+            })
+            .collect()
     }
 
     #[test]
     fn header_renders_at_first_row() {
         let theme = Theme::fallback();
-        let rows = [proc(1, "init", 0.01, 5)];
+        let rows = flat_rows(vec![proc(1, "init", 0.01, 5)]);
         let table = ProcessTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
@@ -423,7 +590,7 @@ mod tests {
     #[test]
     fn data_row_shows_pid_name_cpu() {
         let theme = Theme::fallback();
-        let rows = [proc(12345, "cargo", 0.42, 256)];
+        let rows = flat_rows(vec![proc(12345, "cargo", 0.42, 256)]);
         let table = ProcessTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 3);
         let mut buf = Buffer::empty(area);
@@ -437,7 +604,7 @@ mod tests {
     #[test]
     fn selected_row_gets_background_fill() {
         let theme = Theme::fallback();
-        let rows = [proc(1, "a", 0.1, 1), proc(2, "b", 0.1, 1)];
+        let rows = flat_rows(vec![proc(1, "a", 0.1, 1), proc(2, "b", 0.1, 1)]);
         let table = ProcessTable::new(&rows, &theme).with_selection(Some(1), 0);
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
@@ -456,7 +623,7 @@ mod tests {
         let mut p = proc(1, "x", 0.0, 0);
         p.net_rx_bytes_per_sec = Some(2048.0);
         p.net_tx_bytes_per_sec = Some(512.0);
-        let rows = [p];
+        let rows = flat_rows(vec![p]);
         let table = ProcessTable::new(&rows, &theme).with_net_columns(true);
         let area = Rect::new(0, 0, 100, 3);
         let mut buf = Buffer::empty(area);

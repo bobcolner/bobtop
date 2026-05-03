@@ -135,6 +135,11 @@ fn main() -> anyhow::Result<()> {
             net_tx_bytes_per_sec: None,
             disk_read_bytes_per_sec: Some((i as f64 + 1.0) * 25_000.0),
             disk_write_bytes_per_sec: Some((i as f64 + 1.0) * 10_000.0),
+            cgroup: Some(
+                if i < 3 { "firefox.service".into() }
+                else if i < 6 { "user@1000.service".into() }
+                else { "system.slice".into() },
+            ),
         })
         .collect();
     app.apply_event(MetricEvent::Process(ProcessSample {

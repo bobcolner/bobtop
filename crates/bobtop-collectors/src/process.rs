@@ -132,6 +132,7 @@ impl Collector for ProcessCollector {
                     net_tx_bytes_per_sec: None,
                     disk_read_bytes_per_sec: dr,
                     disk_write_bytes_per_sec: dw,
+                    cgroup: read_cgroup(pid_u32),
                 }
             })
             .collect();
@@ -194,6 +195,36 @@ fn thread_count(p: &sysinfo::Process) -> u32 {
 #[cfg(not(target_os = "linux"))]
 fn thread_count(_p: &sysinfo::Process) -> u32 {
     1
+}
+
+/// Read /proc/[pid]/cgroup and return the leaf segment of the cgroup v2
+/// path. Modern systemd writes a single line of the form
+/// `0::/user.slice/user-1000.slice/session-3.scope` — we strip everything
+/// before the last `/` so the display is readable. Falls back to looking
+/// at the v1 hierarchy line that has the longest path (heuristic).
+/// Returns None on non-Linux, when the file is unreadable, or when the
+/// cgroup is just `/` (the root, useless for grouping).
+#[cfg(target_os = "linux")]
+fn read_cgroup(pid: u32) -> Option<String> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    // Prefer v2 (line starts with "0::"). Fall back to longest v1 path.
+    let v2 = s.lines().find(|l| l.starts_with("0::")).map(|l| &l[3..]);
+    let path = v2.or_else(|| {
+        s.lines()
+            .filter_map(|l| l.splitn(3, ':').nth(2))
+            .max_by_key(|p| p.len())
+    })?;
+    let leaf = path.rsplit('/').find(|s| !s.is_empty())?;
+    if leaf.is_empty() || leaf == "/" {
+        None
+    } else {
+        Some(leaf.to_string())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cgroup(_pid: u32) -> Option<String> {
+    None
 }
 
 #[cfg(test)]

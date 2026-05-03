@@ -478,7 +478,9 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("B", "boxes — show/hide individual panels"),
     ("f", "filter processes by name/cmdline"),
     ("k / K", "kill (SIGTERM / SIGKILL) — confirm dialog"),
-    ("Enter", "process detail (read-only)"),
+    ("Enter", "detail (process) | expand (header)"),
+    ("g", "cycle group mode: flat → exec → cgroup → tree"),
+    ("Space", "expand/collapse selected group or subtree"),
     ("O", "options — edit config + save to disk"),
 ];
 
@@ -982,8 +984,9 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let title = format!(
-        "⁴proc  {} procs  ←{}{}→  rx/tx: {}{}{}",
+        "⁴proc  {} procs  group:{}  ←{}{}→  rx/tx: {}{}{}",
         app.processes_sorted.len(),
+        app.group_mode.label(),
         app.proc_sort.label(),
         arrow,
         app.net_tier.name(),
@@ -993,7 +996,7 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     let panel = mk_panel(app, app.theme.proc_box, app.theme.title)
         .with_title(title)
         .with_keybinds(
-            "q quit  ↑↓ select  ←→ sort col  r reverse  f filter  k/K kill  Enter detail  ?",
+            "q quit  ↑↓ select  ←→ sort  r rev  f filter  g group  Space expand  k/K kill  Enter  ?",
         );
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -1021,10 +1024,16 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
         scroll_offset = app.selected_proc + 1 - body_h;
     }
 
-    let mut table = ProcessTable::new(&app.processes_sorted, &app.theme)
+    // Build the grouped/tree display rows from App state. This is the
+    // input the widget actually iterates over — `processes_sorted` is
+    // still the underlying source of truth, but the widget never sees
+    // it directly anymore.
+    let rows = app.display_rows();
+    let mut table = ProcessTable::new(&rows, &app.theme)
         .with_selection(Some(app.selected_proc), scroll_offset)
         .with_net_columns(app.net_tier.has_bandwidth())
-        .with_direction(app.proc_sort_descending);
+        .with_direction(app.proc_sort_descending)
+        .with_tree_mode(app.group_mode == crate::group::GroupMode::ByParent);
     table.sort = app.proc_sort;
     frame.render_widget(&table, table_area);
 

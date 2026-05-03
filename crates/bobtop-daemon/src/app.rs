@@ -361,6 +361,16 @@ pub struct App {
     /// (success path or error). Cleared on next user action.
     pub last_options_msg: Option<String>,
 
+    /// Process grouping mode (the "intelligent clustering" feature).
+    /// `g` cycles flat → exec → cgroup → tree → flat.
+    pub group_mode: crate::group::GroupMode,
+    /// Expand/collapse state. For grouped modes (exec/cgroup), entries
+    /// are header keys that are EXPANDED (default = collapsed). For tree
+    /// mode, entries are pids stringified that are COLLAPSED (default =
+    /// expanded). The two semantics share one set because they never
+    /// coexist — switching modes resets the meaning.
+    pub expanded: std::collections::HashSet<String>,
+
     /// Set by `apply_event` and `handle_input` whenever something
     /// observable to the renderer has changed. Cleared by `take_dirty`
     /// after the render loop calls `terminal.draw()`. Lets us render
@@ -411,6 +421,8 @@ impl App {
             detail: None,
             options: None,
             last_options_msg: None,
+            group_mode: crate::group::GroupMode::Flat,
+            expanded: std::collections::HashSet::new(),
             // Start dirty so the very first frame paints something rather
             // than a blank alt-screen until the first sample lands.
             dirty: true,
@@ -663,17 +675,63 @@ impl App {
         }
     }
 
+    /// Materialize the current display rows. Cheap to call (clones
+    /// ProcessInfo entries today; can be cached on App later if it
+    /// shows up in the bench). The renderer and the keybind handlers
+    /// both use this so they always agree on what's visible.
+    pub fn display_rows(&self) -> Vec<crate::group::DisplayRow> {
+        crate::group::build_display(
+            &self.processes_sorted,
+            self.group_mode,
+            &self.expanded,
+            self.proc_sort,
+        )
+    }
+
+    /// Cycle the grouping mode (`g` keybind). Resets `expanded` because
+    /// the key namespace differs between modes (header keys for
+    /// grouped views, pids for tree view).
+    pub fn cycle_group_mode(&mut self) {
+        self.group_mode = self.group_mode.next();
+        self.expanded.clear();
+        self.selected_proc = 0;
+    }
+
+    /// Toggle expand/collapse for the row currently under the selection
+    /// cursor. For grouped headers this expands the group; for tree
+    /// processes this collapses/uncollapses the subtree rooted at that
+    /// pid. No-op for Flat mode (no children to hide).
+    pub fn toggle_selected_expand(&mut self) {
+        let rows = self.display_rows();
+        let Some(row) = rows.get(self.selected_proc) else { return };
+        let key = match (self.group_mode, row) {
+            (crate::group::GroupMode::Flat, _) => return,
+            (_, crate::group::DisplayRow::Header(h)) => h.key.clone(),
+            (crate::group::GroupMode::ByParent, crate::group::DisplayRow::Process(p)) => {
+                p.info.pid.to_string()
+            }
+            (_, crate::group::DisplayRow::Process(_)) => return,
+        };
+        if self.expanded.contains(&key) {
+            self.expanded.remove(&key);
+        } else {
+            self.expanded.insert(key);
+        }
+    }
+
     /// Stage a kill request for the currently-selected process. No signal
     /// is sent yet — the user has to confirm via Enter in the modal. If
-    /// no process is selected (empty list) this is a silent no-op.
+    /// the selection isn't on a process row (e.g. on a group header)
+    /// this is a silent no-op.
     pub fn request_kill(&mut self, signal: KillSignal) {
-        if let Some(p) = self.processes_sorted.get(self.selected_proc) {
-            self.pending_kill = Some(KillRequest {
-                pid: p.pid,
-                name: p.name.clone(),
-                signal,
-            });
-        }
+        let rows = self.display_rows();
+        let Some(row) = rows.get(self.selected_proc) else { return };
+        let crate::group::DisplayRow::Process(p) = row else { return };
+        self.pending_kill = Some(KillRequest {
+            pid: p.info.pid,
+            name: p.info.name.clone(),
+            signal,
+        });
     }
 
     pub fn toggle_sort_direction(&mut self) {
@@ -697,7 +755,11 @@ impl App {
     }
 
     fn handle_key(&mut self, k: KeyEvent) -> ControlFlow {
-        let visible_rows = self.processes_sorted.len();
+        // visible_rows = total render-row count (group headers + visible
+        // processes). Bounding selection on this so cursor stops at the
+        // bottom of what's actually painted, not the underlying process
+        // count which excludes headers and includes hidden subtree members.
+        let visible_rows = self.display_rows().len();
 
         // Options overlay (B11b) — modal. ↑/↓ moves cursor, ←/→ cycles
         // the value at the cursor, Enter saves to disk + applies live,
@@ -882,11 +944,27 @@ impl App {
                 ControlFlow::Continue
             }
             KeyCode::Enter => {
-                // Open detail modal for the selected pid. Reads /proc on
-                // open (B3d). No-op when the list is empty.
-                if let Some(p) = self.processes_sorted.get(self.selected_proc) {
-                    self.detail = Some(ProcessDetail::read(p.pid, &p.name));
+                // Enter does double-duty: on a group header, expand/collapse;
+                // on a process row, open the detail modal.
+                let rows = self.display_rows();
+                if let Some(row) = rows.get(self.selected_proc) {
+                    match row {
+                        crate::group::DisplayRow::Header(_) => self.toggle_selected_expand(),
+                        crate::group::DisplayRow::Process(p) => {
+                            self.detail = Some(ProcessDetail::read(p.info.pid, &p.info.name));
+                        }
+                    }
                 }
+                ControlFlow::Continue
+            }
+            KeyCode::Char('g') => {
+                self.cycle_group_mode();
+                ControlFlow::Continue
+            }
+            KeyCode::Char(' ') => {
+                // Space toggles expand on the row at cursor (header in
+                // grouped modes, subtree root in tree mode).
+                self.toggle_selected_expand();
                 ControlFlow::Continue
             }
             KeyCode::Char('O') => {
@@ -1090,6 +1168,7 @@ mod tests {
             net_tx_bytes_per_sec: None,
             disk_read_bytes_per_sec: None,
             disk_write_bytes_per_sec: None,
+            cgroup: None,
         }
     }
 
