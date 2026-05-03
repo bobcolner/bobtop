@@ -55,9 +55,6 @@ pub struct App {
     /// Per-tick aggregate of "real" interface bandwidth, suitable for the
     /// dual-trace network graph. `(rx_bytes_per_sec, tx_bytes_per_sec)`.
     pub net_history: VecDeque<(f64, f64)>,
-    /// Running max for net auto-scale. Decays on each push so a one-time
-    /// burst doesn't permanently squash the graph.
-    pub net_scale_bps: f64,
     pub net_samples: Vec<ProcessNetSample>,
     pub net_tier: AttributorTier,
 
@@ -95,7 +92,6 @@ impl App {
             latest_network: None,
             latest_disk: None,
             net_history: VecDeque::with_capacity(HISTORY_CAP),
-            net_scale_bps: 100.0 * 1024.0, // 100 KiB/s starting baseline
             net_samples: Vec::new(),
             net_tier: AttributorTier::Unavailable,
             processes_sorted: Vec::new(),
@@ -131,11 +127,6 @@ impl App {
                     self.net_history.pop_front();
                 }
                 self.net_history.push_back((rx, tx));
-                // Auto-scale: gentle decay (×0.99 per tick) plus 1.2× headroom over the
-                // current peak. Keeps the graph responsive without permanently
-                // squashing after a single burst.
-                let peak = rx.max(tx);
-                self.net_scale_bps = (self.net_scale_bps * 0.99).max(peak * 1.2).max(1024.0);
                 self.latest_network = Some(s);
             }
             MetricEvent::Disk(s) => self.latest_disk = Some(s),
@@ -147,11 +138,39 @@ impl App {
 
     /// Most recent normalized (rx, tx) pair for the BrailleGraph, in 0..=1.
     pub fn net_normalized_history(&self) -> Vec<(f64, f64)> {
-        let scale = self.net_scale_bps.max(1.0);
+        let scale = self.net_scale_bps().max(1.0);
         self.net_history
             .iter()
             .map(|(rx, tx)| ((rx / scale).clamp(0.0, 1.0), (tx / scale).clamp(0.0, 1.0)))
             .collect()
+    }
+
+    /// Auto-scale ceiling for the network graph: rolling-max across both
+    /// rx and tx in `net_history`, plus 20% headroom, floored at 1 KiB/s.
+    /// Recomputed every render — naturally tracks bursts upward and decays
+    /// downward as old samples scroll out of the history window.
+    pub fn net_scale_bps(&self) -> f64 {
+        let max_hist = self
+            .net_history
+            .iter()
+            .flat_map(|(rx, tx)| [*rx, *tx])
+            .fold(0.0_f64, |a, b| a.max(b));
+        (max_hist * 1.2).max(1024.0)
+    }
+
+    /// Rolling-max for download direction only. Used for the corner labels.
+    pub fn net_peak_rx(&self) -> f64 {
+        self.net_history
+            .iter()
+            .map(|(rx, _)| *rx)
+            .fold(0.0_f64, |a, b| a.max(b))
+    }
+
+    pub fn net_peak_tx(&self) -> f64 {
+        self.net_history
+            .iter()
+            .map(|(_, tx)| *tx)
+            .fold(0.0_f64, |a, b| a.max(b))
     }
 
     pub fn apply_net(&mut self, samples: Vec<ProcessNetSample>, tier: AttributorTier) {

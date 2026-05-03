@@ -128,19 +128,21 @@ impl<'a> Widget for &ProcessTable<'a> {
             return;
         }
 
+        // Widths trimmed so all columns fit in a typical 50%-of-terminal proc
+        // panel (~60-80 cells). RX/TX always shown — `-` when no data —
+        // so the columns are discoverable even at Tier 1.
         let mut cols: Vec<ColSpec> = Vec::with_capacity(9);
-        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),     width: 7,  right_align: true });
-        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),    width: 16, right_align: false });
-        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),    width: 8,  right_align: false });
-        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads), width: 4,  right_align: true });
-        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),     width: 8,  right_align: true });
-        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),     width: 6,  right_align: true });
-        if self.show_net_columns {
-            cols.push(ColSpec { title: "RX/s", sort: Some(ProcessSort::NetRx), width: 8, right_align: true });
-            cols.push(ColSpec { title: "TX/s", sort: Some(ProcessSort::NetTx), width: 8, right_align: true });
-        }
+        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),     width: 6, right_align: true });
+        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),    width: 14, right_align: false });
+        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),    width: 8, right_align: false });
+        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads), width: 3, right_align: true });
+        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),     width: 7, right_align: true });
+        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),     width: 5, right_align: true });
+        cols.push(ColSpec { title: "RX/s",    sort: Some(ProcessSort::NetRx),   width: 7, right_align: true });
+        cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),   width: 7, right_align: true });
         // Command soaks up remaining width — placed last on purpose.
         cols.push(ColSpec { title: "Command", sort: None, width: u16::MAX, right_align: false });
+        let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
 
         // Header row. Active sort column gets bracketed + arrow indicator.
         let header_style = Style::default().fg(self.theme.title).add_modifier(Modifier::BOLD);
@@ -200,7 +202,7 @@ impl<'a> Widget for &ProcessTable<'a> {
                     .min(1.0) as f32,
             );
 
-            let cells = build_row_cells(p, self.show_net_columns);
+            let cells = build_row_cells(p, true);
             render_row(buf, area.x, y, area.width, &cols, |idx| {
                 let s = cells[idx].clone();
                 let mut style = base_style;
@@ -219,26 +221,24 @@ impl<'a> Widget for &ProcessTable<'a> {
     }
 }
 
-fn build_row_cells(p: &ProcessInfo, show_net: bool) -> Vec<String> {
+fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(9);
     out.push(p.pid.to_string());
-    out.push(truncate(&p.name, 16));
+    out.push(truncate(&p.name, 14));
     out.push(truncate(&p.user, 8));
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
-    if show_net {
-        out.push(
-            p.net_rx_bytes_per_sec
-                .map(format_rate)
-                .unwrap_or_else(|| "-".into()),
-        );
-        out.push(
-            p.net_tx_bytes_per_sec
-                .map(format_rate)
-                .unwrap_or_else(|| "-".into()),
-        );
-    }
+    out.push(
+        p.net_rx_bytes_per_sec
+            .map(format_rate)
+            .unwrap_or_else(|| "-".into()),
+    );
+    out.push(
+        p.net_tx_bytes_per_sec
+            .map(format_rate)
+            .unwrap_or_else(|| "-".into()),
+    );
     // Command soaks up trailing width. Empty cmdline → fall back to name.
     let cmd = if p.cmdline.is_empty() {
         p.name.clone()

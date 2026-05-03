@@ -241,6 +241,7 @@ fn build_memory_categories(s: &MemorySample, theme: &Theme) -> Vec<Meter> {
 fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     let (rx_now, tx_now) = current_real_rates(app);
     let (counted, total) = interface_counts(app);
+    let scale = app.net_scale_bps();
     let title = if total == 0 {
         "³net  [no interfaces — check /proc/net/dev]".to_string()
     } else if !app.show_virtual_net && counted < total {
@@ -255,27 +256,18 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     };
     let panel = BoxedPanel::new(app.theme.net_box, app.theme.title)
         .with_title(format!("{title}{bandwidth_note}"))
-        .with_controls(format!("peak {}/s", format_rate(app.net_scale_bps)));
+        .with_controls(format!("auto-scale {}/s", format_rate(scale)));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 12 || inner.height < 4 {
         return;
     }
 
-    // Split the inner area: graph on the left, summary panel on the right.
-    let side_w = (inner.width / 4).clamp(18, 32);
-    let graph_w = inner.width.saturating_sub(side_w + 1);
-    let graph_area = Rect::new(inner.x, inner.y, graph_w, inner.height);
-    let side_area = Rect::new(inner.x + graph_w + 1, inner.y, side_w, inner.height);
-
-    // Build graph with mirrored split: download top, upload bottom (mirrored).
-    let mut graph = BrailleGraph::new((graph_area.width as usize) * 2, app.theme.download)
-        .with_y_scale(
-            format!("↑ {}/s", format_rate(app.net_scale_bps)),
-            format!("↓ {}/s", format_rate(app.net_scale_bps)),
-        )
+    // Centered split graph: top half = upload mirrored down from center,
+    // bottom half = download up from center. MirroredSplit handles the math.
+    let mut graph = BrailleGraph::new((inner.width as usize) * 2, app.theme.download)
         .with_secondary(
-            Trace::new((graph_area.width as usize) * 2, app.theme.upload),
+            Trace::new((inner.width as usize) * 2, app.theme.upload),
             DualMode::MirroredSplit,
         );
     if app.tty_graphs {
@@ -284,51 +276,98 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     for (rx, tx) in app.net_normalized_history() {
         graph.push_dual(rx, tx);
     }
-    frame.render_widget(&graph, graph_area);
+    frame.render_widget(&graph, inner);
 
-    // Side panel: clear current rates with bps + total.
-    draw_net_side(frame, side_area, app, rx_now, tx_now);
+    // Overlay: explicit center divider line so the eye instantly sees the
+    // upload / download split. Replaces the middle row of graph data —
+    // worth it for clarity.
+    overlay_center_divider(frame, inner, app);
+
+    // Corner labels — left side is the auto-scale ceiling, right side is the
+    // current rate. Top half = upload (theme.upload), bottom half = download.
+    overlay_corner_labels(frame, inner, app, rx_now, tx_now);
 }
 
-fn draw_net_side(frame: &mut Frame, area: Rect, app: &App, rx_now: f64, tx_now: f64) {
+fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App) {
+    let div_y = inner.y + inner.height / 2;
+    if div_y >= inner.y + inner.height {
+        return;
+    }
+    let style = ratatui::style::Style::default().fg(app.theme.div_line);
     let buf = frame.buffer_mut();
-    let dim = ratatui::style::Style::default().fg(app.theme.inactive_fg);
-    let dl = ratatui::style::Style::default().fg(app.theme.download.end);
-    let ul = ratatui::style::Style::default().fg(app.theme.upload.end);
-    let txt = ratatui::style::Style::default().fg(app.theme.main_fg);
-
-    let lines: Vec<(ratatui::style::Style, String)> = vec![
-        (dim, "▼ download".to_string()),
-        (dl, format!("  {}/s", format_rate(rx_now))),
-        (txt, format!("  ({} bps)", format_bps(rx_now))),
-        (ratatui::style::Style::default(), String::new()),
-        (dim, "▲ upload".to_string()),
-        (ul, format!("  {}/s", format_rate(tx_now))),
-        (txt, format!("  ({} bps)", format_bps(tx_now))),
-    ];
-    for (i, (style, s)) in lines.iter().enumerate() {
-        if i as u16 >= area.height {
-            break;
-        }
-        let y = area.y + i as u16;
-        let mut x = area.x;
-        for ch in s.chars().take(area.width as usize) {
-            let cell = &mut buf[(x, y)];
-            cell.set_char(ch);
-            cell.set_style(*style);
-            x = x.saturating_add(1);
-        }
+    for x in 0..inner.width {
+        let cell = &mut buf[(inner.x + x, div_y)];
+        cell.set_char('─');
+        cell.set_style(style);
     }
 }
 
-fn format_bps(bytes_per_sec: f64) -> String {
-    let bps = bytes_per_sec * 8.0;
-    if bps >= 1_000_000.0 {
-        format!("{:.1}M", bps / 1_000_000.0)
-    } else if bps >= 1_000.0 {
-        format!("{:.1}K", bps / 1_000.0)
-    } else {
-        format!("{:.0}", bps)
+fn overlay_corner_labels(frame: &mut Frame, inner: Rect, app: &App, rx_now: f64, tx_now: f64) {
+    use ratatui::style::Style;
+    let buf = frame.buffer_mut();
+    let upload_color = app.theme.upload.end;
+    let download_color = app.theme.download.end;
+    let dim = app.theme.inactive_fg;
+
+    // Top half = upload. Top-left = peak ↑, top-right = current ↑.
+    write_str_at(
+        buf,
+        inner.x,
+        inner.y,
+        &format!("↑ peak {}/s", format_rate(app.net_peak_tx())),
+        Style::default().fg(dim),
+    );
+    let cur_up = format!("{}/s ↑", format_rate(tx_now));
+    let cur_up_len = cur_up.chars().count() as u16;
+    if cur_up_len < inner.width {
+        write_str_at(
+            buf,
+            inner.right().saturating_sub(cur_up_len),
+            inner.y,
+            &cur_up,
+            Style::default().fg(upload_color),
+        );
+    }
+
+    // Bottom half = download. Bottom-left = peak ↓, bottom-right = current ↓.
+    let bot_y = inner.y + inner.height.saturating_sub(1);
+    write_str_at(
+        buf,
+        inner.x,
+        bot_y,
+        &format!("↓ peak {}/s", format_rate(app.net_peak_rx())),
+        Style::default().fg(dim),
+    );
+    let cur_dn = format!("{}/s ↓", format_rate(rx_now));
+    let cur_dn_len = cur_dn.chars().count() as u16;
+    if cur_dn_len < inner.width {
+        write_str_at(
+            buf,
+            inner.right().saturating_sub(cur_dn_len),
+            bot_y,
+            &cur_dn,
+            Style::default().fg(download_color),
+        );
+    }
+}
+
+fn write_str_at(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    s: &str,
+    style: ratatui::style::Style,
+) {
+    let mut col = x;
+    let right = buf.area.right();
+    for ch in s.chars() {
+        if col >= right {
+            break;
+        }
+        let cell = &mut buf[(col, y)];
+        cell.set_char(ch);
+        cell.set_style(style);
+        col = col.saturating_add(1);
     }
 }
 
