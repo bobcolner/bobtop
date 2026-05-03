@@ -118,6 +118,10 @@ pub struct FilesystemSample {
     /// Mirrored from the matching [`DiskDeviceSample::utilization`] when the
     /// daemon can join them; `None` otherwise.
     pub io_utilization: Option<f32>,
+    /// Joined from the matching block device's read/write rates so the disk
+    /// panel can show throughput per mount, not just utilization.
+    pub read_bytes_per_sec: Option<f64>,
+    pub write_bytes_per_sec: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +151,11 @@ pub struct ProcessInfo {
     /// bandwidth (Tier 1 / Unavailable).
     pub net_rx_bytes_per_sec: Option<f64>,
     pub net_tx_bytes_per_sec: Option<f64>,
+    /// Per-process block-IO rates from sysinfo (`disk_usage` deltas). `None`
+    /// when the kernel doesn't expose per-pid IO accounting (rare; default
+    /// since Linux 2.6.20 with CONFIG_TASK_IO_ACCOUNTING).
+    pub disk_read_bytes_per_sec: Option<f64>,
+    pub disk_write_bytes_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

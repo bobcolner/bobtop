@@ -134,11 +134,13 @@ impl Collector for DiskCollector {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            // Try to attach IO utilization from the device-level sample.
-            let io = devices
+            // Try to attach IO utilization + rates from the device-level sample.
+            let dev_match = devices
                 .iter()
-                .find(|dev| dev.name == device || device.starts_with(&dev.name))
-                .map(|dev| dev.utilization);
+                .find(|dev| dev.name == device || device.starts_with(&dev.name));
+            let io = dev_match.map(|d| d.utilization);
+            let r_bps = dev_match.map(|d| d.read_bytes_per_sec);
+            let w_bps = dev_match.map(|d| d.write_bytes_per_sec);
             filesystems.push(FilesystemSample {
                 label: short_mount_label(&mp),
                 device,
@@ -147,6 +149,8 @@ impl Collector for DiskCollector {
                 used_bytes: used,
                 available_bytes: avail,
                 io_utilization: io,
+                read_bytes_per_sec: r_bps,
+                write_bytes_per_sec: w_bps,
             });
         }
         // Sort largest first so the panel shows the most relevant disks first.

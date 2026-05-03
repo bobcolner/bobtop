@@ -7,6 +7,16 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Per-pid disk-IO rate state. We compute bytes/sec from the wall-clock
+/// delta between this and the previous refresh; sysinfo's `disk_usage()`
+/// fields are absolute totals.
+#[derive(Debug, Clone, Copy)]
+struct DiskRateState {
+    last_total_read: u64,
+    last_total_written: u64,
+    last_at: Instant,
+}
+
 use async_trait::async_trait;
 use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
 use bobtop_core::{Collector, Result};
@@ -18,6 +28,8 @@ pub struct ProcessCollector {
     interval: Duration,
     sys: Mutex<System>,
     cpu_count: usize,
+    /// Previous absolute disk totals per pid for rate computation.
+    last_disk: Mutex<std::collections::HashMap<u32, DiskRateState>>,
 }
 
 impl std::fmt::Debug for ProcessCollector {
@@ -42,6 +54,7 @@ impl ProcessCollector {
             interval,
             sys: Mutex::new(sys),
             cpu_count,
+            last_disk: Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -65,18 +78,44 @@ impl Collector for ProcessCollector {
         sys.refresh_processes(ProcessesToUpdate::All, true);
 
         let cpu_count = self.cpu_count.max(1);
-        let processes = sys
+        let now = Instant::now();
+        let mut last_disk = self
+            .last_disk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let processes: Vec<_> = sys
             .processes()
             .iter()
             .map(|(pid, p)| {
+                let pid_u32 = pid.as_u32();
                 let cmdline = p
                     .cmd()
                     .iter()
                     .map(|s| s.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" ");
+                let usage = p.disk_usage();
+                // Compute rate as Δ(absolute total) / Δt against the per-pid
+                // previous state. Falls back to None on the first sample.
+                let (dr, dw) = match last_disk.get(&pid_u32) {
+                    Some(prev) => {
+                        let dt = now.duration_since(prev.last_at).as_secs_f64().max(0.001);
+                        let r = usage
+                            .total_read_bytes
+                            .saturating_sub(prev.last_total_read) as f64
+                            / dt;
+                        let w = usage
+                            .total_written_bytes
+                            .saturating_sub(prev.last_total_written)
+                            as f64
+                            / dt;
+                        (Some(r), Some(w))
+                    }
+                    None => (None, None),
+                };
                 ProcessInfo {
-                    pid: pid.as_u32(),
+                    pid: pid_u32,
                     parent_pid: p.parent().map(|pp| pp.as_u32()),
                     name: p.name().to_string_lossy().into_owned(),
                     cmdline,
@@ -85,18 +124,31 @@ impl Collector for ProcessCollector {
                         .map(|u| u.to_string())
                         .unwrap_or_default(),
                     state: map_status(p.status()),
-                    // sysinfo's cpu_usage is 0..(100*N) — normalise to a
-                    // fraction of *one* core so values stay readable
-                    // (1.0 = one fully-loaded core).
                     cpu_fraction: p.cpu_usage() / 100.0,
                     mem_rss_bytes: p.memory(),
                     mem_vsz_bytes: p.virtual_memory(),
                     threads: thread_count(p),
                     net_rx_bytes_per_sec: None,
                     net_tx_bytes_per_sec: None,
+                    disk_read_bytes_per_sec: dr,
+                    disk_write_bytes_per_sec: dw,
                 }
             })
             .collect();
+
+        // Rebuild the per-pid disk-rate state from this sample's totals.
+        last_disk.clear();
+        for (pid, p) in sys.processes().iter() {
+            let usage = p.disk_usage();
+            last_disk.insert(
+                pid.as_u32(),
+                DiskRateState {
+                    last_total_read: usage.total_read_bytes,
+                    last_total_written: usage.total_written_bytes,
+                    last_at: now,
+                },
+            );
+        }
 
         let _ = cpu_count; // kept for future per-core breakdowns
 

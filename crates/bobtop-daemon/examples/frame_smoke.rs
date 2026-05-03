@@ -145,6 +145,8 @@ fn sample_processes() -> Vec<ProcessInfo> {
             threads: 4 + i as u32,
             net_rx_bytes_per_sec: None,
             net_tx_bytes_per_sec: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
         })
         .collect()
 }

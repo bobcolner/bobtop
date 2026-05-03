@@ -25,33 +25,28 @@ pub enum ProcessSort {
     Cpu,
     NetRx,
     NetTx,
+    DiskRead,
+    DiskWrite,
 }
 
 impl ProcessSort {
-    /// Cycle order for the `←` / `→` keybinds. Match the on-screen left-to-right
-    /// column order so the selection visually tracks the arrow key.
-    pub fn cycle(show_net: bool) -> &'static [ProcessSort] {
-        if show_net {
-            &[
-                ProcessSort::Pid,
-                ProcessSort::Name,
-                ProcessSort::User,
-                ProcessSort::Threads,
-                ProcessSort::Mem,
-                ProcessSort::Cpu,
-                ProcessSort::NetRx,
-                ProcessSort::NetTx,
-            ]
-        } else {
-            &[
-                ProcessSort::Pid,
-                ProcessSort::Name,
-                ProcessSort::User,
-                ProcessSort::Threads,
-                ProcessSort::Mem,
-                ProcessSort::Cpu,
-            ]
-        }
+    /// Cycle order for the `←` / `→` keybinds — left-to-right display order
+    /// so the selection visually tracks the arrow direction. Always includes
+    /// every sortable column so users can reach net/disk sort even at Tier 1
+    /// (rows just compare on `0.0` then).
+    pub fn cycle() -> &'static [ProcessSort] {
+        &[
+            ProcessSort::Pid,
+            ProcessSort::Name,
+            ProcessSort::User,
+            ProcessSort::Threads,
+            ProcessSort::Mem,
+            ProcessSort::Cpu,
+            ProcessSort::NetRx,
+            ProcessSort::NetTx,
+            ProcessSort::DiskRead,
+            ProcessSort::DiskWrite,
+        ]
     }
 
     /// Stable label for the panel-title indicator (e.g. `[cpu↓]`).
@@ -65,6 +60,8 @@ impl ProcessSort {
             ProcessSort::Cpu => "cpu",
             ProcessSort::NetRx => "rx",
             ProcessSort::NetTx => "tx",
+            ProcessSort::DiskRead => "dr",
+            ProcessSort::DiskWrite => "dw",
         }
     }
 }
@@ -128,20 +125,22 @@ impl<'a> Widget for &ProcessTable<'a> {
             return;
         }
 
-        // Widths trimmed so all columns fit in a typical 50%-of-terminal proc
-        // panel (~60-80 cells). RX/TX always shown — `-` when no data —
-        // so the columns are discoverable even at Tier 1.
-        let mut cols: Vec<ColSpec> = Vec::with_capacity(9);
-        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),     width: 6, right_align: true });
-        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),    width: 14, right_align: false });
-        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),    width: 8, right_align: false });
-        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads), width: 3, right_align: true });
-        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),     width: 7, right_align: true });
-        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),     width: 5, right_align: true });
-        cols.push(ColSpec { title: "RX/s",    sort: Some(ProcessSort::NetRx),   width: 7, right_align: true });
-        cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),   width: 7, right_align: true });
-        // Command soaks up remaining width — placed last on purpose.
-        cols.push(ColSpec { title: "Command", sort: None, width: u16::MAX, right_align: false });
+        // 11-column layout. All sortable columns always shown; cells render
+        // `-` when data is unavailable so columns are discoverable even at
+        // Tier 1. Render-row truncates from the right when terminal is narrow,
+        // so on tight panels Command/Disk drop first, Net second.
+        let mut cols: Vec<ColSpec> = Vec::with_capacity(11);
+        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),       width: 6,  right_align: true });
+        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),      width: 12, right_align: false });
+        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),      width: 6,  right_align: false });
+        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads),   width: 3,  right_align: true });
+        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),       width: 6,  right_align: true });
+        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),       width: 5,  right_align: true });
+        cols.push(ColSpec { title: "RX/s",    sort: Some(ProcessSort::NetRx),     width: 6,  right_align: true });
+        cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),     width: 6,  right_align: true });
+        cols.push(ColSpec { title: "DR/s",    sort: Some(ProcessSort::DiskRead),  width: 6,  right_align: true });
+        cols.push(ColSpec { title: "DW/s",    sort: Some(ProcessSort::DiskWrite), width: 6,  right_align: true });
+        cols.push(ColSpec { title: "Command", sort: None,                         width: u16::MAX, right_align: false });
         let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
 
         // Header row. Active sort column gets bracketed + arrow indicator.
@@ -222,24 +221,17 @@ impl<'a> Widget for &ProcessTable<'a> {
 }
 
 fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(11);
     out.push(p.pid.to_string());
-    out.push(truncate(&p.name, 14));
-    out.push(truncate(&p.user, 8));
+    out.push(truncate(&p.name, 12));
+    out.push(truncate(&p.user, 6));
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
-    out.push(
-        p.net_rx_bytes_per_sec
-            .map(format_rate)
-            .unwrap_or_else(|| "-".into()),
-    );
-    out.push(
-        p.net_tx_bytes_per_sec
-            .map(format_rate)
-            .unwrap_or_else(|| "-".into()),
-    );
-    // Command soaks up trailing width. Empty cmdline → fall back to name.
+    out.push(opt_rate(p.net_rx_bytes_per_sec));
+    out.push(opt_rate(p.net_tx_bytes_per_sec));
+    out.push(opt_rate(p.disk_read_bytes_per_sec));
+    out.push(opt_rate(p.disk_write_bytes_per_sec));
     let cmd = if p.cmdline.is_empty() {
         p.name.clone()
     } else {
@@ -247,6 +239,14 @@ fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
     };
     out.push(cmd);
     out
+}
+
+fn opt_rate(v: Option<f64>) -> String {
+    match v {
+        Some(r) if r > 0.5 => format_rate(r),
+        Some(_) => "0".into(),
+        None => "-".into(),
+    }
 }
 
 fn render_row<F>(buf: &mut Buffer, x0: u16, y: u16, total_width: u16, cols: &[ColSpec], mut cell_fn: F)
@@ -369,6 +369,8 @@ mod tests {
             threads: 4,
             net_rx_bytes_per_sec: None,
             net_tx_bytes_per_sec: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
         }
     }
 

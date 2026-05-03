@@ -47,6 +47,8 @@ pub struct App {
 
     /// Aggregate CPU utilization history for the BrailleGraph (0.0..=1.0).
     pub cpu_history: VecDeque<f64>,
+    /// Memory used-fraction history for the small mem time-series graph.
+    pub mem_history: VecDeque<f64>,
     pub latest_cpu: Option<CpuSample>,
     pub latest_mem: Option<MemorySample>,
     pub latest_processes: Option<ProcessSample>,
@@ -86,6 +88,7 @@ impl App {
             started_at: Instant::now(),
             tick_ms,
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_CAP),
+            mem_history: VecDeque::with_capacity(HISTORY_CAP),
             latest_cpu: None,
             latest_mem: None,
             latest_processes: None,
@@ -111,7 +114,16 @@ impl App {
                 self.cpu_history.push_back(s.aggregate_utilization as f64);
                 self.latest_cpu = Some(s);
             }
-            MetricEvent::Memory(s) => self.latest_mem = Some(s),
+            MetricEvent::Memory(s) => {
+                if s.total_bytes > 0 {
+                    let used_frac = s.used_bytes as f64 / s.total_bytes as f64;
+                    if self.mem_history.len() == HISTORY_CAP {
+                        self.mem_history.pop_front();
+                    }
+                    self.mem_history.push_back(used_frac.clamp(0.0, 1.0));
+                }
+                self.latest_mem = Some(s);
+            }
             MetricEvent::Process(s) => {
                 self.latest_processes = Some(s.clone());
                 let mut sorted = s.processes;
@@ -145,30 +157,36 @@ impl App {
             .collect()
     }
 
-    /// Auto-scale ceiling for the network graph: rolling-max across both
-    /// rx and tx in `net_history`, plus 20% headroom, floored at 1 KiB/s.
-    /// Recomputed every render — naturally tracks bursts upward and decays
-    /// downward as old samples scroll out of the history window.
-    pub fn net_scale_bps(&self) -> f64 {
-        let max_hist = self
-            .net_history
-            .iter()
-            .flat_map(|(rx, tx)| [*rx, *tx])
-            .fold(0.0_f64, |a, b| a.max(b));
-        (max_hist * 1.2).max(1024.0)
+    /// Number of samples used for rolling-max auto-scale. At the default
+    /// 500ms tick this is 30 seconds — short enough that a one-time burst
+    /// can't permanently squash later quieter traffic.
+    const NET_SCALE_WINDOW: usize = 60;
+
+    fn net_scale_window_iter(&self) -> impl Iterator<Item = &(f64, f64)> {
+        let n = self.net_history.len();
+        let start = n.saturating_sub(Self::NET_SCALE_WINDOW);
+        self.net_history.iter().skip(start)
     }
 
-    /// Rolling-max for download direction only. Used for the corner labels.
+    /// Auto-scale ceiling for the network graph: rolling-max across both
+    /// rx and tx in the recent window, plus 20% headroom, floored at 1 KiB/s.
+    pub fn net_scale_bps(&self) -> f64 {
+        let max_recent = self
+            .net_scale_window_iter()
+            .flat_map(|(rx, tx)| [*rx, *tx])
+            .fold(0.0_f64, |a, b| a.max(b));
+        (max_recent * 1.2).max(1024.0)
+    }
+
+    /// Rolling-max for download direction only (recent window). Used for corner labels.
     pub fn net_peak_rx(&self) -> f64 {
-        self.net_history
-            .iter()
+        self.net_scale_window_iter()
             .map(|(rx, _)| *rx)
             .fold(0.0_f64, |a, b| a.max(b))
     }
 
     pub fn net_peak_tx(&self) -> f64 {
-        self.net_history
-            .iter()
+        self.net_scale_window_iter()
             .map(|(_, tx)| *tx)
             .fold(0.0_f64, |a, b| a.max(b))
     }
@@ -196,7 +214,7 @@ impl App {
     /// wrapping around. Re-sorts the existing process list in place so the
     /// change is visible immediately rather than waiting for the next sample.
     pub fn cycle_sort(&mut self, delta: i32) {
-        let cycle = ProcessSort::cycle(self.net_tier.has_bandwidth());
+        let cycle = ProcessSort::cycle();
         let cur_idx = cycle.iter().position(|&s| s == self.proc_sort).unwrap_or(0) as i32;
         let len = cycle.len() as i32;
         let new_idx = ((cur_idx + delta) % len + len) % len;
@@ -313,6 +331,16 @@ fn sort_processes(rows: &mut [ProcessInfo], sort: ProcessSort, descending: bool)
                 .unwrap_or(0.0)
                 .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
+            ProcessSort::DiskRead => a
+                .disk_read_bytes_per_sec
+                .unwrap_or(0.0)
+                .partial_cmp(&b.disk_read_bytes_per_sec.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::DiskWrite => a
+                .disk_write_bytes_per_sec
+                .unwrap_or(0.0)
+                .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
         };
         if descending { ord.reverse() } else { ord }
     });
@@ -366,6 +394,8 @@ mod tests {
             threads: 1,
             net_rx_bytes_per_sec: None,
             net_tx_bytes_per_sec: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
         }
     }
 

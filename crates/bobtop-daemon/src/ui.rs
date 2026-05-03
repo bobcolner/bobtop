@@ -116,25 +116,53 @@ fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &CpuSample, theme: &T
 // ---------------------------------------------------------------------------
 
 fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
-    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title).with_title("²mem");
+    let used_pct = app
+        .latest_mem
+        .as_ref()
+        .filter(|m| m.total_bytes > 0)
+        .map(|m| (m.used_bytes as f64 / m.total_bytes as f64) * 100.0)
+        .unwrap_or(0.0);
+    let panel = BoxedPanel::new(app.theme.mem_box, app.theme.title)
+        .with_title(format!("²mem  {:.1}% used", used_pct));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
-
-    let Some(s) = &app.latest_mem else {
-        return;
-    };
-
-    let categories = build_memory_categories(s, &app.theme);
-    if categories.is_empty() || inner.height < 3 {
+    if inner.height < 3 {
         return;
     }
-    let row_h = (inner.height / categories.len() as u16).max(3);
+
+    // Top strip: small braille time-series of memory used %, ~3 rows tall.
+    let graph_h = inner.height.min(4).saturating_sub(1).max(2);
+    let graph_area = Rect::new(inner.x, inner.y, inner.width, graph_h);
+    let meters_y = inner.y + graph_h;
+    let meters_area = Rect::new(
+        inner.x,
+        meters_y,
+        inner.width,
+        inner.y + inner.height - meters_y,
+    );
+
+    let mut mem_graph = BrailleGraph::new(graph_area.width as usize * 2, app.theme.used)
+        .with_value_fn(|v| format!("{:>5.1}%", v * 100.0));
+    if app.tty_graphs {
+        mem_graph = mem_graph.with_style(GraphStyle::Blocks);
+    }
+    for v in app.mem_history.iter().copied() {
+        mem_graph.push(v);
+    }
+    frame.render_widget(&mem_graph, graph_area);
+
+    let Some(s) = &app.latest_mem else { return };
+    let categories = build_memory_categories(s, &app.theme);
+    if categories.is_empty() || meters_area.height < 3 {
+        return;
+    }
+    let row_h = (meters_area.height / categories.len() as u16).max(3);
     for (i, m) in categories.iter().enumerate() {
-        let y = inner.y + (i as u16) * row_h;
-        if y + 3 > inner.y + inner.height {
+        let y = meters_area.y + (i as u16) * row_h;
+        if y + 3 > meters_area.y + meters_area.height {
             break;
         }
-        let r = Rect::new(inner.x, y, inner.width, row_h);
+        let r = Rect::new(meters_area.x, y, meters_area.width, row_h);
         m.render(r, frame.buffer_mut());
     }
 }
@@ -182,8 +210,17 @@ fn build_disk_meter(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {
     } else {
         0.0
     };
+    // Bake live read/write rates into the right-aligned value text so the
+    // disk panel actually shows IO at a glance (matches btop's "▼6526" style).
+    let io_part = match (fs.read_bytes_per_sec, fs.write_bytes_per_sec) {
+        (Some(r), Some(w)) if r + w > 0.0 => {
+            format!("▼{}/s ▲{}/s  ", format_rate(r), format_rate(w))
+        }
+        _ => String::new(),
+    };
     let value = format!(
-        "{} / {}",
+        "{}{} / {}",
+        io_part,
         format_bytes(fs.used_bytes),
         format_bytes(fs.total_bytes),
     );
@@ -256,7 +293,12 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     };
     let panel = BoxedPanel::new(app.theme.net_box, app.theme.title)
         .with_title(format!("{title}{bandwidth_note}"))
-        .with_controls(format!("auto-scale {}/s", format_rate(scale)));
+        .with_controls(format!(
+            "↑peak {}/s  ↓peak {}/s  scale {}/s",
+            format_rate(app.net_peak_tx()),
+            format_rate(app.net_peak_rx()),
+            format_rate(scale),
+        ));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 12 || inner.height < 4 {
@@ -278,75 +320,47 @@ fn draw_network(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_widget(&graph, inner);
 
-    // Overlay: explicit center divider line so the eye instantly sees the
-    // upload / download split. Replaces the middle row of graph data —
-    // worth it for clarity.
-    overlay_center_divider(frame, inner, app);
-
-    // Corner labels — left side is the auto-scale ceiling, right side is the
-    // current rate. Top half = upload (theme.upload), bottom half = download.
-    overlay_corner_labels(frame, inner, app, rx_now, tx_now);
+    // Center divider with embedded current-rate labels (peak labels stay in
+    // the panel title's right-side controls slot — no graph cells obscured).
+    overlay_center_divider(frame, inner, app, rx_now, tx_now);
 }
 
-fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App) {
+/// Draw the center divider AND embed the live rate labels in it. Putting
+/// labels here (rather than at the top/bottom corners) keeps the actual
+/// graph rows free of text overlay — graph data was being clobbered before.
+fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, rx_now: f64, tx_now: f64) {
     let div_y = inner.y + inner.height / 2;
     if div_y >= inner.y + inner.height {
         return;
     }
-    let style = ratatui::style::Style::default().fg(app.theme.div_line);
+    use ratatui::style::Style;
+    let style = Style::default().fg(app.theme.div_line);
     let buf = frame.buffer_mut();
     for x in 0..inner.width {
         let cell = &mut buf[(inner.x + x, div_y)];
         cell.set_char('─');
         cell.set_style(style);
     }
-}
-
-fn overlay_corner_labels(frame: &mut Frame, inner: Rect, app: &App, rx_now: f64, tx_now: f64) {
-    use ratatui::style::Style;
-    let buf = frame.buffer_mut();
-    let upload_color = app.theme.upload.end;
-    let download_color = app.theme.download.end;
-    let dim = app.theme.inactive_fg;
-
-    // Top half = upload. Top-left = peak ↑, top-right = current ↑.
+    // Embedded labels: "↑ N/s" on the left (upload, top half), "N/s ↓" on
+    // the right (download, bottom half) — direction matches which side
+    // of the divider that flow occupies.
+    let up_label = format!(" ↑ {}/s ", format_rate(tx_now));
+    let dn_label = format!(" {}/s ↓ ", format_rate(rx_now));
     write_str_at(
         buf,
-        inner.x,
-        inner.y,
-        &format!("↑ peak {}/s", format_rate(app.net_peak_tx())),
-        Style::default().fg(dim),
+        inner.x + 1,
+        div_y,
+        &up_label,
+        Style::default().fg(app.theme.upload.end),
     );
-    let cur_up = format!("{}/s ↑", format_rate(tx_now));
-    let cur_up_len = cur_up.chars().count() as u16;
-    if cur_up_len < inner.width {
+    let dn_len = dn_label.chars().count() as u16;
+    if dn_len + 2 < inner.width {
         write_str_at(
             buf,
-            inner.right().saturating_sub(cur_up_len),
-            inner.y,
-            &cur_up,
-            Style::default().fg(upload_color),
-        );
-    }
-
-    // Bottom half = download. Bottom-left = peak ↓, bottom-right = current ↓.
-    let bot_y = inner.y + inner.height.saturating_sub(1);
-    write_str_at(
-        buf,
-        inner.x,
-        bot_y,
-        &format!("↓ peak {}/s", format_rate(app.net_peak_rx())),
-        Style::default().fg(dim),
-    );
-    let cur_dn = format!("{}/s ↓", format_rate(rx_now));
-    let cur_dn_len = cur_dn.chars().count() as u16;
-    if cur_dn_len < inner.width {
-        write_str_at(
-            buf,
-            inner.right().saturating_sub(cur_dn_len),
-            bot_y,
-            &cur_dn,
-            Style::default().fg(download_color),
+            inner.right().saturating_sub(dn_len + 1),
+            div_y,
+            &dn_label,
+            Style::default().fg(app.theme.download.end),
         );
     }
 }
