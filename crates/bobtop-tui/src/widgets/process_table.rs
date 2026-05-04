@@ -181,13 +181,16 @@ impl<'a> Widget for &ProcessTable<'a> {
             return;
         }
 
-        // 11-column layout. All sortable columns always shown; cells render
-        // `-` when data is unavailable so columns are discoverable even at
-        // Tier 1. Render-row truncates from the right when terminal is narrow,
-        // so on tight panels Command/Disk drop first, Net second.
+        // 11-column layout, btop-style ordering: identifier columns
+        // (pid, program, command, user) on the left, metric columns
+        // (threads, mem, cpu, net, disk) on the right. Command sits in
+        // the flex slot — long argv lists fill the gap before the
+        // right-anchored metrics. Cells render `-` when data is
+        // unavailable so columns stay discoverable even at Tier 1.
         let mut cols: Vec<ColSpec> = Vec::with_capacity(11);
         cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),       width: 6,  right_align: true });
         cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),      width: 12, right_align: false });
+        cols.push(ColSpec { title: "Command", sort: None,                         width: u16::MAX, right_align: false });
         cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),      width: 6,  right_align: false });
         cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads),   width: 3,  right_align: true });
         cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),       width: 6,  right_align: true });
@@ -196,7 +199,6 @@ impl<'a> Widget for &ProcessTable<'a> {
         cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),     width: 6,  right_align: true });
         cols.push(ColSpec { title: "DR/s",    sort: Some(ProcessSort::DiskRead),  width: 6,  right_align: true });
         cols.push(ColSpec { title: "DW/s",    sort: Some(ProcessSort::DiskWrite), width: 6,  right_align: true });
-        cols.push(ColSpec { title: "Command", sort: None,                         width: u16::MAX, right_align: false });
         let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
 
         // Header row. Active sort column gets bracketed + arrow indicator.
@@ -280,9 +282,12 @@ impl<'a> ProcessTable<'a> {
         // Right side: aggregate metrics formatted like the data row's
         // CPU%/MEM/RX/TX/DR/DW columns. We reuse the same column widths
         // so the values line up under their headers.
+        // Cells in the same order as the new `cols` layout above:
+        // Pid, Program, Command, User, Th, MEM, CPU%, RX, TX, DR, DW.
         let cells: Vec<String> = vec![
             String::new(),                                     // Pid (blank)
             String::new(),                                     // Program — overlaid below
+            String::new(),                                     // Command
             String::new(),                                     // User
             h.threads_total.to_string(),                       // Th — sum across group
             format_bytes(h.mem_rss_total),                     // MEM
@@ -291,7 +296,6 @@ impl<'a> ProcessTable<'a> {
             opt_rate(h.net_tx_total),
             opt_rate(h.disk_read_total),
             opt_rate(h.disk_write_total),
-            String::new(),                                     // Command
         ];
         let bg = if is_selected { Some(self.theme.selected_bg) } else { None };
         let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
@@ -407,9 +411,17 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 }
 
 fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
+    // Order MUST match the `cols` layout in render():
+    // Pid, Program, Command, User, Th, MEM, CPU%, RX, TX, DR, DW.
+    let cmd = if p.cmdline.is_empty() {
+        p.name.clone()
+    } else {
+        p.cmdline.clone()
+    };
     let mut out = Vec::with_capacity(11);
     out.push(p.pid.to_string());
     out.push(truncate(&p.name, 12));
+    out.push(cmd);
     out.push(truncate(&p.user, 6));
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
@@ -418,12 +430,6 @@ fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
     out.push(opt_rate(p.net_tx_bytes_per_sec));
     out.push(opt_rate(p.disk_read_bytes_per_sec));
     out.push(opt_rate(p.disk_write_bytes_per_sec));
-    let cmd = if p.cmdline.is_empty() {
-        p.name.clone()
-    } else {
-        p.cmdline.clone()
-    };
-    out.push(cmd);
     out
 }
 

@@ -87,9 +87,12 @@ fn compute_full(area: Rect) -> LayoutAreas {
         .constraints([Constraint::Percentage(30), Constraint::Min(1)])
         .split(area);
 
+    // 40/60 split: process table claims the right 60% so the wider btop-style
+    // column ordering (pid, program, command, user, [metrics]) has room to
+    // breathe. The mem/disks/net stack on the left fits comfortably in 40%.
     let bottom_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(rows[1]);
 
     // Left column subdivides vertically into the mem/disks row + the net row.
