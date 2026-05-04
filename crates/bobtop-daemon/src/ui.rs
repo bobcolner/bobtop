@@ -1029,20 +1029,11 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     // still the underlying source of truth, but the widget never sees
     // it directly anymore.
     let rows = app.display_rows();
-    // In ByExecutable / ByCgroup, headers don't have a meaningful single
-    // user or single command — leaving those columns blank looks broken.
-    // Hide both in those modes so the useful aggregate columns get more
-    // width. Tree mode keeps them: every row is still a real process.
-    let compact = matches!(
-        app.group_mode,
-        crate::group::GroupMode::ByExecutable | crate::group::GroupMode::ByCgroup
-    );
     let mut table = ProcessTable::new(&rows, &app.theme)
         .with_selection(Some(app.selected_proc), scroll_offset)
         .with_net_columns(app.net_tier.has_bandwidth())
         .with_direction(app.proc_sort_descending)
-        .with_tree_mode(app.group_mode == crate::group::GroupMode::ByParent)
-        .with_compact_columns(compact);
+        .with_tree_mode(app.group_mode == crate::group::GroupMode::ByParent);
     table.sort = app.proc_sort;
     frame.render_widget(&table, table_area);
 

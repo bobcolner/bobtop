@@ -124,11 +124,6 @@ pub struct ProcessTable<'a> {
     /// Program column. In flat / executable / cgroup modes children are
     /// indented with a simple two-space prefix instead.
     pub tree_mode: bool,
-    /// Hide the User and Command columns entirely (set in ByExecutable
-    /// and ByCgroup modes where headers don't have a meaningful single
-    /// user / single command and leaving them blank looked broken).
-    /// Reclaims width for the useful aggregate columns.
-    pub compact_columns: bool,
 }
 
 impl<'a> ProcessTable<'a> {
@@ -142,17 +137,11 @@ impl<'a> ProcessTable<'a> {
             sort: ProcessSort::Cpu,
             sort_descending: true,
             tree_mode: false,
-            compact_columns: false,
         }
     }
 
     pub fn with_tree_mode(mut self, on: bool) -> Self {
         self.tree_mode = on;
-        self
-    }
-
-    pub fn with_compact_columns(mut self, on: bool) -> Self {
-        self.compact_columns = on;
         self
     }
 
@@ -192,18 +181,14 @@ impl<'a> Widget for &ProcessTable<'a> {
             return;
         }
 
-        // 11-column layout (or 9 when compact, dropping User + Command).
-        // Cells render `-` when data is unavailable so columns are
-        // discoverable even at Tier 1. Render-row truncates from the
-        // right when terminal is narrow, so on tight panels Command/Disk
-        // drop first, Net second. Whichever cell builder we use below
-        // MUST emit values in the same order as `cols`.
+        // 11-column layout. All sortable columns always shown; cells render
+        // `-` when data is unavailable so columns are discoverable even at
+        // Tier 1. Render-row truncates from the right when terminal is narrow,
+        // so on tight panels Command/Disk drop first, Net second.
         let mut cols: Vec<ColSpec> = Vec::with_capacity(11);
         cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),       width: 6,  right_align: true });
         cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),      width: 12, right_align: false });
-        if !self.compact_columns {
-            cols.push(ColSpec { title: "User", sort: Some(ProcessSort::User),     width: 6,  right_align: false });
-        }
+        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),      width: 6,  right_align: false });
         cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads),   width: 3,  right_align: true });
         cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),       width: 6,  right_align: true });
         cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),       width: 5,  right_align: true });
@@ -211,9 +196,7 @@ impl<'a> Widget for &ProcessTable<'a> {
         cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),     width: 6,  right_align: true });
         cols.push(ColSpec { title: "DR/s",    sort: Some(ProcessSort::DiskRead),  width: 6,  right_align: true });
         cols.push(ColSpec { title: "DW/s",    sort: Some(ProcessSort::DiskWrite), width: 6,  right_align: true });
-        if !self.compact_columns {
-            cols.push(ColSpec { title: "Command", sort: None,                     width: u16::MAX, right_align: false });
-        }
+        cols.push(ColSpec { title: "Command", sort: None,                         width: u16::MAX, right_align: false });
         let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
 
         // Header row. Active sort column gets bracketed + arrow indicator.
@@ -297,24 +280,19 @@ impl<'a> ProcessTable<'a> {
         // Right side: aggregate metrics formatted like the data row's
         // CPU%/MEM/RX/TX/DR/DW columns. We reuse the same column widths
         // so the values line up under their headers.
-        // Cells built to match the conditional `cols` layout above.
-        // Order: Pid, Program, [User], Th, MEM, CPU%, RX, TX, DR, DW, [Command].
-        let mut cells: Vec<String> = Vec::with_capacity(cols.len());
-        cells.push(String::new());                           // Pid (blank)
-        cells.push(String::new());                           // Program — overlaid below
-        if !self.compact_columns {
-            cells.push(String::new());                       // User
-        }
-        cells.push(h.threads_total.to_string());             // Th — sum across group
-        cells.push(format_bytes(h.mem_rss_total));           // MEM
-        cells.push(format!("{:.1}", h.cpu_fraction_total * 100.0)); // CPU%
-        cells.push(opt_rate(h.net_rx_total));
-        cells.push(opt_rate(h.net_tx_total));
-        cells.push(opt_rate(h.disk_read_total));
-        cells.push(opt_rate(h.disk_write_total));
-        if !self.compact_columns {
-            cells.push(String::new());                       // Command
-        }
+        let cells: Vec<String> = vec![
+            String::new(),                                     // Pid (blank)
+            String::new(),                                     // Program — overlaid below
+            String::new(),                                     // User
+            h.threads_total.to_string(),                       // Th — sum across group
+            format_bytes(h.mem_rss_total),                     // MEM
+            format!("{:.1}", h.cpu_fraction_total * 100.0),   // CPU%
+            opt_rate(h.net_rx_total),
+            opt_rate(h.net_tx_total),
+            opt_rate(h.disk_read_total),
+            opt_rate(h.disk_write_total),
+            String::new(),                                     // Command
+        ];
         let bg = if is_selected { Some(self.theme.selected_bg) } else { None };
         let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
         let style = match bg {
@@ -370,10 +348,9 @@ impl<'a> ProcessTable<'a> {
             "  ".repeat(meta.depth as usize)
         };
 
-        let mut cells = build_row_cells(p, self.compact_columns);
+        let mut cells = build_row_cells(p, true);
         // Replace the Program cell with prefix + name (truncated to fit
-        // the column allowance after the prefix). Program is always at
-        // index 1 (immediately after Pid) regardless of compact mode.
+        // the column allowance after the prefix).
         let prog_avail = (cols[1].width as usize).saturating_sub(prefix.chars().count());
         cells[1] = format!("{prefix}{}", truncate(&p.name, prog_avail.max(1)));
 
@@ -429,15 +406,11 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-fn build_row_cells(p: &ProcessInfo, compact: bool) -> Vec<String> {
-    // Order MUST match the conditional `cols` layout in render():
-    // Pid, Program, [User], Th, MEM, CPU%, RX, TX, DR, DW, [Command].
+fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
     let mut out = Vec::with_capacity(11);
     out.push(p.pid.to_string());
     out.push(truncate(&p.name, 12));
-    if !compact {
-        out.push(truncate(&p.user, 6));
-    }
+    out.push(truncate(&p.user, 6));
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
@@ -445,14 +418,12 @@ fn build_row_cells(p: &ProcessInfo, compact: bool) -> Vec<String> {
     out.push(opt_rate(p.net_tx_bytes_per_sec));
     out.push(opt_rate(p.disk_read_bytes_per_sec));
     out.push(opt_rate(p.disk_write_bytes_per_sec));
-    if !compact {
-        let cmd = if p.cmdline.is_empty() {
-            p.name.clone()
-        } else {
-            p.cmdline.clone()
-        };
-        out.push(cmd);
-    }
+    let cmd = if p.cmdline.is_empty() {
+        p.name.clone()
+    } else {
+        p.cmdline.clone()
+    };
+    out.push(cmd);
     out
 }
 
@@ -666,22 +637,6 @@ mod tests {
         assert!(header.contains("TX/s"));
         let row1: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect::<Vec<_>>().join("");
         assert!(row1.contains("2.0K"), "rx missing: {row1}");
-    }
-
-    #[test]
-    fn compact_columns_drops_user_and_command_headers() {
-        let theme = Theme::fallback();
-        let rows = flat_rows(vec![proc(1, "init", 0.01, 5)]);
-        let table = ProcessTable::new(&rows, &theme).with_compact_columns(true);
-        let area = Rect::new(0, 0, 80, 4);
-        let mut buf = Buffer::empty(area);
-        (&table).render(area, &mut buf);
-        let row0: String =
-            (0..area.width).map(|x| buf[(x, 0)].symbol()).collect::<Vec<_>>().join("");
-        assert!(!row0.contains("User"), "User col should be hidden when compact: {row0}");
-        assert!(!row0.contains("Command"), "Command col should be hidden when compact: {row0}");
-        assert!(row0.contains("Pid"), "Pid still present");
-        assert!(row0.contains("MEM"), "MEM still present");
     }
 
     #[test]
