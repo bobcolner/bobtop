@@ -4,7 +4,8 @@
 use bobtop_core::sample::{CpuSample, FilesystemSample, MemorySample};
 use bobtop_core::Box as BoxKind;
 use bobtop_tui::widgets::{
-    BoxedPanel, BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, Trace,
+    BoxedPanel, BrailleGraph, DualMode, GraphStyle, Meter, MiniMeter, ProcessTable, TableLayout,
+    Trace,
 };
 use bobtop_tui::{compute_layout, Theme};
 use ratatui::layout::Rect;
@@ -1029,11 +1030,25 @@ fn draw_processes(frame: &mut Frame, area: Rect, app: &App) {
     // still the underlying source of truth, but the widget never sees
     // it directly anymore.
     let rows = app.display_rows();
+    // Pick a column-width preset per group mode:
+    //   Flat → Command flexes (full argv visibility)
+    //   ByExecutable / ByCgroup → Program flexes (long group keys),
+    //                              Command shrinks but stays visible
+    //                              for expanded children
+    //   ByParent (tree) → Program wider (tree glyphs + indent),
+    //                     Command flexes for argv after the tree prefix
+    let layout = match app.group_mode {
+        crate::group::GroupMode::Flat => TableLayout::Flat,
+        crate::group::GroupMode::ByExecutable | crate::group::GroupMode::ByCgroup => {
+            TableLayout::Grouped
+        }
+        crate::group::GroupMode::ByParent => TableLayout::Tree,
+    };
     let mut table = ProcessTable::new(&rows, &app.theme)
         .with_selection(Some(app.selected_proc), scroll_offset)
         .with_net_columns(app.net_tier.has_bandwidth())
         .with_direction(app.proc_sort_descending)
-        .with_tree_mode(app.group_mode == crate::group::GroupMode::ByParent);
+        .with_layout(layout);
     table.sort = app.proc_sort;
     frame.render_widget(&table, table_area);
 

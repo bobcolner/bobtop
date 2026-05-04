@@ -17,4 +17,6 @@ pub use boxed::{BoxedPanel, CornerStyle};
 pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_FILL};
 pub use meter::Meter;
 pub use mini_meter::MiniMeter;
-pub use process_table::{DisplayRow, GroupHeader, ProcessRowMeta, ProcessSort, ProcessTable};
+pub use process_table::{
+    DisplayRow, GroupHeader, ProcessRowMeta, ProcessSort, ProcessTable, TableLayout,
+};
