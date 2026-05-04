@@ -135,25 +135,52 @@ pub enum TableLayout {
 
 impl TableLayout {
     /// True when this layout draws tree branch glyphs in the Program
-    /// column. (Currently only Tree, but kept as a method so callers
-    /// don't have to spell out the variant.)
+    /// column.
     pub fn draws_tree_glyphs(self) -> bool {
         matches!(self, TableLayout::Tree)
+    }
+
+    /// Whether the Pid column is rendered. Dropped in Grouped because
+    /// a group header has no single pid; child rows in expanded groups
+    /// would benefit from one but the user's call: a clustering view
+    /// is for clustering, not pid spotting.
+    pub fn includes_pid(self) -> bool {
+        matches!(self, TableLayout::Flat | TableLayout::Tree)
+    }
+
+    /// Whether the Command column is rendered. Dropped in Grouped
+    /// (Program already shows the executable name aggregating the
+    /// group) and in Tree (Program with branch glyphs is enough; saves
+    /// width for deep indentation).
+    pub fn includes_command(self) -> bool {
+        matches!(self, TableLayout::Flat)
+    }
+
+    /// Whether the User column is rendered. Dropped in Grouped (no
+    /// single user across a group). Kept in Tree for per-process
+    /// ownership context.
+    pub fn includes_user(self) -> bool {
+        matches!(self, TableLayout::Flat | TableLayout::Tree)
     }
 
     fn program_width(self) -> u16 {
         match self {
             TableLayout::Flat => 12,
-            TableLayout::Grouped => u16::MAX, // flex
-            TableLayout::Tree => 24,
+            // Grouped: Program is the group label ("▼ firefox.service (47)")
+            // and Command is gone — Program absorbs the leftover space.
+            TableLayout::Grouped => u16::MAX,
+            // Tree: Program holds the indent + branch glyphs + name and
+            // Command is gone — flex so deep trees get room.
+            TableLayout::Tree => u16::MAX,
         }
     }
 
     fn command_width(self) -> u16 {
         match self {
-            TableLayout::Flat => u16::MAX, // flex
-            TableLayout::Grouped => 18,
-            TableLayout::Tree => u16::MAX, // flex
+            TableLayout::Flat => u16::MAX, // flex — full argv visibility
+            // Unused for Grouped/Tree (Command not rendered) but the
+            // method must return something. Keep at 0 as a sentinel.
+            _ => 0,
         }
     }
 }
@@ -232,18 +259,11 @@ impl<'a> Widget for &ProcessTable<'a> {
         // the flex slot — long argv lists fill the gap before the
         // right-anchored metrics. Cells render `-` when data is
         // unavailable so columns stay discoverable even at Tier 1.
-        let mut cols: Vec<ColSpec> = Vec::with_capacity(11);
-        cols.push(ColSpec { title: "Pid",     sort: Some(ProcessSort::Pid),       width: 6,                        right_align: true });
-        cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name),      width: self.layout.program_width(), right_align: false });
-        cols.push(ColSpec { title: "Command", sort: None,                         width: self.layout.command_width(), right_align: false });
-        cols.push(ColSpec { title: "User",    sort: Some(ProcessSort::User),      width: 6,                        right_align: false });
-        cols.push(ColSpec { title: "Th",      sort: Some(ProcessSort::Threads),   width: 3,                        right_align: true });
-        cols.push(ColSpec { title: "MEM",     sort: Some(ProcessSort::Mem),       width: 6,                        right_align: true });
-        cols.push(ColSpec { title: "CPU%",    sort: Some(ProcessSort::Cpu),       width: 5,                        right_align: true });
-        cols.push(ColSpec { title: "RX/s",    sort: Some(ProcessSort::NetRx),     width: 6,                        right_align: true });
-        cols.push(ColSpec { title: "TX/s",    sort: Some(ProcessSort::NetTx),     width: 6,                        right_align: true });
-        cols.push(ColSpec { title: "DR/s",    sort: Some(ProcessSort::DiskRead),  width: 6,                        right_align: true });
-        cols.push(ColSpec { title: "DW/s",    sort: Some(ProcessSort::DiskWrite), width: 6,                        right_align: true });
+        // Column set varies by layout (the includes_* methods on
+        // TableLayout dictate which appear). Cells emitted per row by
+        // build_row_cells / header-row cells MUST follow the same
+        // include order — they share the include predicates.
+        let cols: Vec<ColSpec> = build_cols(self.layout);
         let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
 
         // Header row. Active sort column gets bracketed + arrow indicator.
@@ -324,24 +344,28 @@ impl<'a> ProcessTable<'a> {
     ) {
         let glyph = if h.expanded { '▼' } else { '▶' };
         let label = format!("{glyph} {}", h.label);
-        // Right side: aggregate metrics formatted like the data row's
-        // CPU%/MEM/RX/TX/DR/DW columns. We reuse the same column widths
-        // so the values line up under their headers.
-        // Cells in the same order as the new `cols` layout above:
-        // Pid, Program, Command, User, Th, MEM, CPU%, RX, TX, DR, DW.
-        let cells: Vec<String> = vec![
-            String::new(),                                     // Pid (blank)
-            String::new(),                                     // Program — overlaid below
-            String::new(),                                     // Command
-            String::new(),                                     // User
-            h.threads_total.to_string(),                       // Th — sum across group
-            format_bytes(h.mem_rss_total),                     // MEM
-            format!("{:.1}", h.cpu_fraction_total * 100.0),   // CPU%
-            opt_rate(h.net_rx_total),
-            opt_rate(h.net_tx_total),
-            opt_rate(h.disk_read_total),
-            opt_rate(h.disk_write_total),
-        ];
+        // Build cells matching the active layout's column set. Identifier
+        // columns are blank for headers (no aggregate); metrics columns
+        // carry the group totals.
+        let mut cells: Vec<String> = Vec::with_capacity(cols.len());
+        if self.layout.includes_pid() {
+            cells.push(String::new());                       // Pid (blank for headers)
+        }
+        cells.push(String::new());                           // Program — overlaid below
+        if self.layout.includes_command() {
+            cells.push(String::new());                       // Command (blank)
+        }
+        if self.layout.includes_user() {
+            cells.push(String::new());                       // User (blank)
+        }
+        cells.push(h.threads_total.to_string());             // Th — sum across group
+        cells.push(format_bytes(h.mem_rss_total));           // MEM
+        cells.push(format!("{:.1}", h.cpu_fraction_total * 100.0)); // CPU%
+        cells.push(opt_rate(h.net_rx_total));
+        cells.push(opt_rate(h.net_tx_total));
+        cells.push(opt_rate(h.disk_read_total));
+        cells.push(opt_rate(h.disk_write_total));
+
         let bg = if is_selected { Some(self.theme.selected_bg) } else { None };
         let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
         let style = match bg {
@@ -352,14 +376,21 @@ impl<'a> ProcessTable<'a> {
             let s = cells[idx].clone();
             (s, style, cols[idx].right_align)
         });
-        // Overwrite the Program column with the chevron + label. Use
-        // resolved widths so flex (u16::MAX) renders as the actual
-        // available cell width, not 65535.
-        let pid_w = col_actual_width(cols, area.width, 0);
-        let prog_w = col_actual_width(cols, area.width, 1);
+        // Overwrite the Program column with the chevron + label. Find
+        // Program dynamically because Pid may be absent in Grouped
+        // layout — Program is at index 0 then. Sum widths of preceding
+        // columns + their gutters to get Program's x offset.
+        let prog_idx = cols
+            .iter()
+            .position(|c| c.title == "Program")
+            .expect("Program column always present");
+        let prog_x_offset: u16 = (0..prog_idx)
+            .map(|i| col_actual_width(cols, area.width, i).saturating_add(1))
+            .sum();
+        let prog_w = col_actual_width(cols, area.width, prog_idx);
         write_str(
             buf,
-            area.x + pid_w + 1,
+            area.x + prog_x_offset,
             y,
             &label,
             prog_w as usize,
@@ -400,12 +431,18 @@ impl<'a> ProcessTable<'a> {
             "  ".repeat(meta.depth as usize)
         };
 
-        let mut cells = build_row_cells(p, true);
-        // Replace the Program cell with prefix + name. Use resolved width
-        // so flex Program (u16::MAX) doesn't truncate to 65535 chars.
-        let prog_w = col_actual_width(cols, area.width, 1);
+        let mut cells = build_row_cells(p, self.layout);
+        // Replace the Program cell with prefix + name. Program's index
+        // depends on layout (Pid is dropped in Grouped) — look it up.
+        // Use resolved width so flex Program (u16::MAX) doesn't truncate
+        // to 65535 chars.
+        let prog_idx = cols
+            .iter()
+            .position(|c| c.title == "Program")
+            .expect("Program column always present");
+        let prog_w = col_actual_width(cols, area.width, prog_idx);
         let prog_avail = (prog_w as usize).saturating_sub(prefix.chars().count());
-        cells[1] = format!("{prefix}{}", truncate(&p.name, prog_avail.max(1)));
+        cells[prog_idx] = format!("{prefix}{}", truncate(&p.name, prog_avail.max(1)));
 
         render_row(buf, area.x, y, area.width, cols, |idx| {
             let s = cells[idx].clone();
@@ -459,19 +496,49 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-fn build_row_cells(p: &ProcessInfo, _show_net: bool) -> Vec<String> {
-    // Order MUST match the `cols` layout in render():
-    // Pid, Program, Command, User, Th, MEM, CPU%, RX, TX, DR, DW.
-    let cmd = if p.cmdline.is_empty() {
-        p.name.clone()
-    } else {
-        p.cmdline.clone()
-    };
+/// Build the column descriptors for the given layout. Order:
+///   [Pid] · Program · [Command] · [User] · Th · MEM · CPU% · RX · TX · DR · DW
+/// Bracketed columns are filtered by layout.includes_* predicates.
+fn build_cols(layout: TableLayout) -> Vec<ColSpec> {
+    let mut cols = Vec::with_capacity(11);
+    if layout.includes_pid() {
+        cols.push(ColSpec { title: "Pid", sort: Some(ProcessSort::Pid), width: 6, right_align: true });
+    }
+    cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name), width: layout.program_width(), right_align: false });
+    if layout.includes_command() {
+        cols.push(ColSpec { title: "Command", sort: None, width: layout.command_width(), right_align: false });
+    }
+    if layout.includes_user() {
+        cols.push(ColSpec { title: "User", sort: Some(ProcessSort::User), width: 6, right_align: false });
+    }
+    cols.push(ColSpec { title: "Th",   sort: Some(ProcessSort::Threads),   width: 3, right_align: true });
+    cols.push(ColSpec { title: "MEM",  sort: Some(ProcessSort::Mem),       width: 6, right_align: true });
+    cols.push(ColSpec { title: "CPU%", sort: Some(ProcessSort::Cpu),       width: 5, right_align: true });
+    cols.push(ColSpec { title: "RX/s", sort: Some(ProcessSort::NetRx),     width: 6, right_align: true });
+    cols.push(ColSpec { title: "TX/s", sort: Some(ProcessSort::NetTx),     width: 6, right_align: true });
+    cols.push(ColSpec { title: "DR/s", sort: Some(ProcessSort::DiskRead),  width: 6, right_align: true });
+    cols.push(ColSpec { title: "DW/s", sort: Some(ProcessSort::DiskWrite), width: 6, right_align: true });
+    cols
+}
+
+fn build_row_cells(p: &ProcessInfo, layout: TableLayout) -> Vec<String> {
+    // Order MUST match build_cols(layout). Same conditional includes.
     let mut out = Vec::with_capacity(11);
-    out.push(p.pid.to_string());
+    if layout.includes_pid() {
+        out.push(p.pid.to_string());
+    }
     out.push(truncate(&p.name, 12));
-    out.push(cmd);
-    out.push(truncate(&p.user, 6));
+    if layout.includes_command() {
+        let cmd = if p.cmdline.is_empty() {
+            p.name.clone()
+        } else {
+            p.cmdline.clone()
+        };
+        out.push(cmd);
+    }
+    if layout.includes_user() {
+        out.push(truncate(&p.user, 6));
+    }
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
@@ -717,47 +784,36 @@ mod tests {
     }
 
     #[test]
-    fn table_layout_swaps_flex_column() {
-        // Build the same cols-vec layout each layout would emit, then
-        // ask col_actual_width which one absorbs the leftover space.
-        // Total width 100; 10 fixed cols with a Pid + 9 metric-ish
-        // widths summed roughly = ~50; the flex column should take
-        // the rest.
-        fn cols_for(layout: TableLayout) -> Vec<ColSpec> {
-            let mut c = vec![];
-            c.push(ColSpec { title: "Pid", sort: None, width: 6, right_align: true });
-            c.push(ColSpec { title: "Program", sort: None, width: layout.program_width(), right_align: false });
-            c.push(ColSpec { title: "Command", sort: None, width: layout.command_width(), right_align: false });
-            c.push(ColSpec { title: "User", sort: None, width: 6, right_align: false });
-            c.push(ColSpec { title: "Th", sort: None, width: 3, right_align: true });
-            c.push(ColSpec { title: "MEM", sort: None, width: 6, right_align: true });
-            c.push(ColSpec { title: "CPU%", sort: None, width: 5, right_align: true });
-            c.push(ColSpec { title: "RX/s", sort: None, width: 6, right_align: true });
-            c.push(ColSpec { title: "TX/s", sort: None, width: 6, right_align: true });
-            c.push(ColSpec { title: "DR/s", sort: None, width: 6, right_align: true });
-            c.push(ColSpec { title: "DW/s", sort: None, width: 6, right_align: true });
-            c
-        }
-
+    fn table_layout_drops_columns_per_mode() {
         let total = 120u16;
 
-        // Flat: Command (idx 2) flexes; Program (idx 1) is fixed at 12.
-        let flat = cols_for(TableLayout::Flat);
-        assert_eq!(col_actual_width(&flat, total, 1), 12, "Flat Program is fixed 12");
-        let cmd = col_actual_width(&flat, total, 2);
-        assert!(cmd > 20, "Flat Command should flex large, got {cmd}");
+        // Flat: all 11 columns. Program fixed 12, Command flex.
+        let flat = build_cols(TableLayout::Flat);
+        assert_eq!(flat.len(), 11);
+        let prog = flat.iter().position(|c| c.title == "Program").unwrap();
+        let cmd = flat.iter().position(|c| c.title == "Command").unwrap();
+        assert_eq!(col_actual_width(&flat, total, prog), 12);
+        assert!(col_actual_width(&flat, total, cmd) > 20, "Flat Command should flex");
+        assert!(flat.iter().any(|c| c.title == "Pid"));
+        assert!(flat.iter().any(|c| c.title == "User"));
 
-        // Grouped: Program flexes; Command is fixed at 18.
-        let grouped = cols_for(TableLayout::Grouped);
-        assert_eq!(col_actual_width(&grouped, total, 2), 18, "Grouped Command is fixed 18");
-        let prog = col_actual_width(&grouped, total, 1);
-        assert!(prog > 20, "Grouped Program should flex large, got {prog}");
+        // Grouped: Pid + Command + User dropped. 8 columns. Program flexes.
+        let grouped = build_cols(TableLayout::Grouped);
+        assert_eq!(grouped.len(), 8);
+        assert!(!grouped.iter().any(|c| c.title == "Pid"));
+        assert!(!grouped.iter().any(|c| c.title == "Command"));
+        assert!(!grouped.iter().any(|c| c.title == "User"));
+        let prog = grouped.iter().position(|c| c.title == "Program").unwrap();
+        assert!(col_actual_width(&grouped, total, prog) > 20, "Grouped Program should flex");
 
-        // Tree: Program is fixed at 24; Command flexes.
-        let tree = cols_for(TableLayout::Tree);
-        assert_eq!(col_actual_width(&tree, total, 1), 24, "Tree Program is fixed 24");
-        let cmd = col_actual_width(&tree, total, 2);
-        assert!(cmd > 10, "Tree Command should flex, got {cmd}");
+        // Tree: Command dropped. 10 columns. Program flexes.
+        let tree = build_cols(TableLayout::Tree);
+        assert_eq!(tree.len(), 10);
+        assert!(!tree.iter().any(|c| c.title == "Command"));
+        assert!(tree.iter().any(|c| c.title == "Pid"));
+        assert!(tree.iter().any(|c| c.title == "User"));
+        let prog = tree.iter().position(|c| c.title == "Program").unwrap();
+        assert!(col_actual_width(&tree, total, prog) > 20, "Tree Program should flex");
     }
 
     #[test]
