@@ -6,6 +6,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod group;
+pub mod options_editor;
 pub mod tui;
 pub mod ui;
 pub mod state;

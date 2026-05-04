@@ -21,6 +21,7 @@ use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::{MAX_TICK_MS, MIN_TICK_MS, TICK_STEP_MS};
+use crate::options_editor::{OptionsEditor, OptionsOutcome};
 use crate::state::UiState;
 
 /// Maximum historical samples kept for graphing. 600 = 10 min at 1 Hz.
@@ -52,99 +53,6 @@ pub enum ControlFlow {
 /// field is currently being edited. The fields here intentionally mirror
 /// the on-disk Config — when the user hits Enter we Serialize this back
 /// out via `Config::save`. On Esc we throw the snapshot away.
-#[derive(Debug, Clone)]
-pub struct OptionsState {
-    pub cursor: usize,
-    pub theme: String,
-    pub tick_ms: u64,
-    pub layout: crate::cli::LayoutChoice,
-    pub corners: crate::cli::CornerChoice,
-    pub no_ebpf: bool,
-    pub no_pcap: bool,
-    pub tty: bool,
-    pub show_virtual_net: bool,
-    /// Mirror of btop's `theme_background`. False = panel bg → terminal
-    /// default (translucent terminal / wallpaper shows through).
-    pub theme_background: bool,
-    /// Mirror of btop's `truecolor`. False = downsample RGB → 256 cube.
-    pub truecolor: bool,
-    /// Snapshot of the available theme names so cycling is just an index
-    /// step rather than refetching the registry on every keystroke.
-    pub themes: Vec<String>,
-    /// Theme name that was active when the overlay opened. Used to revert
-    /// the live-applied theme when the user cancels with Esc.
-    pub original_theme: String,
-}
-
-impl OptionsState {
-    pub const FIELD_COUNT: usize = 10;
-
-    /// Cycle the field at `self.cursor` by `delta` (-1 = previous,
-    /// +1 = next). For booleans, any non-zero delta toggles. For
-    /// numerics (tick_ms), step is ±100 ms clamped to the global
-    /// MIN/MAX bounds.
-    pub fn cycle_field(&mut self, delta: i32) {
-        use crate::cli::{CornerChoice, LayoutChoice};
-        match self.cursor {
-            0 => {
-                // theme
-                if self.themes.is_empty() {
-                    return;
-                }
-                let cur = self
-                    .themes
-                    .iter()
-                    .position(|n| n == &self.theme)
-                    .unwrap_or(0) as i32;
-                let n = self.themes.len() as i32;
-                let next = ((cur + delta) % n + n) % n;
-                self.theme = self.themes[next as usize].clone();
-            }
-            1 => {
-                // tick_ms ±100 within bounds
-                let step: i64 = 100 * delta as i64;
-                let new = (self.tick_ms as i64 + step)
-                    .clamp(crate::cli::MIN_TICK_MS as i64, crate::cli::MAX_TICK_MS as i64);
-                self.tick_ms = new as u64;
-            }
-            2 => {
-                self.layout = match self.layout {
-                    LayoutChoice::Full => LayoutChoice::Minimal,
-                    LayoutChoice::Minimal => LayoutChoice::Full,
-                };
-            }
-            3 => {
-                self.corners = match self.corners {
-                    CornerChoice::Rounded => CornerChoice::Square,
-                    CornerChoice::Square => CornerChoice::Rounded,
-                };
-            }
-            4 => self.no_ebpf = !self.no_ebpf,
-            5 => self.no_pcap = !self.no_pcap,
-            6 => self.tty = !self.tty,
-            7 => self.show_virtual_net = !self.show_virtual_net,
-            8 => self.theme_background = !self.theme_background,
-            9 => self.truecolor = !self.truecolor,
-            _ => {}
-        }
-    }
-
-    pub fn to_config(&self) -> crate::config::Config {
-        crate::config::Config {
-            theme: Some(self.theme.clone()),
-            tick_ms: Some(self.tick_ms),
-            layout: Some(self.layout),
-            corners: Some(self.corners),
-            no_ebpf: Some(self.no_ebpf),
-            no_pcap: Some(self.no_pcap),
-            tty: Some(self.tty),
-            show_virtual_net: Some(self.show_virtual_net),
-            theme_background: Some(self.theme_background),
-            truecolor: Some(self.truecolor),
-        }
-    }
-}
-
 /// Snapshot of /proc data shown in the detail modal (B3d). Captured
 /// once when the user presses `Enter`; no live refresh — the modal is
 /// for inspection, not monitoring. Fields that fail to read (perm denied,
@@ -794,32 +702,8 @@ impl App {
     /// settings. Theme list is queried from the bobtop-tui builtin
     /// registry once at open time.
     pub fn open_options(&mut self) {
-        let themes: Vec<String> =
-            bobtop_tui::builtin_names().map(|s| s.to_string()).collect();
-        let current_theme = self.theme.name.clone();
-        self.ui.options = Some(OptionsState {
-            cursor: 0,
-            theme: current_theme.clone(),
-            tick_ms: self.tick_ms(),
-            layout: match self.layout_preset {
-                LayoutPreset::Full => crate::cli::LayoutChoice::Full,
-                LayoutPreset::Minimal => crate::cli::LayoutChoice::Minimal,
-            },
-            corners: match self.corner_style {
-                CornerStyle::Rounded => crate::cli::CornerChoice::Rounded,
-                CornerStyle::Square => crate::cli::CornerChoice::Square,
-            },
-            // Sticky bools — we don't have these on App today, default to
-            // false. After first save they'll round-trip correctly.
-            no_ebpf: false,
-            no_pcap: false,
-            tty: self.tty_graphs,
-            show_virtual_net: self.show_virtual_net,
-            theme_background: self.theme_background,
-            truecolor: self.truecolor,
-            themes,
-            original_theme: current_theme,
-        });
+        let editor = OptionsEditor::from_app(self);
+        self.ui.options = Some(editor);
     }
 
     /// Re-apply `theme_background` and `truecolor` to `self.theme`. Should
@@ -835,62 +719,6 @@ impl App {
         }
         if !self.truecolor {
             bobtop_tui::downsample_theme_to_256(&mut self.theme);
-        }
-    }
-
-    /// Apply the staged theme to the live App immediately, so the user
-    /// sees the colors change as they cycle through themes in the
-    /// options overlay. Other staged options stay snapshot-only — they
-    /// only take effect on Enter (save_options).
-    pub fn preview_theme(&mut self) {
-        let Some(opts) = &self.ui.options else { return };
-        // Use load_theme so the search path + parse + name-tracking are
-        // handled in one place. Earlier code tried to call find_source +
-        // from_source manually and got the tuple destructure backwards
-        // (find_source returns (source, origin), not (name, source)),
-        // which assigned the raw source text to Theme.name.
-        self.theme = bobtop_tui::load_theme(&opts.theme);
-        // Live-preview also picks up the staged color options so the user
-        // sees the truecolor / bg-suppression effects while cycling.
-        self.theme_background = opts.theme_background;
-        self.truecolor = opts.truecolor;
-        self.apply_color_options();
-    }
-
-    /// Discard a pending options edit and restore the originally-active
-    /// theme. Called when the user dismisses the overlay with Esc.
-    pub fn cancel_options(&mut self) {
-        let Some(opts) = self.ui.options.take() else { return };
-        self.theme = bobtop_tui::load_theme(&opts.original_theme);
-        self.apply_color_options();
-    }
-
-    /// Apply the staged options to the live App and persist to disk. The
-    /// returned message is for the header toast — Ok = "saved to PATH"
-    /// or "save failed: …".
-    pub fn save_options(&mut self) -> String {
-        let Some(opts) = self.ui.options.take() else {
-            return "no options to save".into();
-        };
-        // Live-apply the changes that mutate render state immediately so
-        // the user sees the effect before we even disk-write. Theme,
-        // corners, tick_ms, layout, tty_graphs, show_virtual_net.
-        self.theme = bobtop_tui::load_theme(&opts.theme);
-        self.theme_background = opts.theme_background;
-        self.truecolor = opts.truecolor;
-        self.apply_color_options();
-        self.corner_style = opts.corners.into();
-        self.tick_ms.store(opts.tick_ms, Ordering::Relaxed);
-        self.set_layout(match opts.layout {
-            crate::cli::LayoutChoice::Full => LayoutPreset::Full,
-            crate::cli::LayoutChoice::Minimal => LayoutPreset::Minimal,
-        });
-        self.tty_graphs = opts.tty;
-        self.show_virtual_net = opts.show_virtual_net;
-        // Then persist.
-        match opts.to_config().save() {
-            Ok(p) => format!("saved {}", p.display()),
-            Err(e) => format!("save failed: {e}"),
         }
     }
 
@@ -1022,64 +850,24 @@ impl App {
         // the value at the cursor, Enter saves to disk + applies live,
         // Esc closes without saving. Routed before everything else so
         // the rest of the keybinds can't fire while the user is editing.
-        if self.ui.options.is_some() {
-            match k.code {
-                KeyCode::Esc => {
-                    // Revert any live previews (currently just theme).
-                    self.cancel_options();
-                    return ControlFlow::Continue;
+        if let Some(editor) = self.ui.options.take() {
+            match editor.handle_key(k) {
+                OptionsOutcome::KeepOpen(editor) => {
+                    self.ui.options = Some(editor);
                 }
-                KeyCode::Enter => {
-                    let msg = self.save_options();
-                    self.ui.last_options_msg = Some(msg);
-                    return ControlFlow::Continue;
+                OptionsOutcome::Preview { editor, preview } => {
+                    preview.apply_to(self);
+                    self.ui.options = Some(editor);
                 }
-                KeyCode::Up => {
-                    if let Some(o) = self.ui.options.as_mut() {
-                        if o.cursor > 0 {
-                            o.cursor -= 1;
-                        }
-                    }
-                    return ControlFlow::Continue;
+                OptionsOutcome::Cancel { preview } => {
+                    preview.apply_to(self);
                 }
-                KeyCode::Down => {
-                    if let Some(o) = self.ui.options.as_mut() {
-                        if o.cursor + 1 < OptionsState::FIELD_COUNT {
-                            o.cursor += 1;
-                        }
-                    }
-                    return ControlFlow::Continue;
+                OptionsOutcome::Save { commit, message } => {
+                    commit.apply_to(self);
+                    self.ui.last_options_msg = Some(message);
                 }
-                KeyCode::Left => {
-                    let on_theme = self
-                        .ui.options
-                        .as_mut()
-                        .map(|o| {
-                            o.cycle_field(-1);
-                            o.cursor == 0
-                        })
-                        .unwrap_or(false);
-                    if on_theme {
-                        self.preview_theme();
-                    }
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Right | KeyCode::Char(' ') => {
-                    let on_theme = self
-                        .ui.options
-                        .as_mut()
-                        .map(|o| {
-                            o.cycle_field(1);
-                            o.cursor == 0
-                        })
-                        .unwrap_or(false);
-                    if on_theme {
-                        self.preview_theme();
-                    }
-                    return ControlFlow::Continue;
-                }
-                _ => return ControlFlow::Continue,
             }
+            return ControlFlow::Continue;
         }
 
         // Detail modal (B3d) — Esc closes. While open the rest of the
@@ -1580,7 +1368,7 @@ mod tests {
         let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_input(press('O'));
         assert!(app.ui.options.is_some());
-        assert_eq!(app.ui.options.as_ref().unwrap().cursor, 0);
+        assert_eq!(app.ui.options.as_ref().unwrap().cursor(), 0);
 
         // Press → to advance theme. Both the staged opts.theme and the
         // live app.theme must change in lockstep.
@@ -1591,7 +1379,7 @@ mod tests {
             after_cycle, original,
             "live theme should change when cycling theme field"
         );
-        assert_eq!(app.ui.options.as_ref().unwrap().theme, after_cycle);
+        assert_eq!(app.ui.options.as_ref().unwrap().theme_name(), after_cycle);
 
         // Esc closes the modal and reverts the theme.
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

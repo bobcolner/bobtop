@@ -2,10 +2,12 @@
 //! the TUI loop on every frame.
 
 use bobtop_core::Box as BoxKind;
-use bobtop_tui::{compute_layout, format_bytes};
-use ratatui::layout::Rect;
+use bobtop_tui::compute_layout;
 use ratatui::style::Style;
 use ratatui::Frame;
+
+#[cfg(test)]
+use ratatui::layout::Rect;
 
 use crate::app::App;
 
@@ -97,12 +99,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+#[cfg(test)]
 fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &bobtop_core::sample::CpuSample, app: &App) {
     cpu::draw_core_meters(frame, area, sample, app);
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bobtop_tui::format_bytes;
 
     #[test]
     fn format_bytes_picks_right_unit() {

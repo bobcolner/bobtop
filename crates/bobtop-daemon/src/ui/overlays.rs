@@ -1,6 +1,9 @@
 use bobtop_core::Box as BoxKind;
-use bobtop_tui::widgets::panel as boxed_panel;
-use bobtop_tui::{bool_label, truncate_chars, write_str_at};
+use crate::options_editor::OptionsEditor;
+use bobtop_tui::widgets::{
+    panel as boxed_panel, ActionBar, ModalShell, SectionHeader, ToggleRow,
+};
+use bobtop_tui::{truncate_chars, write_str_at};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::Frame;
@@ -19,28 +22,17 @@ pub(super) fn draw_hidden_panel(frame: &mut Frame, area: Rect, app: &App, name: 
 pub(super) fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let want_w: u16 = 38;
     let want_h: u16 = (BoxKind::ALL.len() as u16) + 5;
-    if area.width < want_w || area.height < want_h {
-        return;
-    }
-    let x = area.x + (area.width - want_w) / 2;
-    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
-    let modal = Rect::new(x, y, want_w, want_h);
-
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::boxes_overlay_title())
         .with_controls("space toggle  ↑↓ move  B/Esc close");
-    frame.render_widget(&panel, modal);
-    let body = panel.inner(modal);
-    let buf = frame.buffer_mut();
     let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    for yy in body.y..body.y + body.height {
-        for xx in body.x..body.x + body.width {
-            let cell = &mut buf[(xx, yy)];
-            cell.set_char(' ');
-            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
-        }
-    }
+    let Some(body) = ModalShell::new(panel, want_w, want_h)
+        .with_fill(Style::default().bg(bg).fg(app.theme.main_fg))
+        .render(frame, area) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
 
     write_str_at(
         buf,
@@ -55,25 +47,17 @@ pub(super) fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
         if row_y + 1 >= body.y + body.height {
             break;
         }
-        let enabled = app.boxes.is_enabled(*b);
-        let mark = if enabled { "[x]" } else { "[ ]" };
         let label = box_label(*b);
         let is_cursor = i == app.ui.boxes_overlay_cursor;
-        let prefix = if is_cursor { "▶ " } else { "  " };
-        let line = format!("{prefix}{mark}  {label}");
-        let row_style = if is_cursor {
-            Style::default().bg(app.theme.selected_bg).fg(app.theme.selected_fg)
-        } else if enabled {
-            Style::default().bg(bg).fg(app.theme.main_fg)
-        } else {
-            Style::default().bg(bg).fg(app.theme.inactive_fg)
-        };
-        if is_cursor {
-            for xx in body.x + 1..body.x + body.width - 1 {
-                buf[(xx, row_y)].set_style(Style::default().bg(app.theme.selected_bg));
-            }
-        }
-        write_str_at(buf, body.x + 2, row_y, &line, row_style);
+        let row = ToggleRow::new(label, app.boxes.is_enabled(*b))
+            .with_cursor(is_cursor)
+            .with_colors(
+                app.theme.selected_bg,
+                app.theme.selected_fg,
+                app.theme.main_fg,
+                app.theme.inactive_fg,
+            );
+        frame.render_widget(&row, Rect::new(body.x + 1, row_y, body.width.saturating_sub(2), 1));
     }
 }
 
@@ -88,45 +72,21 @@ fn box_label(b: BoxKind) -> &'static str {
 }
 
 pub(super) fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(opts) = &app.ui.options else { return };
+    let Some(editor) = &app.ui.options else { return };
     let want_w: u16 = 56;
-    let want_h: u16 = (crate::app::OptionsState::FIELD_COUNT as u16) + 6;
-    if area.width < want_w || area.height < want_h {
-        return;
-    }
-    let x = area.x + (area.width - want_w) / 2;
-    let y = area.y + (area.height - want_h) / 2;
-    let modal = Rect::new(x, y, want_w, want_h);
-
+    let want_h: u16 = (OptionsEditor::FIELD_COUNT as u16) + 7;
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::options_overlay_title())
         .with_keybinds(" ↑↓ field   ←→ value   Enter save+apply   Esc cancel ");
-    frame.render_widget(&panel, modal);
-    let body = panel.inner(modal);
-    let buf = frame.buffer_mut();
     let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    for yy in body.y..body.y + body.height {
-        for xx in body.x..body.x + body.width {
-            let cell = &mut buf[(xx, yy)];
-            cell.set_char(' ');
-            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
-        }
-    }
+    let Some(body) = ModalShell::new(panel, want_w, want_h)
+        .with_fill(Style::default().bg(bg).fg(app.theme.main_fg))
+        .render(frame, area) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
 
-    let rows: [(&str, String); crate::app::OptionsState::FIELD_COUNT] = [
-        ("theme", opts.theme.clone()),
-        ("tick_ms", format!("{} ms", opts.tick_ms)),
-        ("layout", format!("{:?}", opts.layout).to_lowercase()),
-        ("corners", format!("{:?}", opts.corners).to_lowercase()),
-        ("no_ebpf", bool_label(opts.no_ebpf)),
-        ("no_pcap", bool_label(opts.no_pcap)),
-        ("tty (block graphs)", bool_label(opts.tty)),
-        ("show_virtual_net", bool_label(opts.show_virtual_net)),
-        ("theme_background", bool_label(opts.theme_background)),
-        ("truecolor", bool_label(opts.truecolor)),
-    ];
-    let label_w = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(8) as u16;
     write_str_at(
         buf,
         body.x + 2,
@@ -134,52 +94,64 @@ pub(super) fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
         "(saved to ~/.config/bobtop/bobtop.toml on Enter)",
         Style::default().bg(bg).fg(app.theme.inactive_fg),
     );
-    for (i, (label, value)) in rows.iter().enumerate() {
-        let row_y = body.y + 3 + i as u16;
-        if row_y >= body.y + body.height {
-            break;
-        }
-        let is_cursor = i == opts.cursor;
-        if is_cursor {
-            for xx in body.x + 1..body.x + body.width - 1 {
-                buf[(xx, row_y)].set_style(Style::default().bg(app.theme.selected_bg));
-            }
-        }
-        let prefix = if is_cursor { "▶ " } else { "  " };
-        let row_bg = if is_cursor { app.theme.selected_bg } else { bg };
-        let row_fg = if is_cursor { app.theme.selected_fg } else { app.theme.main_fg };
-        let line = format!(
-            "{prefix}{:<width$}  ◀ {value} ▶",
-            label,
-            width = label_w as usize,
+    let footer = ActionBar::new(vec![
+        ("Esc".into(), "cancel".into()),
+        ("Enter".into(), "save+apply".into()),
+    ])
+    .with_colors(
+        app.theme.div_line,
+        app.theme.hi_fg,
+        app.theme.main_fg,
+        app.theme.selected_bg,
+    );
+    if body.height > 3 {
+        frame.render_widget(
+            &footer,
+            Rect::new(
+                body.x + 2,
+                body.bottom().saturating_sub(1),
+                body.width.saturating_sub(4),
+                1,
+            ),
         );
-        write_str_at(buf, body.x + 2, row_y, &line, Style::default().bg(row_bg).fg(row_fg));
     }
+    let general = editor.general_form().with_colors(
+        app.theme.selected_bg,
+        app.theme.selected_fg,
+        app.theme.main_fg,
+        app.theme.inactive_fg,
+        app.theme.main_fg,
+    );
+    let advanced = editor.behavior_form().with_colors(
+        app.theme.selected_bg,
+        app.theme.selected_fg,
+        app.theme.main_fg,
+        app.theme.inactive_fg,
+        app.theme.main_fg,
+    );
+    let header1 = SectionHeader::new("general").with_colors(app.theme.div_line, app.theme.title);
+    let header2 = SectionHeader::new("behavior").with_colors(app.theme.div_line, app.theme.title);
+    frame.render_widget(&header1, Rect::new(body.x + 2, body.y + 3, body.width.saturating_sub(4), 1));
+    frame.render_widget(&general, Rect::new(body.x + 2, body.y + 4, body.width.saturating_sub(4), 4));
+    frame.render_widget(&header2, Rect::new(body.x + 2, body.y + 9, body.width.saturating_sub(4), 1));
+    frame.render_widget(&advanced, Rect::new(body.x + 2, body.y + 10, body.width.saturating_sub(4), 6));
 }
 
 pub(super) fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
     let Some(d) = &app.ui.detail else { return };
     let want_w = (area.width * 7 / 10).max(50).min(area.width);
     let want_h = (area.height * 7 / 10).max(14).min(area.height);
-    let x = area.x + (area.width - want_w) / 2;
-    let y = area.y + (area.height - want_h) / 2;
-    let modal = Rect::new(x, y, want_w, want_h);
-
     let panel = boxed_panel(app.theme.proc_box, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::detail_title(d))
         .with_keybinds(" Esc / Enter close ");
-    frame.render_widget(&panel, modal);
-    let body = panel.inner(modal);
-    let buf = frame.buffer_mut();
     let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    for yy in body.y..body.y + body.height {
-        for xx in body.x..body.x + body.width {
-            let cell = &mut buf[(xx, yy)];
-            cell.set_char(' ');
-            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
-        }
-    }
+    let Some(body) = ModalShell::new(panel, want_w, want_h)
+        .with_fill(Style::default().bg(bg).fg(app.theme.main_fg))
+        .render(frame, area) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
 
     let mut row = body.y;
     let max_row = body.y + body.height;
@@ -258,30 +230,24 @@ pub(super) fn draw_kill_dialog(frame: &mut Frame, area: Rect, app: &App) {
     let line2 = " [Enter / y]  confirm    [Esc / n]  cancel ";
     let want_w = (line1.chars().count().max(line2.chars().count()) + 4) as u16;
     let want_h: u16 = 6;
-    if area.width < want_w || area.height < want_h {
-        return;
-    }
-    let x = area.x + (area.width - want_w) / 2;
-    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
-    let modal = Rect::new(x, y, want_w, want_h);
-
     let title = presenter::kill_title(req);
     let panel = boxed_panel(app.theme.proc_box, app.theme.title, app.corner_style)
         .flat()
         .with_title(title);
-    frame.render_widget(&panel, modal);
-    let body = panel.inner(modal);
-    let buf = frame.buffer_mut();
     let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    for yy in body.y..body.y + body.height {
-        for xx in body.x..body.x + body.width {
-            let cell = &mut buf[(xx, yy)];
-            cell.set_char(' ');
-            cell.set_style(Style::default().bg(bg).fg(app.theme.main_fg));
-        }
-    }
+    let Some(body) = ModalShell::new(panel, want_w, want_h)
+        .with_fill(Style::default().bg(bg).fg(app.theme.main_fg))
+        .render(frame, area) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
     write_str_at(buf, body.x + 1, body.y + 1, &line1, Style::default().bg(bg).fg(app.theme.hi_fg));
     write_str_at(buf, body.x + 1, body.y + 3, line2, Style::default().bg(bg).fg(app.theme.inactive_fg));
+    if body.height > 4 {
+        let footer = ActionBar::new(vec![("Enter / y".into(), "confirm".into()), ("Esc / n".into(), "cancel".into())])
+            .with_colors(app.theme.div_line, app.theme.hi_fg, app.theme.main_fg, app.theme.selected_bg);
+        frame.render_widget(&footer, Rect::new(body.x + 2, body.bottom().saturating_sub(1), body.width.saturating_sub(4), 1));
+    }
 }
 
 pub const HELP_LINES: &[(&str, &str)] = &[
@@ -316,27 +282,16 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(40);
     let want_w = inner_w + 4;
     let want_h = (HELP_LINES.len() as u16) + 4;
-    if area.width < want_w || area.height < want_h {
-        return;
-    }
-    let x = area.x + (area.width - want_w) / 2;
-    let y = area.y + (area.height.saturating_sub(want_h)) / 2;
-    let modal = Rect::new(x, y, want_w, want_h);
-
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::help_title());
-    frame.render_widget(&panel, modal);
-    let body = panel.inner(modal);
-    let buf = frame.buffer_mut();
     let modal_bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    for yy in body.y..body.y + body.height {
-        for xx in body.x..body.x + body.width {
-            let cell = &mut buf[(xx, yy)];
-            cell.set_char(' ');
-            cell.set_style(Style::default().bg(modal_bg).fg(app.theme.main_fg));
-        }
-    }
+    let Some(body) = ModalShell::new(panel, want_w, want_h)
+        .with_fill(Style::default().bg(modal_bg).fg(app.theme.main_fg))
+        .render(frame, area) else {
+        return;
+    };
+    let buf = frame.buffer_mut();
     let key_w = HELP_LINES
         .iter()
         .map(|(k, _)| k.chars().count())
@@ -361,5 +316,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             desc,
             Style::default().bg(modal_bg).fg(app.theme.main_fg),
         );
+    }
+    if body.height > 2 {
+        let footer = ActionBar::new(vec![("Esc".into(), "close".into()), ("q".into(), "quit".into())])
+            .with_colors(app.theme.div_line, app.theme.hi_fg, app.theme.main_fg, app.theme.selected_bg);
+        frame.render_widget(&footer, Rect::new(body.x + 2, body.bottom().saturating_sub(1), body.width.saturating_sub(4), 1));
     }
 }

@@ -1,4 +1,5 @@
-use crate::app::{KillRequest, OptionsState, ProcessDetail};
+use crate::app::{KillRequest, ProcessDetail};
+use crate::options_editor::OptionsEditor;
 
 #[derive(Debug, Clone)]
 pub struct UiState {
@@ -34,7 +35,7 @@ pub struct UiState {
     /// editing a snapshot of the persisted Config; ←/→ cycles the field
     /// at the cursor, ↑/↓ moves cursor, Enter saves to disk + applies
     /// live, Esc closes without saving.
-    pub options: Option<OptionsState>,
+    pub options: Option<OptionsEditor>,
     /// Status line shown in the header strip after a save attempt
     /// (success path or error). Cleared on next user action.
     pub last_options_msg: Option<String>,
