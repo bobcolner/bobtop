@@ -44,25 +44,42 @@ Useful flags:
 ```bash
 ./target/release/bobtop --theme tokyo-night        # any of 41 bundled btop themes
 ./target/release/bobtop --list-themes              # print every theme name and exit
+./target/release/bobtop --help-keys                # print all keybinds and exit
 ./target/release/bobtop --layout minimal           # cpu + processes only
-./target/release/bobtop --tick-ms 250              # faster updates (default 500ms)
+./target/release/bobtop --tick-ms 500              # faster updates (default 1500ms)
+./target/release/bobtop --corners square           # plain box corners (default rounded)
 ./target/release/bobtop --tty                      # block-char fallback for VTs without braille
 ./target/release/bobtop --show-virtual-net         # include lo, docker0, veth*, tun* in net aggregate
 ./target/release/bobtop --no-ebpf --no-pcap        # force lower-tier net attribution
 RUST_LOG=info ./target/release/bobtop              # log tier selection + collector errors to stderr
 ```
 
+Sticky preferences live at `~/.config/bobtop/bobtop.toml` (XDG-respected);
+CLI flags override file values. Edit live in-app via the `O` overlay
+(see Keyboard below).
+
 ### Keyboard
 
-| key                 | action                                       |
-|---------------------|----------------------------------------------|
-| `q` / `Esc` / Ctrl-C| quit                                         |
-| `↑` `↓` / `j` `k`   | move process selection                       |
-| `PgUp` `PgDn`       | jump 10 rows                                 |
-| `Home` `End`        | jump to top / bottom                         |
-| `+` `-`             | tune update tick by ±100ms (live)            |
-| `1`                 | full layout (CPU + Mem + Net + Procs)        |
-| `m`                 | minimal layout (CPU + Procs)                 |
+| key                 | action                                                     |
+|---------------------|------------------------------------------------------------|
+| `q` / Ctrl-C        | quit                                                       |
+| `Esc`               | close overlay (or quit when none open)                     |
+| `?`                 | help overlay                                               |
+| `↑` `↓`             | move process selection                                     |
+| `PgUp` `PgDn`       | jump 10 rows                                               |
+| `Home` `End`        | jump to top / bottom                                       |
+| `+` `-`             | tune update tick by ±100ms (live)                          |
+| `←` `→`             | cycle sort column                                          |
+| `r`                 | reverse sort direction                                     |
+| `p` `n` `m` `c`     | sort by Pid / Name / Mem / Cpu                             |
+| `1` `2` `3` `4`     | preset layouts (CPU / MEM / NET-RX / minimal)              |
+| `B`                 | boxes overlay — show/hide individual panels live           |
+| `O`                 | options overlay — edit config + save to disk               |
+| `f`                 | filter processes by name/cmdline                           |
+| `g`                 | cycle group mode: flat → exec → cgroup → tree              |
+| `Space`             | expand/collapse selected group or subtree                  |
+| `Enter`             | process detail (read-only) or expand on group header       |
+| `k` / `K`           | send SIGTERM / SIGKILL to selected process (confirm modal) |
 
 ## Themes
 
@@ -108,11 +125,40 @@ crates/
   bobtop-daemon/       binary
 ```
 
+## Process clustering
+
+`g` cycles between four views of the process list:
+
+- **flat** — one row per process (default)
+- **exec** — collapse by executable name; "chrome (47)" sums to one row
+- **cgroup** — collapse by `/proc/[pid]/cgroup` leaf; on systemd hosts
+  this groups by service / container — `firefox.service`,
+  `docker-<sha>.scope`, `user@1000.service` — and containers + k8s
+  pods show up as named cgroups for free
+- **tree** — parent_pid hierarchy with collapsible subtrees
+
+Headers carry aggregated CPU / MEM / threads / RX / TX / DR / DW so the
+collapsed view is informative on its own. Headers sort by the
+aggregate matching the active sort key, so `m` (sort by mem) +
+`g`-to-cgroup gives "which cgroup is using the most memory" — the
+clustering question, answered.
+
+Per-mode column layouts: Flat shows everything; Grouped drops Pid,
+Command, User (no aggregate value at header level — Program flexes for
+long group keys); Tree drops Command (Program flexes for indent +
+branch glyphs).
+
+## Status
+
+See [ROADMAP.md](ROADMAP.md) for shipped Phase A (perf) + Phase B (UX)
+items and what remains open.
+
 ## Tests
 
 ```bash
-cargo test --workspace                              # 78 tests, default features
+cargo test --workspace                              # 115 tests, default features
 cargo test --workspace --features bobtop-net/pcap   # +pcap parser tests
+cargo bench -p bobtop-daemon                        # render-loop perf benches
 ```
 
 Visual smoke tests (render full frame with truecolor ANSI, no real terminal needed):
