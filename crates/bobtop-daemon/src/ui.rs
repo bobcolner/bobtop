@@ -80,19 +80,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
         overlays::draw_hidden_panel(frame, layout.processes, app, "proc");
     }
 
-    if app.show_boxes_overlay {
+    if app.ui.show_boxes_overlay {
         overlays::draw_boxes_overlay(frame, area, app);
     }
-    if app.pending_kill.is_some() {
+    if app.ui.pending_kill.is_some() {
         overlays::draw_kill_dialog(frame, area, app);
     }
-    if app.detail.is_some() {
+    if app.ui.detail.is_some() {
         overlays::draw_detail_modal(frame, area, app);
     }
-    if app.options.is_some() {
+    if app.ui.options.is_some() {
         overlays::draw_options_overlay(frame, area, app);
     }
-    if app.show_help {
+    if app.ui.show_help {
         overlays::draw_help_overlay(frame, area, app);
     }
 }

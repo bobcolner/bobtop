@@ -396,6 +396,70 @@ pub const DEFAULT_PRESETS: [Preset; 4] = [
     },
 ];
 
+#[derive(Debug, Clone)]
+pub struct UiState {
+    /// `?` toggles the centered help overlay listing keybinds (B2).
+    pub show_help: bool,
+    /// `B` toggles the boxes overlay — show/hide individual panels (B5).
+    pub show_boxes_overlay: bool,
+    /// Cursor row inside the boxes overlay (index into `bobtop_core::Box::ALL`).
+    pub boxes_overlay_cursor: usize,
+
+    /// `f` opens the process filter input (B3b). While `filter_active`,
+    /// keystrokes append to `filter_text`; rebuild_sorted hides processes
+    /// whose name and cmdline both miss the substring (case-insensitive).
+    /// `filter_text` persists across edit-mode toggles so the user can
+    /// briefly switch focus and come back without re-typing.
+    pub filter_active: bool,
+    pub filter_text: String,
+
+    /// `k` (SIGTERM) / `K` (SIGKILL) opens a confirm dialog targeting the
+    /// currently-selected process (B3c). `Some(req)` = modal showing.
+    /// Enter sends the signal via libc::kill; Esc cancels.
+    pub pending_kill: Option<KillRequest>,
+    /// Most recent kill outcome — drives a brief one-line toast in the
+    /// status bar so the user gets feedback (success / errno).
+    pub last_kill_msg: Option<String>,
+
+    /// `Enter` opens a read-only detail modal for the selected pid (B3d).
+    /// Lazy-populated from /proc on open; not refreshed every tick because
+    /// most fields (cmdline, environ, fd count) don't churn at human speed.
+    pub detail: Option<ProcessDetail>,
+
+    /// `O` opens the options overlay (B11b). When `Some`, the user is
+    /// editing a snapshot of the persisted Config; ←/→ cycles the field
+    /// at the cursor, ↑/↓ moves cursor, Enter saves to disk + applies
+    /// live, Esc closes without saving.
+    pub options: Option<OptionsState>,
+    /// Status line shown in the header strip after a save attempt
+    /// (success path or error). Cleared on next user action.
+    pub last_options_msg: Option<String>,
+
+    /// Set by `apply_event` and `handle_input` whenever something
+    /// observable to the renderer has changed. Cleared by `take_dirty`
+    /// after the render loop calls `terminal.draw()`. Lets us render
+    /// on change instead of on a 60Hz heartbeat — see `tui::run`.
+    dirty: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            show_help: false,
+            show_boxes_overlay: false,
+            boxes_overlay_cursor: 0,
+            filter_active: false,
+            filter_text: String::new(),
+            pending_kill: None,
+            last_kill_msg: None,
+            detail: None,
+            options: None,
+            last_options_msg: None,
+            dirty: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub theme: Theme,
@@ -486,44 +550,6 @@ pub struct App {
     /// Sort direction for `proc_sort`. Toggled by `r`.
     pub proc_sort_descending: bool,
 
-    /// `?` toggles the centered help overlay listing keybinds (B2).
-    pub show_help: bool,
-
-    /// `B` toggles the boxes overlay — show/hide individual panels (B5).
-    pub show_boxes_overlay: bool,
-    /// Cursor row inside the boxes overlay (index into `bobtop_core::Box::ALL`).
-    pub boxes_overlay_cursor: usize,
-
-    /// `f` opens the process filter input (B3b). While `filter_active`,
-    /// keystrokes append to `filter_text`; rebuild_sorted hides processes
-    /// whose name and cmdline both miss the substring (case-insensitive).
-    /// `filter_text` persists across edit-mode toggles so the user can
-    /// briefly switch focus and come back without re-typing.
-    pub filter_active: bool,
-    pub filter_text: String,
-
-    /// `k` (SIGTERM) / `K` (SIGKILL) opens a confirm dialog targeting the
-    /// currently-selected process (B3c). `Some(req)` = modal showing.
-    /// Enter sends the signal via libc::kill; Esc cancels.
-    pub pending_kill: Option<KillRequest>,
-    /// Most recent kill outcome — drives a brief one-line toast in the
-    /// status bar so the user gets feedback (success / errno).
-    pub last_kill_msg: Option<String>,
-
-    /// `Enter` opens a read-only detail modal for the selected pid (B3d).
-    /// Lazy-populated from /proc on open; not refreshed every tick because
-    /// most fields (cmdline, environ, fd count) don't churn at human speed.
-    pub detail: Option<ProcessDetail>,
-
-    /// `O` opens the options overlay (B11b). When `Some`, the user is
-    /// editing a snapshot of the persisted Config; ←/→ cycles the field
-    /// at the cursor, ↑/↓ moves cursor, Enter saves to disk + applies
-    /// live, Esc closes without saving.
-    pub options: Option<OptionsState>,
-    /// Status line shown in the header strip after a save attempt
-    /// (success path or error). Cleared on next user action.
-    pub last_options_msg: Option<String>,
-
     /// Process grouping mode (the "intelligent clustering" feature).
     /// `g` cycles flat → exec → cgroup → tree → flat.
     pub group_mode: crate::group::GroupMode,
@@ -534,11 +560,7 @@ pub struct App {
     /// coexist — switching modes resets the meaning.
     pub expanded: std::collections::HashSet<String>,
 
-    /// Set by `apply_event` and `handle_input` whenever something
-    /// observable to the renderer has changed. Cleared by `take_dirty`
-    /// after the render loop calls `terminal.draw()`. Lets us render
-    /// on change instead of on a 60Hz heartbeat — see `tui::run`.
-    dirty: bool,
+    pub ui: UiState,
 }
 
 impl App {
@@ -583,39 +605,27 @@ impl App {
             scroll_offset: 0,
             proc_sort: ProcessSort::Cpu,
             proc_sort_descending: true,
-            show_help: false,
-            show_boxes_overlay: false,
-            boxes_overlay_cursor: 0,
-            filter_active: false,
-            filter_text: String::new(),
-            pending_kill: None,
-            last_kill_msg: None,
-            detail: None,
-            options: None,
-            last_options_msg: None,
+            ui: UiState::default(),
             group_mode: crate::group::GroupMode::Flat,
             expanded: std::collections::HashSet::new(),
-            // Start dirty so the very first frame paints something rather
-            // than a blank alt-screen until the first sample lands.
-            dirty: true,
         }
     }
 
     /// Atomically read-and-clear the dirty flag. The render loop calls this
     /// to decide whether to skip `terminal.draw()` this iteration.
     pub fn take_dirty(&mut self) -> bool {
-        std::mem::replace(&mut self.dirty, false)
+        std::mem::replace(&mut self.ui.dirty, false)
     }
 
     /// Mark state as observably changed. Anything that mutates a field
     /// `ui::draw` reads should call this (apply_event, handle_input
     /// branches that change selection/sort/layout/tick).
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.ui.dirty = true;
     }
 
     pub fn apply_event(&mut self, ev: MetricEvent) {
-        self.dirty = true;
+        self.ui.dirty = true;
         match ev {
             MetricEvent::Cpu(s) => {
                 if self.cpu_history.len() == CPU_HISTORY_CAP {
@@ -749,7 +759,7 @@ impl App {
         self.net_samples = samples;
         self.net_tier = tier;
         self.rebuild_sorted();
-        self.dirty = true;
+        self.ui.dirty = true;
     }
 
     /// Rebuild `processes_sorted` from `latest_processes`, joining in
@@ -776,8 +786,8 @@ impl App {
         }
         // Apply text filter (B3b) if any. Match name OR cmdline,
         // case-insensitive. Empty filter passes everything.
-        if !self.filter_text.is_empty() {
-            let needle = self.filter_text.to_lowercase();
+        if !self.ui.filter_text.is_empty() {
+            let needle = self.ui.filter_text.to_lowercase();
             joined.retain(|p| {
                 p.name.to_lowercase().contains(&needle)
                     || p.cmdline.to_lowercase().contains(&needle)
@@ -850,7 +860,7 @@ impl App {
         let themes: Vec<String> =
             bobtop_tui::builtin_names().map(|s| s.to_string()).collect();
         let current_theme = self.theme.name.clone();
-        self.options = Some(OptionsState {
+        self.ui.options = Some(OptionsState {
             cursor: 0,
             theme: current_theme.clone(),
             tick_ms: self.tick_ms(),
@@ -896,7 +906,7 @@ impl App {
     /// options overlay. Other staged options stay snapshot-only — they
     /// only take effect on Enter (save_options).
     pub fn preview_theme(&mut self) {
-        let Some(opts) = &self.options else { return };
+        let Some(opts) = &self.ui.options else { return };
         // Use load_theme so the search path + parse + name-tracking are
         // handled in one place. Earlier code tried to call find_source +
         // from_source manually and got the tuple destructure backwards
@@ -913,7 +923,7 @@ impl App {
     /// Discard a pending options edit and restore the originally-active
     /// theme. Called when the user dismisses the overlay with Esc.
     pub fn cancel_options(&mut self) {
-        let Some(opts) = self.options.take() else { return };
+        let Some(opts) = self.ui.options.take() else { return };
         self.theme = bobtop_tui::load_theme(&opts.original_theme);
         self.apply_color_options();
     }
@@ -922,7 +932,7 @@ impl App {
     /// returned message is for the header toast — Ok = "saved to PATH"
     /// or "save failed: …".
     pub fn save_options(&mut self) -> String {
-        let Some(opts) = self.options.take() else {
+        let Some(opts) = self.ui.options.take() else {
             return "no options to save".into();
         };
         // Live-apply the changes that mutate render state immediately so
@@ -995,7 +1005,7 @@ impl App {
         } else {
             Some(names[(next - 1) as usize].clone())
         };
-        self.dirty = true;
+        self.ui.dirty = true;
     }
 
     /// Cycle the grouping mode (`g` keybind). Resets `expanded` because
@@ -1037,7 +1047,7 @@ impl App {
         let rows = self.display_rows();
         let Some(row) = rows.get(self.selected_proc) else { return };
         let crate::group::DisplayRow::Process(p) = row else { return };
-        self.pending_kill = Some(KillRequest {
+        self.ui.pending_kill = Some(KillRequest {
             pid: p.info.pid,
             name: p.info.name.clone(),
             signal,
@@ -1059,7 +1069,7 @@ impl App {
         // here than to thread `mark_dirty()` through each branch.
         let flow = self.handle_key(k);
         if matches!(flow, ControlFlow::Continue) {
-            self.dirty = true;
+            self.ui.dirty = true;
         }
         flow
     }
@@ -1075,7 +1085,7 @@ impl App {
         // the value at the cursor, Enter saves to disk + applies live,
         // Esc closes without saving. Routed before everything else so
         // the rest of the keybinds can't fire while the user is editing.
-        if self.options.is_some() {
+        if self.ui.options.is_some() {
             match k.code {
                 KeyCode::Esc => {
                     // Revert any live previews (currently just theme).
@@ -1084,11 +1094,11 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let msg = self.save_options();
-                    self.last_options_msg = Some(msg);
+                    self.ui.last_options_msg = Some(msg);
                     return ControlFlow::Continue;
                 }
                 KeyCode::Up => {
-                    if let Some(o) = self.options.as_mut() {
+                    if let Some(o) = self.ui.options.as_mut() {
                         if o.cursor > 0 {
                             o.cursor -= 1;
                         }
@@ -1096,7 +1106,7 @@ impl App {
                     return ControlFlow::Continue;
                 }
                 KeyCode::Down => {
-                    if let Some(o) = self.options.as_mut() {
+                    if let Some(o) = self.ui.options.as_mut() {
                         if o.cursor + 1 < OptionsState::FIELD_COUNT {
                             o.cursor += 1;
                         }
@@ -1105,7 +1115,7 @@ impl App {
                 }
                 KeyCode::Left => {
                     let on_theme = self
-                        .options
+                        .ui.options
                         .as_mut()
                         .map(|o| {
                             o.cycle_field(-1);
@@ -1119,7 +1129,7 @@ impl App {
                 }
                 KeyCode::Right | KeyCode::Char(' ') => {
                     let on_theme = self
-                        .options
+                        .ui.options
                         .as_mut()
                         .map(|o| {
                             o.cycle_field(1);
@@ -1138,10 +1148,10 @@ impl App {
         // Detail modal (B3d) — Esc closes. While open the rest of the
         // UI is read-only so we don't lose the user's place if they
         // accidentally press a sort key.
-        if self.detail.is_some() {
+        if self.ui.detail.is_some() {
             match k.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.detail = None;
+                    self.ui.detail = None;
                     return ControlFlow::Continue;
                 }
                 _ => return ControlFlow::Continue,
@@ -1151,16 +1161,16 @@ impl App {
         // Kill confirm dialog (B3c) — modal. Enter sends the signal,
         // Esc/n cancels. We route this first so the user can't
         // accidentally take other action with the modal up.
-        if let Some(req) = self.pending_kill.clone() {
+        if let Some(req) = self.ui.pending_kill.clone() {
             match k.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let outcome = send_signal(req.pid, req.signal);
-                    self.last_kill_msg = Some(outcome);
-                    self.pending_kill = None;
+                    self.ui.last_kill_msg = Some(outcome);
+                    self.ui.pending_kill = None;
                     return ControlFlow::Continue;
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.pending_kill = None;
+                    self.ui.pending_kill = None;
                     return ControlFlow::Continue;
                 }
                 _ => return ControlFlow::Continue,
@@ -1171,25 +1181,25 @@ impl App {
         // filter text. Esc cancels the filter entirely; Enter commits and
         // exits edit mode (filter stays applied). This must come BEFORE
         // any other modal so e.g. `q` / `B` while typing don't quit/open menus.
-        if self.filter_active {
+        if self.ui.filter_active {
             match k.code {
                 KeyCode::Esc => {
-                    self.filter_active = false;
-                    self.filter_text.clear();
+                    self.ui.filter_active = false;
+                    self.ui.filter_text.clear();
                     self.rebuild_sorted();
                     return ControlFlow::Continue;
                 }
                 KeyCode::Enter => {
-                    self.filter_active = false;
+                    self.ui.filter_active = false;
                     return ControlFlow::Continue;
                 }
                 KeyCode::Backspace => {
-                    self.filter_text.pop();
+                    self.ui.filter_text.pop();
                     self.rebuild_sorted();
                     return ControlFlow::Continue;
                 }
                 KeyCode::Char(c) => {
-                    self.filter_text.push(c);
+                    self.ui.filter_text.push(c);
                     self.rebuild_sorted();
                     return ControlFlow::Continue;
                 }
@@ -1200,10 +1210,10 @@ impl App {
         // When the help overlay is open, only `?` / Esc / `q` are routed —
         // everything else is swallowed so the user doesn't accidentally
         // mutate state while reading the keybinds.
-        if self.show_help {
+        if self.ui.show_help {
             match k.code {
                 KeyCode::Char('?') | KeyCode::Esc => {
-                    self.show_help = false;
+                    self.ui.show_help = false;
                     return ControlFlow::Continue;
                 }
                 KeyCode::Char('q') => return ControlFlow::Quit,
@@ -1214,28 +1224,28 @@ impl App {
         // Other keys pass through (so e.g. `+`/`-` still tunes tick while
         // the overlay is visible) — that matches btop's modal-but-permissive
         // boxes menu.
-        if self.show_boxes_overlay {
+        if self.ui.show_boxes_overlay {
             use bobtop_core::Box as BoxKind;
             let n = BoxKind::ALL.len();
             match k.code {
                 KeyCode::Char('B') | KeyCode::Char('b') | KeyCode::Esc => {
-                    self.show_boxes_overlay = false;
+                    self.ui.show_boxes_overlay = false;
                     return ControlFlow::Continue;
                 }
                 KeyCode::Up => {
-                    if self.boxes_overlay_cursor > 0 {
-                        self.boxes_overlay_cursor -= 1;
+                    if self.ui.boxes_overlay_cursor > 0 {
+                        self.ui.boxes_overlay_cursor -= 1;
                     }
                     return ControlFlow::Continue;
                 }
                 KeyCode::Down => {
-                    if self.boxes_overlay_cursor + 1 < n {
-                        self.boxes_overlay_cursor += 1;
+                    if self.ui.boxes_overlay_cursor + 1 < n {
+                        self.ui.boxes_overlay_cursor += 1;
                     }
                     return ControlFlow::Continue;
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => {
-                    let b = BoxKind::ALL[self.boxes_overlay_cursor];
+                    let b = BoxKind::ALL[self.ui.boxes_overlay_cursor];
                     let cur = self.boxes.is_enabled(b);
                     self.boxes.set(b, !cur);
                     return ControlFlow::Continue;
@@ -1245,21 +1255,21 @@ impl App {
         }
         match k.code {
             KeyCode::Char('?') => {
-                self.show_help = true;
+                self.ui.show_help = true;
                 ControlFlow::Continue
             }
             KeyCode::Char('B') => {
                 // Capital B opens the boxes overlay. Lowercase `b` is left
                 // free for future use (btop's `b` cycles network interfaces).
-                self.show_boxes_overlay = true;
-                self.boxes_overlay_cursor = 0;
+                self.ui.show_boxes_overlay = true;
+                self.ui.boxes_overlay_cursor = 0;
                 ControlFlow::Continue
             }
             KeyCode::Char('f') => {
                 // Open the filter input (B3b). If a filter is already applied
                 // (text non-empty, but not in edit mode), `f` re-enters edit
                 // mode so the user can refine it.
-                self.filter_active = true;
+                self.ui.filter_active = true;
                 ControlFlow::Continue
             }
             KeyCode::Char('k') => {
@@ -1278,7 +1288,7 @@ impl App {
                     match row {
                         crate::group::DisplayRow::Header(_) => self.toggle_selected_expand(),
                         crate::group::DisplayRow::Process(p) => {
-                            self.detail = Some(ProcessDetail::read(p.info.pid, &p.info.name));
+                            self.ui.detail = Some(ProcessDetail::read(p.info.pid, &p.info.name));
                         }
                     }
                 }
@@ -1561,8 +1571,8 @@ mod tests {
         // Open overlay with capital B.
         let open = Event::Key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::NONE));
         app.handle_input(open);
-        assert!(app.show_boxes_overlay);
-        assert_eq!(app.boxes_overlay_cursor, 0); // first row = CPU
+        assert!(app.ui.show_boxes_overlay);
+        assert_eq!(app.ui.boxes_overlay_cursor, 0); // first row = CPU
 
         // Space toggles the cursor's box (CPU at index 0).
         let space = || Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -1572,14 +1582,14 @@ mod tests {
         // Down moves cursor to MEM, space disables it too.
         let down = Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_input(down);
-        assert_eq!(app.boxes_overlay_cursor, 1);
+        assert_eq!(app.ui.boxes_overlay_cursor, 1);
         app.handle_input(space());
         assert!(!app.boxes.is_enabled(BoxKind::Memory));
 
         // Esc closes; CPU/MEM stay disabled (overlay state was just visibility).
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_input(esc);
-        assert!(!app.show_boxes_overlay);
+        assert!(!app.ui.show_boxes_overlay);
         assert!(!app.boxes.is_enabled(BoxKind::Cpu));
     }
 
@@ -1632,8 +1642,8 @@ mod tests {
         // Open options. Cursor starts on theme (field 0).
         let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_input(press('O'));
-        assert!(app.options.is_some());
-        assert_eq!(app.options.as_ref().unwrap().cursor, 0);
+        assert!(app.ui.options.is_some());
+        assert_eq!(app.ui.options.as_ref().unwrap().cursor, 0);
 
         // Press → to advance theme. Both the staged opts.theme and the
         // live app.theme must change in lockstep.
@@ -1644,12 +1654,12 @@ mod tests {
             after_cycle, original,
             "live theme should change when cycling theme field"
         );
-        assert_eq!(app.options.as_ref().unwrap().theme, after_cycle);
+        assert_eq!(app.ui.options.as_ref().unwrap().theme, after_cycle);
 
         // Esc closes the modal and reverts the theme.
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_input(esc);
-        assert!(app.options.is_none());
+        assert!(app.ui.options.is_none());
         assert_eq!(app.theme.name, original, "Esc should revert theme");
     }
 
@@ -1666,19 +1676,19 @@ mod tests {
         // Press `k` → SIGTERM staged for selected pid.
         let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_input(press('k'));
-        let req = app.pending_kill.as_ref().expect("kill staged");
+        let req = app.ui.pending_kill.as_ref().expect("kill staged");
         assert_eq!(req.pid, 4242);
         assert_eq!(req.signal, KillSignal::Term);
 
         // Esc cancels — no signal sent (no last_kill_msg), pending cleared.
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_input(esc);
-        assert!(app.pending_kill.is_none());
-        assert!(app.last_kill_msg.is_none());
+        assert!(app.ui.pending_kill.is_none());
+        assert!(app.ui.last_kill_msg.is_none());
 
         // Press `K` (capital) → SIGKILL staged.
         app.handle_input(press('K'));
-        let req = app.pending_kill.as_ref().expect("kill staged");
+        let req = app.ui.pending_kill.as_ref().expect("kill staged");
         assert_eq!(req.signal, KillSignal::Kill);
     }
 
@@ -1699,19 +1709,19 @@ mod tests {
         // Open filter, type "chrom" → should keep "chrome" + "chromium".
         let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_input(press('f'));
-        assert!(app.filter_active);
+        assert!(app.ui.filter_active);
         for c in "chrom".chars() {
             app.handle_input(press(c));
         }
-        assert_eq!(app.filter_text, "chrom");
+        assert_eq!(app.ui.filter_text, "chrom");
         assert_eq!(app.processes_sorted.len(), 2);
         assert!(app.processes_sorted.iter().all(|p| p.name.contains("chrom")));
 
         // Esc clears the filter and exits edit mode.
         let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_input(esc);
-        assert!(!app.filter_active);
-        assert_eq!(app.filter_text, "");
+        assert!(!app.ui.filter_active);
+        assert_eq!(app.ui.filter_text, "");
         assert_eq!(app.processes_sorted.len(), 3);
     }
 

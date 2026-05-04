@@ -58,7 +58,7 @@ pub(super) fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
         let enabled = app.boxes.is_enabled(*b);
         let mark = if enabled { "[x]" } else { "[ ]" };
         let label = box_label(*b);
-        let is_cursor = i == app.boxes_overlay_cursor;
+        let is_cursor = i == app.ui.boxes_overlay_cursor;
         let prefix = if is_cursor { "▶ " } else { "  " };
         let line = format!("{prefix}{mark}  {label}");
         let row_style = if is_cursor {
@@ -88,7 +88,7 @@ fn box_label(b: BoxKind) -> &'static str {
 }
 
 pub(super) fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(opts) = &app.options else { return };
+    let Some(opts) = &app.ui.options else { return };
     let want_w: u16 = 56;
     let want_h: u16 = (crate::app::OptionsState::FIELD_COUNT as u16) + 6;
     if area.width < want_w || area.height < want_h {
@@ -158,7 +158,7 @@ pub(super) fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(d) = &app.detail else { return };
+    let Some(d) = &app.ui.detail else { return };
     let want_w = (area.width * 7 / 10).max(50).min(area.width);
     let want_h = (area.height * 7 / 10).max(14).min(area.height);
     let x = area.x + (area.width - want_w) / 2;
@@ -253,7 +253,7 @@ pub(super) fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 pub(super) fn draw_kill_dialog(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(req) = &app.pending_kill else { return };
+    let Some(req) = &app.ui.pending_kill else { return };
     let line1 = format!(" Send {} to pid {} ({})?", req.signal.label(), req.pid, req.name);
     let line2 = " [Enter / y]  confirm    [Esc / n]  cancel ";
     let want_w = (line1.chars().count().max(line2.chars().count()) + 4) as u16;

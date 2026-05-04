@@ -103,8 +103,8 @@ pub(super) fn process_title(app: &App) -> String {
     } else {
         ""
     };
-    let filter_tag = if !app.filter_text.is_empty() {
-        format!("  filter:\"{}\"", app.filter_text)
+    let filter_tag = if !app.ui.filter_text.is_empty() {
+        format!("  filter:\"{}\"", app.ui.filter_text)
     } else {
         String::new()
     };

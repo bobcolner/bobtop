@@ -20,7 +20,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let (table_area, filter_bar) = if app.filter_active {
+    let (table_area, filter_bar) = if app.ui.filter_active {
         let body_h = inner.height.saturating_sub(1);
         (
             Rect::new(inner.x, inner.y, inner.width, body_h),
@@ -60,7 +60,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
             cell.set_char(' ');
             cell.set_style(Style::default().bg(bg).fg(app.theme.title));
         }
-        let label = format!(" filter: {}█  ", app.filter_text);
+        let label = format!(" filter: {}█  ", app.ui.filter_text);
         write_str_at(buf, bar.x, bar.y, &label, Style::default().bg(bg).fg(app.theme.hi_fg));
         let hint = " Enter=apply  Esc=clear ";
         let len = hint.chars().count() as u16;
