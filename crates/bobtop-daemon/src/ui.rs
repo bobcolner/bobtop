@@ -508,22 +508,11 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .map(|s| s.aggregate_utilization * 100.0)
         .unwrap_or(0.0);
-    let cores = app
-        .latest_cpu
-        .as_ref()
-        .map(|s| s.cores.len())
-        .unwrap_or(0);
-    let load = app
-        .latest_cpu
-        .as_ref()
-        .and_then(|s| s.load_average)
-        .map(|l| format!("load {:.2} {:.2} {:.2}", l.one, l.five, l.fifteen))
-        .unwrap_or_else(|| "load — — —".into());
-
-    // Outer CPU panel title omits freq & model — those moved to the cores
-    // subpanel title, where they sit next to the per-core grid that
-    // visualizes them. Keeping them on both would just be duplication.
-    let title = format!("¹cpu  CPU {:.1}%  Cores={}  {}", cpu_pct, cores, load);
+    // Outer CPU panel title shows just the live CPU% — model + freq are in
+    // the cores subpanel title, core count is implicit from the visible
+    // per-core grid, and load averages moved to the bottom of the cores
+    // subpanel where they sit next to the per-core data they contextualize.
+    let title = format!("¹cpu  CPU {:.1}%", cpu_pct);
     let panel = mk_panel(app, app.theme.cpu_box, app.theme.title)
         .with_title(title)
         .with_controls(format!("- {}ms +", app.tick_ms()));
@@ -542,8 +531,10 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App) {
     // — value 0 = thin line at center, value 1 = full fill. Color sampled
     // by distance-from-center: gradient.start at the line, .end at edges.
     let max_pts = (graph_area.width as usize) * 2;
+    // No value_fn here — current CPU% already lives in the panel title
+    // and the overall bar inside the cores subpanel. A third copy
+    // overlapping the graph cells was visual noise.
     let mut graph = BrailleGraph::new(max_pts, app.theme.cpu)
-        .with_value_fn(|v| format!("{:>5.1}%", v * 100.0))
         .with_style(if app.tty_graphs {
             GraphStyle::Blocks
         } else {
@@ -616,10 +607,31 @@ fn draw_cores_subpanel(
     let overall_rect = Rect::new(inner.x, inner.y, inner.width, 1);
     (&overall).render(overall_rect, frame.buffer_mut());
 
-    // Remaining rows: per-core grid (sparkline or bar based on toggle).
-    let cores_rect = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
-    if cores_rect.height > 0 {
+    // Reserve the bottom row for the load-averages line — sits next to the
+    // per-core data it's contextualizing. Falls back to no-load-row when
+    // the subpanel is too short for both the cores grid + a stat row.
+    let load_label = sample
+        .load_average
+        .map(|l| format!("load  {:.2} · {:.2} · {:.2}  (1m / 5m / 15m)", l.one, l.five, l.fifteen))
+        .unwrap_or_else(|| "load  — · — · —".to_string());
+    let load_h: u16 = if inner.height >= 4 { 1 } else { 0 };
+
+    // Middle rows: per-core grid (sparkline or bar based on toggle).
+    let cores_h = inner.height.saturating_sub(1).saturating_sub(load_h);
+    if cores_h > 0 {
+        let cores_rect = Rect::new(inner.x, inner.y + 1, inner.width, cores_h);
         draw_core_meters(frame, cores_rect, sample, app);
+    }
+
+    if load_h > 0 {
+        let y = inner.y + inner.height - 1;
+        write_str_at(
+            frame.buffer_mut(),
+            inner.x,
+            y,
+            &load_label,
+            Style::default().fg(app.theme.inactive_fg),
+        );
     }
 }
 
@@ -767,22 +779,10 @@ fn draw_track_sparkline_row(
 // ---------------------------------------------------------------------------
 
 fn draw_memory(frame: &mut Frame, area: Rect, app: &App) {
-    let used_pct = app
-        .latest_mem
-        .as_ref()
-        .filter(|m| m.total_bytes > 0)
-        .map(|m| (m.used_bytes as f64 / m.total_bytes as f64) * 100.0)
-        .unwrap_or(0.0);
-    // Title carries the size-summary so the breakdown bar can keep its
-    // full inner width for the colored segments instead of giving 16 cells
-    // to a `64.0 GiB total` value-text.
+    // Header shows total memory only — used / available / breakdown all
+    // live in the StackedBar + legend below.
     let title = match app.latest_mem.as_ref() {
-        Some(m) if m.total_bytes > 0 => format!(
-            "²mem  {} / {}  {:.1}%",
-            format_bytes(m.used_bytes),
-            format_bytes(m.total_bytes),
-            used_pct
-        ),
+        Some(m) if m.total_bytes > 0 => format!("²mem  {} total", format_bytes(m.total_bytes)),
         _ => "²mem".to_string(),
     };
     let panel = mk_panel(app, app.theme.mem_box, app.theme.title).with_title(title);
@@ -938,8 +938,14 @@ fn draw_memory_breakdown(frame: &mut Frame, area: Rect, s: &MemorySample, app: &
 // ---------------------------------------------------------------------------
 
 fn draw_disks(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.latest_disk.as_ref().map(|d| d.filesystems.len()) {
-        Some(n) if n > 0 => format!("²disks  {} mounts", n),
+    // Header shows total disk space (sum across all visible mounts) — the
+    // per-mount detail is in the rows below. Mount count was redundant
+    // with the row count.
+    let title = match app.latest_disk.as_ref() {
+        Some(d) if !d.filesystems.is_empty() => {
+            let total: u64 = d.filesystems.iter().map(|fs| fs.total_bytes).sum();
+            format!("²disks  {} total", format_bytes(total))
+        }
         _ => "²disks".to_string(),
     };
     let panel = mk_panel(app, app.theme.mem_box, app.theme.title).with_title(title);

@@ -20,7 +20,7 @@ struct DiskRateState {
 use async_trait::async_trait;
 use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
 use bobtop_core::{Collector, Result};
-use sysinfo::{ProcessStatus, ProcessesToUpdate, System, Users};
+use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, Users};
 
 const DEFAULT_INTERVAL_MS: u64 = 2000;
 
@@ -80,7 +80,16 @@ impl Collector for ProcessCollector {
             .sys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        sys.refresh_processes(ProcessesToUpdate::All, true);
+        // `refresh_processes` uses the *default* ProcessRefreshKind, which
+        // omits `user`. Without an explicit `with_user`, `p.user_id()`
+        // returns None for every process and the User column renders blank.
+        // Refresh everything — the per-tick cost is dominated by the syscalls
+        // we'd already pay for cpu/mem anyway.
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::everything(),
+        );
 
         let cpu_count = self.cpu_count.max(1);
         let now = Instant::now();
