@@ -147,7 +147,7 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "bobtop-collectors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "bobtop-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "bobtop-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "bobtop-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "bobtop-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bobtop-core",
