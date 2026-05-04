@@ -81,6 +81,9 @@ async fn main() -> Result<()> {
     );
     app.net_tier = net_tier;
     app.corner_style = eff.corners.into();
+    app.theme_background = eff.theme_background;
+    app.truecolor = eff.truecolor;
+    app.apply_color_options();
     let boxes = app.boxes.clone();
     let app = Arc::new(Mutex::new(app));
 
@@ -140,6 +143,8 @@ struct EffectiveConfig {
     tty: bool,
     show_virtual_net: bool,
     corners: CornerChoice,
+    theme_background: bool,
+    truecolor: bool,
 }
 
 impl EffectiveConfig {
@@ -200,6 +205,10 @@ fn resolve(cli: &Cli, matches: &clap::ArgMatches, cfg: &Config) -> EffectiveConf
         } else {
             cfg.corners.unwrap_or(cli.corners)
         },
+        // Theme background + truecolor toggles default to true (btop's
+        // defaults). No CLI flag yet — they're config + Options-overlay only.
+        theme_background: cfg.theme_background.unwrap_or(true),
+        truecolor: cfg.truecolor.unwrap_or(true),
     }
 }
 

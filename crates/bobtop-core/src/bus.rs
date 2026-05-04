@@ -72,6 +72,10 @@ mod tests {
             swap_total_bytes: 0,
             swap_used_bytes: 0,
             huge_pages: None,
+            cached_bytes: 0,
+            buffers_bytes: 0,
+            free_bytes: 768,
+            pressure: None,
         }
     }
 

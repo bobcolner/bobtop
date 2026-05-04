@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bobtop_core::sample::{HugePages, MemorySample};
+use bobtop_core::sample::{HugePages, MemoryPressure, MemorySample};
 use bobtop_core::{Collector, CoreError, Result};
 
 const DEFAULT_INTERVAL_MS: u64 = 1000;
@@ -63,7 +63,61 @@ impl Collector for MemoryCollector {
 fn read_memory_sample() -> Result<MemorySample> {
     let text = std::fs::read_to_string("/proc/meminfo")?;
     let map = parse_meminfo(&text);
-    sample_from_meminfo(&map, Instant::now())
+    let mut sample = sample_from_meminfo(&map, Instant::now())?;
+    // PSI is best-effort — kernel < 4.20 / unprivileged containers / WSL2
+    // don't expose the file. Silent None on read or parse failure so the
+    // memory collector stays useful where PSI is unavailable.
+    sample.pressure = std::fs::read_to_string("/proc/pressure/memory")
+        .ok()
+        .and_then(|t| parse_pressure(&t));
+    Ok(sample)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pressure(text: &str) -> Option<MemoryPressure> {
+    // Two lines:
+    //   some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+    //   full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+    let mut p = MemoryPressure::default();
+    let mut saw_some = false;
+    let mut saw_full = false;
+    for line in text.lines() {
+        let mut tokens = line.split_ascii_whitespace();
+        let kind = tokens.next()?;
+        let mut a10 = 0.0_f32;
+        let mut a60 = 0.0_f32;
+        let mut a300 = 0.0_f32;
+        for tok in tokens {
+            if let Some(v) = tok.strip_prefix("avg10=") {
+                a10 = v.parse().unwrap_or(0.0);
+            } else if let Some(v) = tok.strip_prefix("avg60=") {
+                a60 = v.parse().unwrap_or(0.0);
+            } else if let Some(v) = tok.strip_prefix("avg300=") {
+                a300 = v.parse().unwrap_or(0.0);
+            }
+        }
+        match kind {
+            "some" => {
+                p.some_avg10 = a10;
+                p.some_avg60 = a60;
+                p.some_avg300 = a300;
+                saw_some = true;
+            }
+            "full" => {
+                p.full_avg10 = a10;
+                p.full_avg60 = a60;
+                p.full_avg300 = a300;
+                saw_full = true;
+            }
+            _ => {}
+        }
+    }
+    // Require at least the `some` line — `full` is optional on some kernels.
+    if saw_some || saw_full {
+        Some(p)
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -110,6 +164,21 @@ fn sample_from_meminfo(map: &HashMap<&str, u64>, now: Instant) -> Result<MemoryS
     let swap_used_bytes = swap_total_kb
         .saturating_sub(swap_free_kb)
         .saturating_mul(1024);
+    let cached_bytes = map
+        .get("Cached")
+        .copied()
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let buffers_bytes = map
+        .get("Buffers")
+        .copied()
+        .unwrap_or(0)
+        .saturating_mul(1024);
+    let free_bytes = map
+        .get("MemFree")
+        .copied()
+        .unwrap_or(0)
+        .saturating_mul(1024);
 
     let huge_pages = match map.get("HugePages_Total").copied().unwrap_or(0) {
         0 => None,
@@ -128,6 +197,12 @@ fn sample_from_meminfo(map: &HashMap<&str, u64>, now: Instant) -> Result<MemoryS
         swap_total_bytes,
         swap_used_bytes,
         huge_pages,
+        cached_bytes,
+        buffers_bytes,
+        free_bytes,
+        // PSI is filled by `read_memory_sample` after this constructor;
+        // tests that go through `sample_from_meminfo` directly leave it None.
+        pressure: None,
     })
 }
 
@@ -192,6 +267,34 @@ Hugepagesize:       2048 kB
         let map = parse_meminfo(text);
         let s = sample_from_meminfo(&map, Instant::now()).expect("sample");
         assert!(s.huge_pages.is_none());
+    }
+
+    #[test]
+    fn parses_pressure_some_and_full_lines() {
+        let text = "\
+some avg10=0.50 avg60=0.20 avg300=0.05 total=12345
+full avg10=0.10 avg60=0.05 avg300=0.01 total=678
+";
+        let p = parse_pressure(text).expect("psi parse");
+        assert!((p.some_avg10 - 0.50).abs() < 1e-6);
+        assert!((p.some_avg60 - 0.20).abs() < 1e-6);
+        assert!((p.some_avg300 - 0.05).abs() < 1e-6);
+        assert!((p.full_avg10 - 0.10).abs() < 1e-6);
+        assert!((p.full_avg60 - 0.05).abs() < 1e-6);
+        assert!((p.full_avg300 - 0.01).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pressure_some_only_still_parses() {
+        let text = "some avg10=1.5 avg60=0.7 avg300=0.2 total=999\n";
+        let p = parse_pressure(text).expect("psi parse");
+        assert!((p.some_avg10 - 1.5).abs() < 1e-6);
+        assert_eq!(p.full_avg10, 0.0);
+    }
+
+    #[test]
+    fn pressure_empty_returns_none() {
+        assert!(parse_pressure("").is_none());
     }
 
     #[tokio::test]

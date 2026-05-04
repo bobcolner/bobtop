@@ -196,6 +196,50 @@ impl Default for Theme {
     }
 }
 
+/// In-place downsample every color in `theme` to the 256-color terminal
+/// palette using the same algorithm btop applies when `truecolor=false`
+/// (see `truecolor_to_256` in `color.rs`). Run this once on theme load
+/// rather than per-cell at render time so the 24×N RGB conversions don't
+/// hit the hot path.
+pub fn downsample_theme_to_256(theme: &mut Theme) {
+    let conv = crate::color::truecolor_to_256;
+    let conv_grad = |g: Gradient| -> Gradient {
+        Gradient::new(conv(g.start), conv(g.mid), conv(g.end))
+    };
+    if let Some(bg) = theme.main_bg {
+        theme.main_bg = Some(conv(bg));
+    }
+    theme.main_fg = conv(theme.main_fg);
+    theme.title = conv(theme.title);
+    theme.hi_fg = conv(theme.hi_fg);
+    theme.selected_bg = conv(theme.selected_bg);
+    theme.selected_fg = conv(theme.selected_fg);
+    theme.inactive_fg = conv(theme.inactive_fg);
+    theme.graph_text = conv(theme.graph_text);
+    theme.meter_bg = conv(theme.meter_bg);
+    theme.proc_misc = conv(theme.proc_misc);
+    theme.cpu_box = conv(theme.cpu_box);
+    theme.mem_box = conv(theme.mem_box);
+    theme.net_box = conv(theme.net_box);
+    theme.proc_box = conv(theme.proc_box);
+    theme.div_line = conv(theme.div_line);
+    if let Some(c) = theme.followed_bg { theme.followed_bg = Some(conv(c)); }
+    if let Some(c) = theme.followed_fg { theme.followed_fg = Some(conv(c)); }
+    if let Some(c) = theme.proc_banner_bg { theme.proc_banner_bg = Some(conv(c)); }
+    if let Some(c) = theme.proc_banner_fg { theme.proc_banner_fg = Some(conv(c)); }
+    if let Some(c) = theme.proc_follow_bg { theme.proc_follow_bg = Some(conv(c)); }
+    if let Some(c) = theme.proc_pause_bg { theme.proc_pause_bg = Some(conv(c)); }
+    theme.cpu = conv_grad(theme.cpu);
+    theme.temp = conv_grad(theme.temp);
+    theme.used = conv_grad(theme.used);
+    theme.available = conv_grad(theme.available);
+    theme.cached = conv_grad(theme.cached);
+    theme.free = conv_grad(theme.free);
+    theme.download = conv_grad(theme.download);
+    theme.upload = conv_grad(theme.upload);
+    theme.process = conv_grad(theme.process);
+}
+
 /// Locate a theme by name. Search order: built-in → `~/.config/bobtop/themes/`
 /// → `~/.config/btop/themes/`. Returns the source string and a label
 /// describing where it was found, for logging.

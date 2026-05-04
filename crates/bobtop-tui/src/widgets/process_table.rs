@@ -458,6 +458,27 @@ impl<'a> ProcessTable<'a> {
             }
             (s, style, cols[idx].right_align)
         });
+
+        // Tree branch glyphs (`├ │ └ ─`) get the dedicated `proc_misc` accent
+        // so the tree structure reads as chrome rather than blending into the
+        // program name. btop colors its tree the same way. Done as a second
+        // pass to avoid splitting the Program cell into two strings.
+        if !is_selected && self.layout.draws_tree_glyphs() && !prefix.is_empty() {
+            let prog_x_offset: u16 = (0..prog_idx)
+                .map(|i| col_actual_width(cols, area.width, i).saturating_add(1))
+                .sum();
+            let mut x = area.x + prog_x_offset;
+            for _ in prefix.chars() {
+                if x >= area.x + area.width {
+                    break;
+                }
+                buf[(x, y)].set_style(
+                    Style::default()
+                        .fg(lerp_color(self.theme.proc_misc, self.theme.inactive_fg, fade_t)),
+                );
+                x = x.saturating_add(1);
+            }
+        }
     }
 }
 

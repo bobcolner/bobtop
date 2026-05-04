@@ -30,6 +30,16 @@ pub struct Config {
     pub tty: Option<bool>,
     pub show_virtual_net: Option<bool>,
     pub corners: Option<CornerChoice>,
+    /// Mirror of btop's `theme_background`. When `Some(false)`, the theme's
+    /// `main_bg` is suppressed so the terminal's own background (incl.
+    /// transparency / wallpaper) shows through every panel. Default: theme's
+    /// own value is used.
+    pub theme_background: Option<bool>,
+    /// Mirror of btop's `truecolor`. When `Some(false)`, all RGB colors are
+    /// downsampled to the 256-color palette (216-cube + 24-step grayscale)
+    /// at render time. Useful on terminals without 24-bit support; same
+    /// fallback algorithm btop uses (btop_theme.cpp:155).
+    pub truecolor: Option<bool>,
 }
 
 impl Config {

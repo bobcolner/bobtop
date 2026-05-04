@@ -25,6 +25,21 @@ use crate::cli::{MAX_TICK_MS, MIN_TICK_MS, TICK_STEP_MS};
 /// Maximum historical samples kept for graphing. 600 = 10 min at 1 Hz.
 pub const HISTORY_CAP: usize = 600;
 pub const CPU_HISTORY_CAP: usize = HISTORY_CAP;
+/// Inline chart style for per-core CPU and per-mount disk rows. Picks which
+/// reusable widget renders the row's chart cell — only one shows at a time.
+/// Default is `Sparkline`; `Bar` keeps the original gauge available so the
+/// chart library stays interchangeable instead of one mode being hard-coded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackChartStyle {
+    #[default]
+    Sparkline,
+    Bar,
+}
+
+/// Per-core sparkline history depth — 80 samples is enough to fill ~40 cells
+/// of braille (2 dot-cols per cell). Kept small so high-core hosts (64+) don't
+/// pay a HISTORY_CAP × N memory bill for a meter that only renders a few cells.
+pub const PER_TRACK_HISTORY_CAP: usize = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlow {
@@ -47,6 +62,11 @@ pub struct OptionsState {
     pub no_pcap: bool,
     pub tty: bool,
     pub show_virtual_net: bool,
+    /// Mirror of btop's `theme_background`. False = panel bg → terminal
+    /// default (translucent terminal / wallpaper shows through).
+    pub theme_background: bool,
+    /// Mirror of btop's `truecolor`. False = downsample RGB → 256 cube.
+    pub truecolor: bool,
     /// Snapshot of the available theme names so cycling is just an index
     /// step rather than refetching the registry on every keystroke.
     pub themes: Vec<String>,
@@ -56,7 +76,7 @@ pub struct OptionsState {
 }
 
 impl OptionsState {
-    pub const FIELD_COUNT: usize = 8;
+    pub const FIELD_COUNT: usize = 10;
 
     /// Cycle the field at `self.cursor` by `delta` (-1 = previous,
     /// +1 = next). For booleans, any non-zero delta toggles. For
@@ -102,6 +122,8 @@ impl OptionsState {
             5 => self.no_pcap = !self.no_pcap,
             6 => self.tty = !self.tty,
             7 => self.show_virtual_net = !self.show_virtual_net,
+            8 => self.theme_background = !self.theme_background,
+            9 => self.truecolor = !self.truecolor,
             _ => {}
         }
     }
@@ -116,6 +138,8 @@ impl OptionsState {
             no_pcap: Some(self.no_pcap),
             tty: Some(self.tty),
             show_virtual_net: Some(self.show_virtual_net),
+            theme_background: Some(self.theme_background),
+            truecolor: Some(self.truecolor),
         }
     }
 }
@@ -210,6 +234,40 @@ impl ProcessDetail {
 /// the modal-render artifacts. Collapse runs of whitespace too so
 /// `Name:\t\tbobtop` doesn't render as a wide gap. Allows non-ASCII
 /// (UTF-8 in cmdline arguments survives intact).
+/// Read the CPU model name from `/proc/cpuinfo`. Returns the first
+/// `model name` line's value, trimmed and de-whitespaced. Strips the
+/// common AMD/Intel marketing tail (`Processor`, `CPU @ 3.40GHz`,
+/// `XX-Core Processor`) so the panel title doesn't blow past 30 chars.
+fn read_cpu_model() -> Option<String> {
+    let body = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let raw = body
+        .lines()
+        .find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')))
+        .map(|(_, v)| v.trim().to_string())?;
+    // Trim noisy suffixes for compactness.
+    let cleaned = raw
+        .replace("(R)", "")
+        .replace("(TM)", "")
+        .replace("CPU ", "")
+        .split('@')
+        .next()
+        .unwrap_or(&raw)
+        .split("-Core")
+        .next()
+        .unwrap_or(&raw)
+        .trim()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Drop trailing "<digits>" leftover from "96-Core Processor" splits.
+    let cleaned = cleaned.trim_end_matches(char::is_whitespace).to_string();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 fn sanitize_for_display<S: AsRef<str>>(s: S) -> String {
     let mut out = String::with_capacity(s.as_ref().len());
     let mut prev_was_space = false;
@@ -344,6 +402,30 @@ pub struct App {
     pub layout_preset: LayoutPreset,
     pub tty_graphs: bool,
     pub show_virtual_net: bool,
+    /// Interface focused by the network panel. `None` = aggregate view
+    /// (sum of all visible interfaces — current default behavior). When
+    /// set, the panel renders only that interface's rates + history. `b`
+    /// (back) / `n` (next) keybinds cycle through visible interfaces with
+    /// `None` as the first slot in the cycle ("All").
+    pub selected_iface: Option<String>,
+    /// Chart style for per-core CPU rows and per-mount disk rows. Default
+    /// is `Sparkline` (1-row time-series). `Bar` falls back to the gauge
+    /// MiniMeter / Meter — kept as a peer option so the chart-type lib
+    /// stays interchangeable instead of having one mode hard-coded.
+    pub track_chart_style: TrackChartStyle,
+    /// CPU model name from `/proc/cpuinfo "model name"`, read once at App
+    /// init. Used in the cores subpanel title alongside the live frequency.
+    /// `None` on hosts that don't expose it (uncommon — most VMs / WSL do).
+    pub cpu_model: Option<String>,
+    /// Mirror of btop's `theme_background`. When false, theme's `main_bg`
+    /// is suppressed so the terminal default (translucency / wallpaper)
+    /// shows through. Applied at theme-load time in `apply_color_options`.
+    pub theme_background: bool,
+    /// Mirror of btop's `truecolor`. When false, theme RGB is downsampled
+    /// to the 256-color cube + greyscale palette via the same algorithm
+    /// btop uses (btop_theme.cpp:155). Applied at theme-load time so the
+    /// downsample only runs once per theme change, not per cell.
+    pub truecolor: bool,
     /// Border corner style applied to every BoxedPanel. Sourced from
     /// the config file (B12). Default rounded matches btop's signature.
     pub corner_style: CornerStyle,
@@ -364,8 +446,20 @@ pub struct App {
 
     /// Aggregate CPU utilization history for the BrailleGraph (0.0..=1.0).
     pub cpu_history: VecDeque<f64>,
+    /// Per-core utilization history (0..=1), keyed by core id. Lazily grown
+    /// to fit the current CPU sample's core count — handles both hot-plug
+    /// (cores appear) and the common fixed-N case without explicit init.
+    pub core_history: std::collections::HashMap<u32, VecDeque<f64>>,
+    /// Per-mount disk-IO history (read_rate, write_rate) keyed by mount label.
+    /// Same lazy-grow pattern as `core_history` so removable mounts don't need
+    /// special handling.
+    pub disk_history: std::collections::HashMap<String, VecDeque<(f64, f64)>>,
     /// Memory used-fraction history for the small mem time-series graph.
     pub mem_history: VecDeque<f64>,
+    /// Memory pressure-stall history — `some_avg10` percentage per sample,
+    /// 0..=100. Drives the PSI sparkline. Empty on hosts without
+    /// `/proc/pressure/memory`.
+    pub mem_pressure_history: VecDeque<f64>,
     pub latest_cpu: Option<CpuSample>,
     pub latest_mem: Option<MemorySample>,
     pub latest_processes: Option<ProcessSample>,
@@ -374,6 +468,10 @@ pub struct App {
     /// Per-tick aggregate of "real" interface bandwidth, suitable for the
     /// dual-trace network graph. `(rx_bytes_per_sec, tx_bytes_per_sec)`.
     pub net_history: VecDeque<(f64, f64)>,
+    /// Per-interface (rx, tx) bytes/sec history, capped at HISTORY_CAP per
+    /// iface. Populated alongside the aggregate `net_history`. Used when
+    /// `selected_iface` scopes the network panel to a single interface.
+    pub iface_history: std::collections::HashMap<String, VecDeque<(f64, f64)>>,
     pub net_samples: Vec<ProcessNetSample>,
     pub net_tier: AttributorTier,
 
@@ -457,18 +555,27 @@ impl App {
             layout_preset,
             tty_graphs,
             show_virtual_net,
+            selected_iface: None,
+            track_chart_style: TrackChartStyle::default(),
+            cpu_model: read_cpu_model(),
+            theme_background: true,
+            truecolor: true,
             corner_style: CornerStyle::default(),
             boxes,
             started_at: Instant::now(),
             tick_ms,
             cpu_history: VecDeque::with_capacity(CPU_HISTORY_CAP),
+            core_history: std::collections::HashMap::new(),
+            disk_history: std::collections::HashMap::new(),
             mem_history: VecDeque::with_capacity(HISTORY_CAP),
+            mem_pressure_history: VecDeque::with_capacity(PER_TRACK_HISTORY_CAP),
             latest_cpu: None,
             latest_mem: None,
             latest_processes: None,
             latest_network: None,
             latest_disk: None,
             net_history: VecDeque::with_capacity(HISTORY_CAP),
+            iface_history: std::collections::HashMap::new(),
             net_samples: Vec::new(),
             net_tier: AttributorTier::Unavailable,
             processes_sorted: Vec::new(),
@@ -515,6 +622,19 @@ impl App {
                     self.cpu_history.pop_front();
                 }
                 self.cpu_history.push_back(s.aggregate_utilization as f64);
+                // Per-core sparkline history. Only push values for cores in
+                // this sample — never auto-zero an absent core, since that
+                // would draw a misleading "down to 0" stair into the graph.
+                for core in &s.cores {
+                    let h = self
+                        .core_history
+                        .entry(core.id)
+                        .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
+                    if h.len() == PER_TRACK_HISTORY_CAP {
+                        h.pop_front();
+                    }
+                    h.push_back(core.utilization as f64);
+                }
                 self.latest_cpu = Some(s);
             }
             MetricEvent::Memory(s) => {
@@ -524,6 +644,17 @@ impl App {
                         self.mem_history.pop_front();
                     }
                     self.mem_history.push_back(used_frac.clamp(0.0, 1.0));
+                }
+                // Push the most-responsive PSI window (`some_avg10`) into the
+                // sparkline ring. Stored as 0..=1 fraction of "100% stalled
+                // for the entire 10s window" — kernel value `100.00` means
+                // every task waited on memory.
+                if let Some(p) = s.pressure {
+                    if self.mem_pressure_history.len() == PER_TRACK_HISTORY_CAP {
+                        self.mem_pressure_history.pop_front();
+                    }
+                    self.mem_pressure_history
+                        .push_back((p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0));
                 }
                 self.latest_mem = Some(s);
             }
@@ -537,9 +668,39 @@ impl App {
                     self.net_history.pop_front();
                 }
                 self.net_history.push_back((rx, tx));
+                // Per-interface history powers the `b`/`n` scope cycle on
+                // the net panel. Each iface gets its own ring; absent
+                // interfaces never show in the cycle.
+                for iface in &s.interfaces {
+                    let h = self
+                        .iface_history
+                        .entry(iface.name.clone())
+                        .or_insert_with(|| VecDeque::with_capacity(HISTORY_CAP));
+                    if h.len() == HISTORY_CAP {
+                        h.pop_front();
+                    }
+                    h.push_back((iface.rx_bytes_per_sec, iface.tx_bytes_per_sec));
+                }
                 self.latest_network = Some(s);
             }
-            MetricEvent::Disk(s) => self.latest_disk = Some(s),
+            MetricEvent::Disk(s) => {
+                // Per-mount sparkline history. Normalize each rate against a
+                // rolling per-mount peak at render time; the deque stores raw
+                // bytes/sec so the renderer can compute its own scale ceiling.
+                for fs in &s.filesystems {
+                    let r = fs.read_bytes_per_sec.unwrap_or(0.0);
+                    let w = fs.write_bytes_per_sec.unwrap_or(0.0);
+                    let h = self
+                        .disk_history
+                        .entry(fs.label.clone())
+                        .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
+                    if h.len() == PER_TRACK_HISTORY_CAP {
+                        h.pop_front();
+                    }
+                    h.push_back((r, w));
+                }
+                self.latest_disk = Some(s);
+            }
             MetricEvent::Gpu(_) => {
                 // Not yet wired into the UI; receiving is fine.
             }
@@ -707,9 +868,27 @@ impl App {
             no_pcap: false,
             tty: self.tty_graphs,
             show_virtual_net: self.show_virtual_net,
+            theme_background: self.theme_background,
+            truecolor: self.truecolor,
             themes,
             original_theme: current_theme,
         });
+    }
+
+    /// Re-apply `theme_background` and `truecolor` to `self.theme`. Should
+    /// be called after every theme load so a parsed theme reflects the
+    /// user's color preferences before it reaches the renderer.
+    /// - `theme_background = false` clears `main_bg` so panels render on
+    ///   the terminal default (transparency / wallpaper shows through).
+    /// - `truecolor = false` walks every theme color and downsamples to
+    ///   the 256-palette (btop's algorithm — `bobtop_tui::downsample_256`).
+    pub fn apply_color_options(&mut self) {
+        if !self.theme_background {
+            self.theme.main_bg = None;
+        }
+        if !self.truecolor {
+            bobtop_tui::downsample_theme_to_256(&mut self.theme);
+        }
     }
 
     /// Apply the staged theme to the live App immediately, so the user
@@ -724,6 +903,11 @@ impl App {
         // (find_source returns (source, origin), not (name, source)),
         // which assigned the raw source text to Theme.name.
         self.theme = bobtop_tui::load_theme(&opts.theme);
+        // Live-preview also picks up the staged color options so the user
+        // sees the truecolor / bg-suppression effects while cycling.
+        self.theme_background = opts.theme_background;
+        self.truecolor = opts.truecolor;
+        self.apply_color_options();
     }
 
     /// Discard a pending options edit and restore the originally-active
@@ -731,6 +915,7 @@ impl App {
     pub fn cancel_options(&mut self) {
         let Some(opts) = self.options.take() else { return };
         self.theme = bobtop_tui::load_theme(&opts.original_theme);
+        self.apply_color_options();
     }
 
     /// Apply the staged options to the live App and persist to disk. The
@@ -744,6 +929,9 @@ impl App {
         // the user sees the effect before we even disk-write. Theme,
         // corners, tick_ms, layout, tty_graphs, show_virtual_net.
         self.theme = bobtop_tui::load_theme(&opts.theme);
+        self.theme_background = opts.theme_background;
+        self.truecolor = opts.truecolor;
+        self.apply_color_options();
         self.corner_style = opts.corners.into();
         self.tick_ms.store(opts.tick_ms, Ordering::Relaxed);
         self.set_layout(match opts.layout {
@@ -771,6 +959,43 @@ impl App {
             self.proc_sort,
             self.proc_sort_descending,
         )
+    }
+
+    /// Cycle the focused network interface for the net panel. `direction`
+    /// is +1 for next (`n`), -1 for back (`b`). The cycle is `None` (All)
+    /// → iface[0] → iface[1] → … → iface[N-1] → None, so users always
+    /// have a way back to the aggregate view. Hidden virtual interfaces
+    /// are skipped when `show_virtual_net = false`, matching the rest of
+    /// the panel's filter.
+    pub fn cycle_selected_iface(&mut self, direction: i32) {
+        let Some(s) = &self.latest_network else { return };
+        let mut names: Vec<String> = s
+            .interfaces
+            .iter()
+            .filter(|i| {
+                self.show_virtual_net || !bobtop_collectors::is_virtual_interface(&i.name)
+            })
+            .map(|i| i.name.clone())
+            .collect();
+        if names.is_empty() {
+            self.selected_iface = None;
+            return;
+        }
+        names.sort();
+        // Slot 0 = None (All); slots 1..=N = interfaces. Map current state
+        // into that index space, step, then map back.
+        let cur = match &self.selected_iface {
+            None => 0i32,
+            Some(name) => names.iter().position(|n| n == name).map_or(0, |i| i as i32 + 1),
+        };
+        let total = names.len() as i32 + 1;
+        let next = ((cur + direction) % total + total) % total;
+        self.selected_iface = if next == 0 {
+            None
+        } else {
+            Some(names[(next - 1) as usize].clone())
+        };
+        self.dirty = true;
     }
 
     /// Cycle the grouping mode (`g` keybind). Resets `expanded` because
@@ -1061,6 +1286,17 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.cycle_group_mode();
+                ControlFlow::Continue
+            }
+            // `[` / `]` cycle the focused network interface in the net
+            // panel. `n` was the obvious mnemonic but it's already bound
+            // to sort-by-name in the proc panel.
+            KeyCode::Char('[') => {
+                self.cycle_selected_iface(-1);
+                ControlFlow::Continue
+            }
+            KeyCode::Char(']') => {
+                self.cycle_selected_iface(1);
                 ControlFlow::Continue
             }
             KeyCode::Char(' ') => {

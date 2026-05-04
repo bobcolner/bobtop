@@ -12,6 +12,8 @@ pub mod braille_graph;
 pub mod meter;
 pub mod mini_meter;
 pub mod process_table;
+pub mod sparkline;
+pub mod stacked_bar;
 
 pub use boxed::{BoxedPanel, CornerStyle};
 pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_FILL};
@@ -20,3 +22,5 @@ pub use mini_meter::MiniMeter;
 pub use process_table::{
     DisplayRow, GroupHeader, ProcessRowMeta, ProcessSort, ProcessTable, TableLayout,
 };
+pub use sparkline::Sparkline;
+pub use stacked_bar::{LegendStyle, StackedBar, StackedSegment};

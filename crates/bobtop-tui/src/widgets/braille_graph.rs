@@ -41,8 +41,14 @@ thread_local! {
 const DOTS_PER_CELL_X: usize = 2;
 /// Number of dot rows per terminal cell.
 const DOTS_PER_CELL_Y: usize = 4;
-/// Default dimming for fill cells beneath the trace.
-pub const DEFAULT_DIM_FILL: f32 = 0.45;
+/// Default dimming for fill cells beneath the trace. Set high (close to 1.0)
+/// so fill cells remain visible when the panel renders on top of the theme's
+/// `main_bg` — the previous 0.45 value was tuned for the terminal default
+/// (pure black) and washed out against typical theme backgrounds like
+/// `#0F1419` (ayu) or `#1d2021` (gruvbox). At 0.85 the trace edge still
+/// reads brighter than the fill below it, but the fill keeps enough
+/// saturation to draw the gradient.
+pub const DEFAULT_DIM_FILL: f32 = 0.85;
 
 /// Block-density characters for the TTY fallback, indexed 0..=8.
 const BLOCK_LEVELS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -123,6 +129,10 @@ pub struct BrailleGraph {
     /// Used by the network panel to show auto-scaled max ("2M" / "13K").
     pub y_scale_top: Option<String>,
     pub y_scale_bottom: Option<String>,
+    /// Optional style for chrome overlays (label, value readout, y-scale).
+    /// When `None`, falls back to `Color::Reset`. Set this from the caller to
+    /// theme the chrome via `theme.graph_text`.
+    pub text_style: Option<Style>,
 }
 
 impl std::fmt::Debug for BrailleGraph {
@@ -151,7 +161,13 @@ impl BrailleGraph {
             value_fn: None,
             y_scale_top: None,
             y_scale_bottom: None,
+            text_style: None,
         }
+    }
+
+    pub fn with_text_style(mut self, style: Style) -> Self {
+        self.text_style = Some(style);
+        self
     }
 
     /// Convert this into a dual-trace graph by attaching a secondary.
@@ -248,8 +264,13 @@ impl Widget for &BrailleGraph {
 }
 
 fn render_overlays(graph: &BrailleGraph, area: Rect, buf: &mut Buffer) {
+    // Optional caller-provided text style for graph chrome (label, value
+    // readout, y-scale ticks). When unset we fall back to plain reset to
+    // match historical behavior; bobtop's UI now passes `theme.graph_text`.
+    let style = graph
+        .text_style
+        .unwrap_or_else(|| Style::default().fg(Color::Reset));
     if let Some(label) = &graph.label {
-        let style = Style::default().fg(Color::Reset);
         write_str(buf, area.left(), area.top(), label, area.width as usize, style);
     }
     if let (Some(f), Some(v)) = (&graph.value_fn, graph.current_value()) {
@@ -257,15 +278,15 @@ fn render_overlays(graph: &BrailleGraph, area: Rect, buf: &mut Buffer) {
         let len = s.chars().count() as u16;
         if len <= area.width {
             let x = area.right().saturating_sub(len);
-            write_str(buf, x, area.top(), &s, area.width as usize, Style::default());
+            write_str(buf, x, area.top(), &s, area.width as usize, style);
         }
     }
     if let Some(top_label) = &graph.y_scale_top {
-        write_str(buf, area.left(), area.top(), top_label, area.width as usize, Style::default());
+        write_str(buf, area.left(), area.top(), top_label, area.width as usize, style);
     }
     if let Some(bot_label) = &graph.y_scale_bottom {
         let y = area.bottom().saturating_sub(1);
-        write_str(buf, area.left(), y, bot_label, area.width as usize, Style::default());
+        write_str(buf, area.left(), y, bot_label, area.width as usize, style);
     }
 }
 

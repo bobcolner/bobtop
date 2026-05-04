@@ -86,7 +86,45 @@ pub fn build_display(
         GroupMode::ByCgroup => build_grouped(procs, expanded, sort, descending, |p| {
             p.cgroup.clone().unwrap_or_else(|| "(no cgroup)".into())
         }),
-        GroupMode::ByParent => build_tree(procs, expanded),
+        GroupMode::ByParent => build_tree(procs, expanded, sort, descending),
+    }
+}
+
+/// Compare two `ProcessInfo`s by the active sort key. Used by tree mode to
+/// order siblings so pressing `m`/`c`/etc. actually re-shuffles the display
+/// instead of leaving everything pid-ascending.
+fn cmp_processes(a: &ProcessInfo, b: &ProcessInfo, sort: ProcessSort) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match sort {
+        ProcessSort::Pid => a.pid.cmp(&b.pid),
+        ProcessSort::Name => a.name.cmp(&b.name),
+        ProcessSort::User => a.user.cmp(&b.user),
+        ProcessSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
+        ProcessSort::Threads => a.threads.cmp(&b.threads),
+        ProcessSort::Cpu => a
+            .cpu_fraction
+            .partial_cmp(&b.cpu_fraction)
+            .unwrap_or(Ordering::Equal),
+        ProcessSort::NetRx => a
+            .net_rx_bytes_per_sec
+            .unwrap_or(0.0)
+            .partial_cmp(&b.net_rx_bytes_per_sec.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
+        ProcessSort::NetTx => a
+            .net_tx_bytes_per_sec
+            .unwrap_or(0.0)
+            .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
+        ProcessSort::DiskRead => a
+            .disk_read_bytes_per_sec
+            .unwrap_or(0.0)
+            .partial_cmp(&b.disk_read_bytes_per_sec.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
+        ProcessSort::DiskWrite => a
+            .disk_write_bytes_per_sec
+            .unwrap_or(0.0)
+            .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
+            .unwrap_or(Ordering::Equal),
     }
 }
 
@@ -214,7 +252,17 @@ where
 /// roots are *initially* expanded, so the set tracks COLLAPSED nodes
 /// only — sentinel-style. Tracking the smaller set keeps memory tiny
 /// and means a fresh App starts with the whole tree visible.
-fn build_tree(procs: &[ProcessInfo], collapsed: &HashSet<String>) -> Vec<DisplayRow> {
+///
+/// Roots and each set of siblings are ordered by the active `sort` key —
+/// so pressing `m`/`c`/etc. floats heaviest siblings to the top of every
+/// subtree. Without this the tree would be permanently pid-ascending and
+/// the global sort shortcuts would silently no-op in tree mode.
+fn build_tree(
+    procs: &[ProcessInfo],
+    collapsed: &HashSet<String>,
+    sort: ProcessSort,
+    descending: bool,
+) -> Vec<DisplayRow> {
     // Index pid -> ProcessInfo and parent_pid -> children list.
     let by_pid: HashMap<u32, &ProcessInfo> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -226,9 +274,20 @@ fn build_tree(procs: &[ProcessInfo], collapsed: &HashSet<String>) -> Vec<Display
             }
         }
     }
-    // Sort each sibling list by pid for stable display.
+    // Sort each sibling list by the active sort key. `partial_cmp` on f-fields
+    // can return None for NaN — `cmp_processes` already coerces those to Equal,
+    // so a stable sort gives us a deterministic order.
+    let cmp_pid = |a: &u32, b: &u32| {
+        let pa = by_pid.get(a).copied();
+        let pb = by_pid.get(b).copied();
+        let ord = match (pa, pb) {
+            (Some(x), Some(y)) => cmp_processes(x, y, sort),
+            _ => a.cmp(b),
+        };
+        if descending { ord.reverse() } else { ord }
+    };
     for v in children_of.values_mut() {
-        v.sort_unstable();
+        v.sort_by(cmp_pid);
     }
 
     // Roots = processes whose parent isn't in the snapshot (incl. pid 1).
@@ -240,7 +299,7 @@ fn build_tree(procs: &[ProcessInfo], collapsed: &HashSet<String>) -> Vec<Display
         })
         .map(|p| p.pid)
         .collect();
-    roots.sort_unstable();
+    roots.sort_by(cmp_pid);
 
     let mut out = Vec::new();
     let n = roots.len();
@@ -474,5 +533,59 @@ mod tests {
         let rows = build_display(&ps, GroupMode::ByParent, &collapsed, ProcessSort::Cpu, true);
         // init + shell — cmd should be hidden under collapsed shell.
         assert_eq!(rows.len(), 2);
+    }
+
+    /// Tree-mode sort regression: roots and siblings must obey the active
+    /// `ProcessSort` instead of permanently sitting at pid-ascending. Was
+    /// silently broken before — `build_tree` ignored the sort args entirely.
+    #[test]
+    fn tree_orders_siblings_by_active_sort() {
+        // Two roots with distinct CPU values; expected order: 5 (high cpu)
+        // then 1 (low cpu) when sort=Cpu desc, and the inverse when desc=false.
+        let ps = vec![
+            p(1, None, "low", 0.10, 0, None),
+            p(5, None, "high", 0.90, 0, None),
+        ];
+
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, true);
+        let pids: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Process(p) => Some(p.info.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pids, vec![5, 1], "Cpu desc should put high-cpu root first");
+
+        let rows_asc =
+            build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, false);
+        let pids_asc: Vec<u32> = rows_asc
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Process(p) => Some(p.info.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pids_asc, vec![1, 5], "Cpu asc should reverse the order");
+    }
+
+    /// Tree-mode sort by Mem reorders siblings within an expanded parent.
+    #[test]
+    fn tree_orders_children_by_mem() {
+        let ps = vec![
+            p(1, None, "init", 0.0, 0, None),
+            p(100, Some(1), "small", 0.0, 50, None),
+            p(200, Some(1), "big", 0.0, 500, None),
+            p(300, Some(1), "mid", 0.0, 200, None),
+        ];
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Mem, true);
+        let pids: Vec<u32> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DisplayRow::Process(p) => Some(p.info.pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pids, vec![1, 200, 300, 100], "siblings should be heaviest-mem first");
     }
 }

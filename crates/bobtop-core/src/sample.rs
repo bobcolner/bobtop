@@ -51,6 +51,18 @@ pub struct MemorySample {
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
     pub huge_pages: Option<HugePages>,
+    /// Page cache. Reclaimable under pressure — visible to apps as "used"
+    /// in some tools, but really free for new allocations.
+    pub cached_bytes: u64,
+    /// Kernel I/O buffers. Same reclaimable category as `cached_bytes`,
+    /// kept separate so the breakdown widget can show both stripes.
+    pub buffers_bytes: u64,
+    /// Truly unallocated memory (`MemFree` in `/proc/meminfo`). Not the
+    /// same as `available_bytes` — `free` doesn't count cached pages.
+    pub free_bytes: u64,
+    /// Pressure-stall info from `/proc/pressure/memory`. Linux 4.20+;
+    /// `None` on hosts that don't expose it (older kernels, some VMs).
+    pub pressure: Option<MemoryPressure>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,6 +70,20 @@ pub struct HugePages {
     pub total: u64,
     pub free: u64,
     pub size_bytes: u64,
+}
+
+/// Pressure-stall info (`/proc/pressure/memory`). Each window is the
+/// percentage of wall-clock time in that interval where at least `some` /
+/// `full` tasks were stalled waiting on memory. Numbers come straight from
+/// the kernel — no smoothing needed (kernel already does the EWMA).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryPressure {
+    pub some_avg10: f32,
+    pub some_avg60: f32,
+    pub some_avg300: f32,
+    pub full_avg10: f32,
+    pub full_avg60: f32,
+    pub full_avg300: f32,
 }
 
 // ---------------------------------------------------------------------------

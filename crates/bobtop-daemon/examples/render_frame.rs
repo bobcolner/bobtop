@@ -67,6 +67,10 @@ fn main() -> anyhow::Result<()> {
             swap_total_bytes: 8 * (1 << 30),
             swap_used_bytes: 1 * (1 << 30),
             huge_pages: None,
+            cached_bytes: 8u64 * (1 << 30),
+            buffers_bytes: 1u64 * (1 << 30),
+            free_bytes: 7u64 * (1 << 30),
+            pressure: None,
         }));
         let rx = ((t * 1.3).sin() * 60_000.0 + 80_000.0).max(1000.0);
         let tx = ((t * 0.9).cos() * 20_000.0 + 30_000.0).max(500.0);
