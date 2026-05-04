@@ -1,20 +1,16 @@
-//! Ratatui rendering layer.
+//! Ratatui rendering layer for building a shared terminal UI frame.
 //!
 //! - [`color`] — hex parsing and gradient interpolation primitives.
-//! - [`theme`] — btop `.theme` parser, embedded built-in registry, runtime
-//!   loader with `~/.config/bobtop/themes/` and `~/.config/btop/themes/`
-//!   search paths.
-//! - [`widgets`] — `BrailleGraph` (the visual identity widget) and
-//!   `BoxedPanel` (rounded box with btop-style inline title slots).
-//!
-//! Step 6 brings the layout engine and the remaining widgets (Meter,
-//! MiniMeter, ProcessTable). For now this crate exposes everything needed
-//! to render a single graph or box anywhere.
+//! - [`theme`] — built-in registry, `.theme` parser, loader, and runtime theme model.
+//! - [`layout`] — responsive frame splitting into named regions.
+//! - [`widgets`] — generic, reusable controls and panels.
+//! - [`prelude`] — the intended one-stop import for app code.
 
 #![forbid(unsafe_code)]
 
 pub mod color;
 pub mod layout;
+pub mod prelude;
 pub mod theme;
 pub mod text;
 pub mod widgets;
@@ -27,6 +23,9 @@ pub use theme::{
 };
 pub use text::{bool_label, format_bytes, format_rate, truncate_chars, write_str_at};
 pub use widgets::{
-    BoxedPanel, BrailleGraph, CornerStyle, DualMode, GraphStyle, LegendStyle, Meter, MiniMeter,
-    ProcessSort, ProcessTable, Sparkline, StackedBar, StackedSegment, Trace,
+    ActionBar, BrailleGraph, BoxedPanel, CornerStyle, DataTable, DualMode, GraphStyle,
+    LegendStyle, Meter, MiniMeter, ModalShell, SectionHeader, SelectableList, SettingRow,
+    SettingValue, SettingsForm, Sparkline, StackedBar, StackedSegment, Cell, Column,
+    ProcessTableGroupHeader, ProcessTableRow, ProcessTableRowMeta, ProcessTableSort, Row,
+    RowKind, Table, ToggleRow, Trace,
 };

@@ -103,19 +103,25 @@ pub(super) fn process_title(app: &App) -> String {
     } else {
         ""
     };
+    let sticky_tag = if app.sticky_proc_selection {
+        " sticky:on"
+    } else {
+        " sticky:off"
+    };
     let filter_tag = if !app.ui.filter_text.is_empty() {
         format!("  filter:\"{}\"", app.ui.filter_text)
     } else {
         String::new()
     };
     format!(
-        "⁴proc  {} procs  group:{}  ←{}{}→  rx/tx: {}{}{}",
+        "⁴proc  {} procs  group:{}  ←{}{}→  rx/tx: {}{}{}{}",
         app.processes_sorted.len(),
         app.group_mode.label(),
         app.proc_sort.label(),
         arrow,
         app.net_tier.name(),
         build_hint,
+        sticky_tag,
         filter_tag,
     )
 }

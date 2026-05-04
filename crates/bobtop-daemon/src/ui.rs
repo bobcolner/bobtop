@@ -105,7 +105,6 @@ fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &bobtop_core::sample:
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use bobtop_tui::format_bytes;
 
     #[test]

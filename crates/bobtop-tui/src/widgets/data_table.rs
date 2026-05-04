@@ -1,4 +1,4 @@
-//! Process table — sortable row list matching btop's proc panel.
+//! Data table — sortable row list for dense, structured tabular data.
 //!
 //! Columns: PID, Program, User, Threads, MEM (RSS), CPU%. Optional NET RX /
 //! NET TX columns appear when the active [`bobtop_net::AttributorTier`]
@@ -19,13 +19,13 @@ use crate::Theme;
 /// CPU/MEM/etc); processes carry their own info plus depth/branch info
 /// for tree-mode indentation. Built by `bobtop_daemon::group::build_display`.
 #[derive(Debug, Clone)]
-pub enum DisplayRow {
-    Header(GroupHeader),
-    Process(ProcessRowMeta),
+pub enum TableRow {
+    Header(TableGroupHeader),
+    Item(TableRowMeta),
 }
 
 #[derive(Debug, Clone)]
-pub struct GroupHeader {
+pub struct TableGroupHeader {
     pub key: String,
     pub label: String,
     pub proc_count: usize,
@@ -43,7 +43,7 @@ pub struct GroupHeader {
 }
 
 #[derive(Debug, Clone)]
-pub struct ProcessRowMeta {
+pub struct TableRowMeta {
     pub info: ProcessInfo,
     /// 0 = top-level. 1+ = nested under a group header or a tree parent.
     pub depth: u8,
@@ -61,7 +61,7 @@ pub struct ProcessRowMeta {
 const FADE_END: f32 = 0.55;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessSort {
+pub enum TableSort {
     Pid,
     Name,
     User,
@@ -74,39 +74,39 @@ pub enum ProcessSort {
     DiskWrite,
 }
 
-impl ProcessSort {
+impl TableSort {
     /// Cycle order for the `←` / `→` keybinds — left-to-right display order
     /// so the selection visually tracks the arrow direction. Always includes
     /// every sortable column so users can reach net/disk sort even at Tier 1
     /// (rows just compare on `0.0` then).
-    pub fn cycle() -> &'static [ProcessSort] {
+    pub fn cycle() -> &'static [TableSort] {
         &[
-            ProcessSort::Pid,
-            ProcessSort::Name,
-            ProcessSort::User,
-            ProcessSort::Threads,
-            ProcessSort::Mem,
-            ProcessSort::Cpu,
-            ProcessSort::NetRx,
-            ProcessSort::NetTx,
-            ProcessSort::DiskRead,
-            ProcessSort::DiskWrite,
+            TableSort::Pid,
+            TableSort::Name,
+            TableSort::User,
+            TableSort::Threads,
+            TableSort::Mem,
+            TableSort::Cpu,
+            TableSort::NetRx,
+            TableSort::NetTx,
+            TableSort::DiskRead,
+            TableSort::DiskWrite,
         ]
     }
 
     /// Stable label for the panel-title indicator (e.g. `[cpu↓]`).
     pub fn label(self) -> &'static str {
         match self {
-            ProcessSort::Pid => "pid",
-            ProcessSort::Name => "name",
-            ProcessSort::User => "user",
-            ProcessSort::Threads => "threads",
-            ProcessSort::Mem => "mem",
-            ProcessSort::Cpu => "cpu",
-            ProcessSort::NetRx => "rx",
-            ProcessSort::NetTx => "tx",
-            ProcessSort::DiskRead => "dr",
-            ProcessSort::DiskWrite => "dw",
+            TableSort::Pid => "pid",
+            TableSort::Name => "name",
+            TableSort::User => "user",
+            TableSort::Threads => "threads",
+            TableSort::Mem => "mem",
+            TableSort::Cpu => "cpu",
+            TableSort::NetRx => "rx",
+            TableSort::NetTx => "tx",
+            TableSort::DiskRead => "dr",
+            TableSort::DiskWrite => "dw",
         }
     }
 }
@@ -163,7 +163,7 @@ impl TableLayout {
         matches!(self, TableLayout::Flat | TableLayout::Tree)
     }
 
-    fn program_width(self) -> u16 {
+    pub fn program_width(self) -> u16 {
         match self {
             TableLayout::Flat => 12,
             // Grouped: Program is the group label ("▼ firefox.service (47)")
@@ -175,7 +175,7 @@ impl TableLayout {
         }
     }
 
-    fn command_width(self) -> u16 {
+    pub fn command_width(self) -> u16 {
         match self {
             TableLayout::Flat => u16::MAX, // flex — full argv visibility
             // Unused for Grouped/Tree (Command not rendered) but the
@@ -185,28 +185,28 @@ impl TableLayout {
     }
 }
 
-pub struct ProcessTable<'a> {
-    pub rows: &'a [DisplayRow],
+pub struct DataTable<'a> {
+    pub rows: &'a [TableRow],
     pub selected: Option<usize>,
     pub scroll_offset: usize,
     pub theme: &'a Theme,
     pub show_net_columns: bool,
-    pub sort: ProcessSort,
+    pub sort: TableSort,
     pub sort_descending: bool,
     /// Column-width preset — picks the flex column and per-column widths
     /// based on what each GroupMode benefits from.
     pub layout: TableLayout,
 }
 
-impl<'a> ProcessTable<'a> {
-    pub fn new(rows: &'a [DisplayRow], theme: &'a Theme) -> Self {
+impl<'a> DataTable<'a> {
+    pub fn new(rows: &'a [TableRow], theme: &'a Theme) -> Self {
         Self {
             rows,
             selected: None,
             scroll_offset: 0,
             theme,
             show_net_columns: false,
-            sort: ProcessSort::Cpu,
+            sort: TableSort::Cpu,
             sort_descending: true,
             layout: TableLayout::Flat,
         }
@@ -233,7 +233,7 @@ impl<'a> ProcessTable<'a> {
         self
     }
 
-    pub fn with_sort(mut self, sort: ProcessSort) -> Self {
+    pub fn with_sort(mut self, sort: TableSort) -> Self {
         self.sort = sort;
         self
     }
@@ -242,12 +242,12 @@ impl<'a> ProcessTable<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ColSpec {
     title: &'static str,
-    sort: Option<ProcessSort>,
+    sort: Option<TableSort>,
     width: u16,
     right_align: bool,
 }
 
-impl<'a> Widget for &ProcessTable<'a> {
+impl<'a> Widget for &DataTable<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -313,10 +313,10 @@ impl<'a> Widget for &ProcessTable<'a> {
             }
 
             match row {
-                DisplayRow::Header(h) => {
+                TableRow::Header(h) => {
                     self.render_header_row(buf, area, y, h, is_selected, &cols);
                 }
-                DisplayRow::Process(p) => {
+                TableRow::Item(p) => {
                     self.render_process_row(
                         buf,
                         area,
@@ -332,13 +332,13 @@ impl<'a> Widget for &ProcessTable<'a> {
     }
 }
 
-impl<'a> ProcessTable<'a> {
+impl<'a> DataTable<'a> {
     fn render_header_row(
         &self,
         buf: &mut Buffer,
         area: Rect,
         y: u16,
-        h: &GroupHeader,
+        h: &TableGroupHeader,
         is_selected: bool,
         cols: &[ColSpec],
     ) {
@@ -403,7 +403,7 @@ impl<'a> ProcessTable<'a> {
         buf: &mut Buffer,
         area: Rect,
         y: u16,
-        meta: &ProcessRowMeta,
+        meta: &TableRowMeta,
         is_selected: bool,
         fade_t: f32,
         cols: &[ColSpec],
@@ -489,7 +489,7 @@ impl<'a> ProcessTable<'a> {
 ///   depth=1, mid:      "├─ "
 ///   depth=2, last,
 ///     parent had more: "│  └─ "
-fn tree_prefix(meta: &ProcessRowMeta) -> String {
+fn tree_prefix(meta: &TableRowMeta) -> String {
     if meta.depth == 0 {
         return String::new();
     }
@@ -523,22 +523,22 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 fn build_cols(layout: TableLayout) -> Vec<ColSpec> {
     let mut cols = Vec::with_capacity(11);
     if layout.includes_pid() {
-        cols.push(ColSpec { title: "Pid", sort: Some(ProcessSort::Pid), width: 6, right_align: true });
+        cols.push(ColSpec { title: "Pid", sort: Some(TableSort::Pid), width: 6, right_align: true });
     }
-    cols.push(ColSpec { title: "Program", sort: Some(ProcessSort::Name), width: layout.program_width(), right_align: false });
+    cols.push(ColSpec { title: "Program", sort: Some(TableSort::Name), width: layout.program_width(), right_align: false });
     if layout.includes_command() {
         cols.push(ColSpec { title: "Command", sort: None, width: layout.command_width(), right_align: false });
     }
     if layout.includes_user() {
-        cols.push(ColSpec { title: "User", sort: Some(ProcessSort::User), width: 6, right_align: false });
+        cols.push(ColSpec { title: "User", sort: Some(TableSort::User), width: 6, right_align: false });
     }
-    cols.push(ColSpec { title: "Th",   sort: Some(ProcessSort::Threads),   width: 3, right_align: true });
-    cols.push(ColSpec { title: "MEM",  sort: Some(ProcessSort::Mem),       width: 6, right_align: true });
-    cols.push(ColSpec { title: "CPU%", sort: Some(ProcessSort::Cpu),       width: 5, right_align: true });
-    cols.push(ColSpec { title: "RX/s", sort: Some(ProcessSort::NetRx),     width: 6, right_align: true });
-    cols.push(ColSpec { title: "TX/s", sort: Some(ProcessSort::NetTx),     width: 6, right_align: true });
-    cols.push(ColSpec { title: "DR/s", sort: Some(ProcessSort::DiskRead),  width: 6, right_align: true });
-    cols.push(ColSpec { title: "DW/s", sort: Some(ProcessSort::DiskWrite), width: 6, right_align: true });
+    cols.push(ColSpec { title: "Th",   sort: Some(TableSort::Threads),   width: 3, right_align: true });
+    cols.push(ColSpec { title: "MEM",  sort: Some(TableSort::Mem),       width: 6, right_align: true });
+    cols.push(ColSpec { title: "CPU%", sort: Some(TableSort::Cpu),       width: 5, right_align: true });
+    cols.push(ColSpec { title: "RX/s", sort: Some(TableSort::NetRx),     width: 6, right_align: true });
+    cols.push(ColSpec { title: "TX/s", sort: Some(TableSort::NetTx),     width: 6, right_align: true });
+    cols.push(ColSpec { title: "DR/s", sort: Some(TableSort::DiskRead),  width: 6, right_align: true });
+    cols.push(ColSpec { title: "DW/s", sort: Some(TableSort::DiskWrite), width: 6, right_align: true });
     cols
 }
 
@@ -726,10 +726,10 @@ mod tests {
         }
     }
 
-    fn flat_rows(ps: Vec<ProcessInfo>) -> Vec<DisplayRow> {
+    fn flat_rows(ps: Vec<ProcessInfo>) -> Vec<TableRow> {
         ps.into_iter()
             .map(|info| {
-                DisplayRow::Process(ProcessRowMeta {
+                TableRow::Item(TableRowMeta {
                     info,
                     depth: 0,
                     is_last_sibling: false,
@@ -743,7 +743,7 @@ mod tests {
     fn header_renders_at_first_row() {
         let theme = Theme::fallback();
         let rows = flat_rows(vec![proc(1, "init", 0.01, 5)]);
-        let table = ProcessTable::new(&rows, &theme);
+        let table = DataTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         let _ = Instant::now();
@@ -760,7 +760,7 @@ mod tests {
     fn data_row_shows_pid_name_cpu() {
         let theme = Theme::fallback();
         let rows = flat_rows(vec![proc(12345, "cargo", 0.42, 256)]);
-        let table = ProcessTable::new(&rows, &theme);
+        let table = DataTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 3);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);
@@ -774,7 +774,7 @@ mod tests {
     fn selected_row_gets_background_fill() {
         let theme = Theme::fallback();
         let rows = flat_rows(vec![proc(1, "a", 0.1, 1), proc(2, "b", 0.1, 1)]);
-        let table = ProcessTable::new(&rows, &theme).with_selection(Some(1), 0);
+        let table = DataTable::new(&rows, &theme).with_selection(Some(1), 0);
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);
@@ -793,7 +793,7 @@ mod tests {
         p.net_rx_bytes_per_sec = Some(2048.0);
         p.net_tx_bytes_per_sec = Some(512.0);
         let rows = flat_rows(vec![p]);
-        let table = ProcessTable::new(&rows, &theme).with_net_columns(true);
+        let table = DataTable::new(&rows, &theme).with_net_columns(true);
         let area = Rect::new(0, 0, 100, 3);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);

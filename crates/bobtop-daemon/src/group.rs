@@ -14,15 +14,19 @@
 //! - **ByParent** — render as a collapsible parent_pid tree with branch
 //!   glyphs (├ │ └). Each non-leaf can be collapsed to hide its subtree.
 //!
-//! All four modes feed the same `Vec<DisplayRow>` to the renderer. Headers
+//! All four modes feed the same `Vec<TableRow>` to the renderer. Headers
 //! sort by their aggregates; children inside an expanded group sort by
 //! the active sort key. Tree mode sorts roots-then-children separately.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bobtop_core::sample::ProcessInfo;
-pub use bobtop_tui::widgets::{DisplayRow, GroupHeader, ProcessRowMeta};
-use bobtop_tui::widgets::ProcessSort;
+pub use bobtop_tui::widgets::{
+    ProcessTableGroupHeader as TableGroupHeader,
+    ProcessTableRow as TableRow,
+    ProcessTableRowMeta as TableRowMeta,
+};
+use bobtop_tui::widgets::ProcessTableSort as TableSort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
@@ -65,14 +69,14 @@ pub fn build_display(
     procs: &[ProcessInfo],
     mode: GroupMode,
     expanded: &HashSet<String>,
-    sort: ProcessSort,
+    sort: TableSort,
     descending: bool,
-) -> Vec<DisplayRow> {
+) -> Vec<TableRow> {
     match mode {
         GroupMode::Flat => procs
             .iter()
             .map(|p| {
-                DisplayRow::Process(ProcessRowMeta {
+                TableRow::Item(TableRowMeta {
                     info: p.clone(),
                     depth: 0,
                     is_last_sibling: false,
@@ -93,34 +97,34 @@ pub fn build_display(
 /// Compare two `ProcessInfo`s by the active sort key. Used by tree mode to
 /// order siblings so pressing `m`/`c`/etc. actually re-shuffles the display
 /// instead of leaving everything pid-ascending.
-fn cmp_processes(a: &ProcessInfo, b: &ProcessInfo, sort: ProcessSort) -> std::cmp::Ordering {
+fn cmp_processes(a: &ProcessInfo, b: &ProcessInfo, sort: TableSort) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match sort {
-        ProcessSort::Pid => a.pid.cmp(&b.pid),
-        ProcessSort::Name => a.name.cmp(&b.name),
-        ProcessSort::User => a.user.cmp(&b.user),
-        ProcessSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
-        ProcessSort::Threads => a.threads.cmp(&b.threads),
-        ProcessSort::Cpu => a
+        TableSort::Pid => a.pid.cmp(&b.pid),
+        TableSort::Name => a.name.cmp(&b.name),
+        TableSort::User => a.user.cmp(&b.user),
+        TableSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
+        TableSort::Threads => a.threads.cmp(&b.threads),
+        TableSort::Cpu => a
             .cpu_fraction
             .partial_cmp(&b.cpu_fraction)
             .unwrap_or(Ordering::Equal),
-        ProcessSort::NetRx => a
+        TableSort::NetRx => a
             .net_rx_bytes_per_sec
             .unwrap_or(0.0)
             .partial_cmp(&b.net_rx_bytes_per_sec.unwrap_or(0.0))
             .unwrap_or(Ordering::Equal),
-        ProcessSort::NetTx => a
+        TableSort::NetTx => a
             .net_tx_bytes_per_sec
             .unwrap_or(0.0)
             .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
             .unwrap_or(Ordering::Equal),
-        ProcessSort::DiskRead => a
+        TableSort::DiskRead => a
             .disk_read_bytes_per_sec
             .unwrap_or(0.0)
             .partial_cmp(&b.disk_read_bytes_per_sec.unwrap_or(0.0))
             .unwrap_or(Ordering::Equal),
-        ProcessSort::DiskWrite => a
+        TableSort::DiskWrite => a
             .disk_write_bytes_per_sec
             .unwrap_or(0.0)
             .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
@@ -138,10 +142,10 @@ fn cmp_processes(a: &ProcessInfo, b: &ProcessInfo, sort: ProcessSort) -> std::cm
 fn build_grouped<F>(
     procs: &[ProcessInfo],
     expanded: &HashSet<String>,
-    sort: ProcessSort,
+    sort: TableSort,
     descending: bool,
     key_fn: F,
-) -> Vec<DisplayRow>
+) -> Vec<TableRow>
 where
     F: Fn(&ProcessInfo) -> String,
 {
@@ -150,7 +154,7 @@ where
         buckets.entry(key_fn(p)).or_default().push(p.clone());
     }
 
-    let mut headers: Vec<(GroupHeader, Vec<ProcessInfo>)> = buckets
+    let mut headers: Vec<(TableGroupHeader, Vec<ProcessInfo>)> = buckets
         .into_iter()
         .map(|(key, group)| {
             let proc_count = group.len();
@@ -165,7 +169,7 @@ where
                 group.iter().filter_map(|p| p.disk_read_bytes_per_sec).collect();
             let disk_w: Vec<f64> =
                 group.iter().filter_map(|p| p.disk_write_bytes_per_sec).collect();
-            let header = GroupHeader {
+            let header = TableGroupHeader {
                 label: format!("{} ({})", key, proc_count),
                 key: key.clone(),
                 proc_count,
@@ -190,27 +194,27 @@ where
     headers.sort_by(|a, b| {
         use std::cmp::Ordering;
         let ord = match sort {
-            ProcessSort::Mem => a.0.mem_rss_total.cmp(&b.0.mem_rss_total),
-            ProcessSort::Threads => a.0.threads_total.cmp(&b.0.threads_total),
-            ProcessSort::NetRx => a
+            TableSort::Mem => a.0.mem_rss_total.cmp(&b.0.mem_rss_total),
+            TableSort::Threads => a.0.threads_total.cmp(&b.0.threads_total),
+            TableSort::NetRx => a
                 .0
                 .net_rx_total
                 .unwrap_or(0.0)
                 .partial_cmp(&b.0.net_rx_total.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::NetTx => a
+            TableSort::NetTx => a
                 .0
                 .net_tx_total
                 .unwrap_or(0.0)
                 .partial_cmp(&b.0.net_tx_total.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::DiskRead => a
+            TableSort::DiskRead => a
                 .0
                 .disk_read_total
                 .unwrap_or(0.0)
                 .partial_cmp(&b.0.disk_read_total.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::DiskWrite => a
+            TableSort::DiskWrite => a
                 .0
                 .disk_write_total
                 .unwrap_or(0.0)
@@ -219,8 +223,8 @@ where
             // Per-row keys that don't aggregate cleanly: order by group
             // key (the exec name or cgroup leaf) so listings are stable
             // and discoverable.
-            ProcessSort::Pid | ProcessSort::Name | ProcessSort::User => a.0.key.cmp(&b.0.key),
-            ProcessSort::Cpu => a
+            TableSort::Pid | TableSort::Name | TableSort::User => a.0.key.cmp(&b.0.key),
+            TableSort::Cpu => a
                 .0
                 .cpu_fraction_total
                 .partial_cmp(&b.0.cpu_fraction_total)
@@ -232,10 +236,10 @@ where
     let mut out = Vec::new();
     for (header, children) in headers {
         let expanded = header.expanded;
-        out.push(DisplayRow::Header(header));
+        out.push(TableRow::Header(header));
         if expanded {
             for p in children {
-                out.push(DisplayRow::Process(ProcessRowMeta {
+                out.push(TableRow::Item(TableRowMeta {
                     info: p,
                     depth: 1,
                     is_last_sibling: false,
@@ -260,9 +264,9 @@ where
 fn build_tree(
     procs: &[ProcessInfo],
     collapsed: &HashSet<String>,
-    sort: ProcessSort,
+    sort: TableSort,
     descending: bool,
-) -> Vec<DisplayRow> {
+) -> Vec<TableRow> {
     // Index pid -> ProcessInfo and parent_pid -> children list.
     let by_pid: HashMap<u32, &ProcessInfo> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -326,10 +330,10 @@ fn emit_subtree(
     by_pid: &HashMap<u32, &ProcessInfo>,
     children_of: &HashMap<u32, Vec<u32>>,
     collapsed: &HashSet<String>,
-    out: &mut Vec<DisplayRow>,
+    out: &mut Vec<TableRow>,
 ) {
     let Some(info) = by_pid.get(&pid) else { return };
-    out.push(DisplayRow::Process(ProcessRowMeta {
+    out.push(TableRow::Item(TableRowMeta {
         info: (*info).clone(),
         depth,
         is_last_sibling: is_last,
@@ -389,9 +393,9 @@ mod tests {
     #[test]
     fn flat_mode_yields_one_row_per_process() {
         let ps = vec![p(1, None, "a", 0.0, 0, None), p(2, None, "b", 0.0, 0, None)];
-        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), TableSort::Cpu, true);
         assert_eq!(rows.len(), 2);
-        assert!(matches!(rows[0], DisplayRow::Process(_)));
+        assert!(matches!(rows[0], TableRow::Item(_)));
     }
 
     #[test]
@@ -401,11 +405,11 @@ mod tests {
             p(2, None, "chrome", 0.20, 200, None),
             p(3, None, "vim", 0.05, 50, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
         assert_eq!(rows.len(), 2, "two collapsed headers");
         // First header should be chrome (more total CPU).
         match &rows[0] {
-            DisplayRow::Header(h) => {
+            TableRow::Header(h) => {
                 assert_eq!(h.key, "chrome");
                 assert_eq!(h.proc_count, 2);
                 assert!((h.cpu_fraction_total - 0.30).abs() < 1e-6);
@@ -427,24 +431,24 @@ mod tests {
         ];
 
         let rows_by_mem =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Mem, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, true);
         match &rows_by_mem[0] {
-            DisplayRow::Header(h) => assert_eq!(h.key, "small", "Mem sort should put small first"),
+            TableRow::Header(h) => assert_eq!(h.key, "small", "Mem sort should put small first"),
             _ => panic!("expected Header"),
         }
 
         let rows_by_cpu =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
         match &rows_by_cpu[0] {
-            DisplayRow::Header(h) => assert_eq!(h.key, "huge", "Cpu sort should put huge first"),
+            TableRow::Header(h) => assert_eq!(h.key, "huge", "Cpu sort should put huge first"),
             _ => panic!("expected Header"),
         }
 
         // Ascending direction reverses both.
         let rows_by_mem_asc =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Mem, false);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, false);
         match &rows_by_mem_asc[0] {
-            DisplayRow::Header(h) => assert_eq!(h.key, "huge", "Mem asc should flip"),
+            TableRow::Header(h) => assert_eq!(h.key, "huge", "Mem asc should flip"),
             _ => panic!("expected Header"),
         }
     }
@@ -458,9 +462,9 @@ mod tests {
         ps[0].threads = 5;
         ps[1].threads = 7;
         let rows =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
         match &rows[0] {
-            DisplayRow::Header(h) => assert_eq!(h.threads_total, 12),
+            TableRow::Header(h) => assert_eq!(h.threads_total, 12),
             _ => panic!("expected Header"),
         }
     }
@@ -474,13 +478,13 @@ mod tests {
         ];
         let mut expanded = HashSet::new();
         expanded.insert("chrome".to_string());
-        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, TableSort::Cpu, true);
         // chrome header + 2 children + vim header.
         assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0], DisplayRow::Header(_)));
-        assert!(matches!(rows[1], DisplayRow::Process(_)));
-        assert!(matches!(rows[2], DisplayRow::Process(_)));
-        assert!(matches!(rows[3], DisplayRow::Header(_)));
+        assert!(matches!(rows[0], TableRow::Header(_)));
+        assert!(matches!(rows[1], TableRow::Item(_)));
+        assert!(matches!(rows[2], TableRow::Item(_)));
+        assert!(matches!(rows[3], TableRow::Header(_)));
     }
 
     #[test]
@@ -489,11 +493,11 @@ mod tests {
             p(1, None, "x", 0.0, 0, Some("firefox.service")),
             p(2, None, "y", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), TableSort::Cpu, true);
         let keys: Vec<_> = rows
             .iter()
             .filter_map(|r| match r {
-                DisplayRow::Header(h) => Some(h.key.as_str()),
+                TableRow::Header(h) => Some(h.key.as_str()),
                 _ => None,
             })
             .collect();
@@ -510,11 +514,11 @@ mod tests {
             p(200, Some(1), "daemon", 0.0, 0, None),
             p(300, Some(100), "cmd", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true);
         let depths: Vec<u8> = rows
             .iter()
             .filter_map(|r| match r {
-                DisplayRow::Process(p) => Some(p.depth),
+                TableRow::Item(p) => Some(p.depth),
                 _ => None,
             })
             .collect();
@@ -530,13 +534,13 @@ mod tests {
         ];
         let mut collapsed = HashSet::new();
         collapsed.insert("100".to_string());
-        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, TableSort::Cpu, true);
         // init + shell — cmd should be hidden under collapsed shell.
         assert_eq!(rows.len(), 2);
     }
 
     /// Tree-mode sort regression: roots and siblings must obey the active
-    /// `ProcessSort` instead of permanently sitting at pid-ascending. Was
+    /// `TableSort` instead of permanently sitting at pid-ascending. Was
     /// silently broken before — `build_tree` ignored the sort args entirely.
     #[test]
     fn tree_orders_siblings_by_active_sort() {
@@ -547,22 +551,22 @@ mod tests {
             p(5, None, "high", 0.90, 0, None),
         ];
 
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true);
         let pids: Vec<u32> = rows
             .iter()
             .filter_map(|r| match r {
-                DisplayRow::Process(p) => Some(p.info.pid),
+                TableRow::Item(p) => Some(p.info.pid),
                 _ => None,
             })
             .collect();
         assert_eq!(pids, vec![5, 1], "Cpu desc should put high-cpu root first");
 
         let rows_asc =
-            build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, false);
+            build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, false);
         let pids_asc: Vec<u32> = rows_asc
             .iter()
             .filter_map(|r| match r {
-                DisplayRow::Process(p) => Some(p.info.pid),
+                TableRow::Item(p) => Some(p.info.pid),
                 _ => None,
             })
             .collect();
@@ -578,11 +582,11 @@ mod tests {
             p(200, Some(1), "big", 0.0, 500, None),
             p(300, Some(1), "mid", 0.0, 200, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Mem, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Mem, true);
         let pids: Vec<u32> = rows
             .iter()
             .filter_map(|r| match r {
-                DisplayRow::Process(p) => Some(p.info.pid),
+                TableRow::Item(p) => Some(p.info.pid),
                 _ => None,
             })
             .collect();

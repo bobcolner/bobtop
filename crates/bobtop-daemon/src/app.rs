@@ -16,7 +16,7 @@ use bobtop_core::sample::{
 };
 use bobtop_core::{BoxesEnabled, MetricEvent};
 use bobtop_net::{AttributorTier, ProcessNetSample};
-use bobtop_tui::widgets::{CornerStyle, ProcessSort};
+use bobtop_tui::widgets::{CornerStyle, ProcessTableSort as TableSort};
 use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
@@ -270,7 +270,7 @@ impl KillSignal {
 pub struct Preset {
     pub label: &'static str,
     pub layout: LayoutPreset,
-    pub sort: ProcessSort,
+    pub sort: TableSort,
     pub descending: bool,
 }
 
@@ -282,25 +282,25 @@ pub const DEFAULT_PRESETS: [Preset; 4] = [
     Preset {
         label: "all panels, sort by CPU",
         layout: LayoutPreset::Full,
-        sort: ProcessSort::Cpu,
+        sort: TableSort::Cpu,
         descending: true,
     },
     Preset {
         label: "all panels, sort by MEM",
         layout: LayoutPreset::Full,
-        sort: ProcessSort::Mem,
+        sort: TableSort::Mem,
         descending: true,
     },
     Preset {
         label: "all panels, sort by NET RX",
         layout: LayoutPreset::Full,
-        sort: ProcessSort::NetRx,
+        sort: TableSort::NetRx,
         descending: true,
     },
     Preset {
         label: "minimal (CPU + processes only)",
         layout: LayoutPreset::Minimal,
-        sort: ProcessSort::Cpu,
+        sort: TableSort::Cpu,
         descending: true,
     },
 ];
@@ -389,9 +389,13 @@ pub struct App {
 
     pub selected_proc: usize,
     pub scroll_offset: usize,
+    /// Stable identity for the selected process row.
+    selected_proc_pid: Option<u32>,
+    /// Keep the highlighted process attached to the same pid as it moves.
+    pub sticky_proc_selection: bool,
 
     /// Active sort column for the process table — driven by `←` / `→`.
-    pub proc_sort: ProcessSort,
+    pub proc_sort: TableSort,
     /// Sort direction for `proc_sort`. Toggled by `r`.
     pub proc_sort_descending: bool,
 
@@ -448,7 +452,9 @@ impl App {
             processes_sorted: Vec::new(),
             selected_proc: 0,
             scroll_offset: 0,
-            proc_sort: ProcessSort::Cpu,
+            selected_proc_pid: None,
+            sticky_proc_selection: false,
+            proc_sort: TableSort::Cpu,
             proc_sort_descending: true,
             ui: UiState::default(),
             group_mode: crate::group::GroupMode::Flat,
@@ -639,12 +645,9 @@ impl App {
             });
         }
         sort_processes(&mut joined, self.proc_sort, self.proc_sort_descending);
-        if !joined.is_empty() && self.selected_proc >= joined.len() {
-            self.selected_proc = joined.len() - 1;
-        } else if joined.is_empty() {
-            self.selected_proc = 0;
-        }
         self.processes_sorted = joined;
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     /// Current global update tick in milliseconds.
@@ -665,7 +668,7 @@ impl App {
     /// wrapping around. Re-sorts the existing process list in place so the
     /// change is visible immediately rather than waiting for the next sample.
     pub fn cycle_sort(&mut self, delta: i32) {
-        let cycle = ProcessSort::cycle();
+        let cycle = TableSort::cycle();
         let cur_idx = cycle.iter().position(|&s| s == self.proc_sort).unwrap_or(0) as i32;
         let len = cycle.len() as i32;
         let new_idx = ((cur_idx + delta) % len + len) % len;
@@ -675,9 +678,11 @@ impl App {
     /// Set the sort column directly (used by the `n`/`m`/`p`/`c` direct-sort
     /// keybinds). Re-sorts in place — the join state hasn't changed, only
     /// the comparator has.
-    pub fn set_sort(&mut self, sort: ProcessSort) {
+    pub fn set_sort(&mut self, sort: TableSort) {
         self.proc_sort = sort;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     /// Switch the layout preset and mirror the new visible-box set into
@@ -696,6 +701,8 @@ impl App {
         self.proc_sort = p.sort;
         self.proc_sort_descending = p.descending;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     /// Open the options overlay (B11b) with a snapshot of the current
@@ -726,7 +733,7 @@ impl App {
     /// ProcessInfo entries today; can be cached on App later if it
     /// shows up in the bench). The renderer and the keybind handlers
     /// both use this so they always agree on what's visible.
-    pub fn display_rows(&self) -> Vec<crate::group::DisplayRow> {
+    pub fn display_rows(&self) -> Vec<crate::group::TableRow> {
         crate::group::build_display(
             &self.processes_sorted,
             self.group_mode,
@@ -734,6 +741,46 @@ impl App {
             self.proc_sort,
             self.proc_sort_descending,
         )
+    }
+
+    fn row_pid(row: Option<&crate::group::TableRow>) -> Option<u32> {
+        match row? {
+            crate::group::TableRow::Item(p) => Some(p.info.pid),
+            crate::group::TableRow::Header(_) => None,
+        }
+    }
+
+    /// Keep the cursor index as-is and refresh the remembered pid.
+    fn sync_selected_process_identity_from_rows(&mut self, rows: &[crate::group::TableRow]) {
+        if rows.is_empty() {
+            self.selected_proc = 0;
+            self.selected_proc_pid = None;
+            return;
+        }
+        self.selected_proc = self.selected_proc.min(rows.len() - 1);
+        self.selected_proc_pid = Self::row_pid(rows.get(self.selected_proc));
+    }
+
+    /// Keep the cursor on the same pid if possible after rows re-order.
+    fn sync_selected_process_position_from_rows(&mut self, rows: &[crate::group::TableRow]) {
+        if rows.is_empty() {
+            self.selected_proc = 0;
+            self.selected_proc_pid = None;
+            return;
+        }
+        let mut idx = self.selected_proc.min(rows.len() - 1);
+        if self.sticky_proc_selection {
+            if let Some(pid) = self.selected_proc_pid {
+                if let Some(found) = rows
+                    .iter()
+                    .position(|row| matches!(row, crate::group::TableRow::Item(p) if p.info.pid == pid))
+                {
+                    idx = found;
+                }
+            }
+        }
+        self.selected_proc = idx;
+        self.selected_proc_pid = Self::row_pid(rows.get(idx));
     }
 
     /// Cycle the focused network interface for the net panel. `direction`
@@ -779,7 +826,8 @@ impl App {
     pub fn cycle_group_mode(&mut self) {
         self.group_mode = self.group_mode.next();
         self.expanded.clear();
-        self.selected_proc = 0;
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     /// Toggle expand/collapse for the row currently under the selection
@@ -791,17 +839,19 @@ impl App {
         let Some(row) = rows.get(self.selected_proc) else { return };
         let key = match (self.group_mode, row) {
             (crate::group::GroupMode::Flat, _) => return,
-            (_, crate::group::DisplayRow::Header(h)) => h.key.clone(),
-            (crate::group::GroupMode::ByParent, crate::group::DisplayRow::Process(p)) => {
+            (_, crate::group::TableRow::Header(h)) => h.key.clone(),
+            (crate::group::GroupMode::ByParent, crate::group::TableRow::Item(p)) => {
                 p.info.pid.to_string()
             }
-            (_, crate::group::DisplayRow::Process(_)) => return,
+            (_, crate::group::TableRow::Item(_)) => return,
         };
         if self.expanded.contains(&key) {
             self.expanded.remove(&key);
         } else {
             self.expanded.insert(key);
         }
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     /// Stage a kill request for the currently-selected process. No signal
@@ -811,7 +861,7 @@ impl App {
     pub fn request_kill(&mut self, signal: KillSignal) {
         let rows = self.display_rows();
         let Some(row) = rows.get(self.selected_proc) else { return };
-        let crate::group::DisplayRow::Process(p) = row else { return };
+        let crate::group::TableRow::Item(p) = row else { return };
         self.ui.pending_kill = Some(KillRequest {
             pid: p.info.pid,
             name: p.info.name.clone(),
@@ -822,6 +872,15 @@ impl App {
     pub fn toggle_sort_direction(&mut self) {
         self.proc_sort_descending = !self.proc_sort_descending;
         sort_processes(&mut self.processes_sorted, self.proc_sort, self.proc_sort_descending);
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
+    }
+
+    /// Toggle sticky selection follow for the process list.
+    pub fn toggle_sticky_proc_selection(&mut self) {
+        self.sticky_proc_selection = !self.sticky_proc_selection;
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
     }
 
     pub fn handle_input(&mut self, ev: Event) -> ControlFlow {
@@ -844,7 +903,8 @@ impl App {
         // processes). Bounding selection on this so cursor stops at the
         // bottom of what's actually painted, not the underlying process
         // count which excludes headers and includes hidden subtree members.
-        let visible_rows = self.display_rows().len();
+        let rows = self.display_rows();
+        let visible_rows = rows.len();
 
         // Options overlay (B11b) — modal. ↑/↓ moves cursor, ←/→ cycles
         // the value at the cursor, Enter saves to disk + applies live,
@@ -1008,11 +1068,10 @@ impl App {
             KeyCode::Enter => {
                 // Enter does double-duty: on a group header, expand/collapse;
                 // on a process row, open the detail modal.
-                let rows = self.display_rows();
                 if let Some(row) = rows.get(self.selected_proc) {
                     match row {
-                        crate::group::DisplayRow::Header(_) => self.toggle_selected_expand(),
-                        crate::group::DisplayRow::Process(p) => {
+                        crate::group::TableRow::Header(_) => self.toggle_selected_expand(),
+                        crate::group::TableRow::Item(p) => {
                             self.ui.detail = Some(ProcessDetail::read(p.info.pid, &p.info.name));
                         }
                     }
@@ -1056,19 +1115,19 @@ impl App {
             // (minimal); that alias is dropped in favor of the more useful
             // sort-by-mem binding — preset 4 is still reachable via `4`.
             KeyCode::Char('p') => {
-                self.set_sort(ProcessSort::Pid);
+                self.set_sort(TableSort::Pid);
                 ControlFlow::Continue
             }
             KeyCode::Char('n') => {
-                self.set_sort(ProcessSort::Name);
+                self.set_sort(TableSort::Name);
                 ControlFlow::Continue
             }
             KeyCode::Char('m') => {
-                self.set_sort(ProcessSort::Mem);
+                self.set_sort(TableSort::Mem);
                 ControlFlow::Continue
             }
             KeyCode::Char('c') => {
-                self.set_sort(ProcessSort::Cpu);
+                self.set_sort(TableSort::Cpu);
                 ControlFlow::Continue
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
@@ -1092,6 +1151,10 @@ impl App {
                 self.toggle_sort_direction();
                 ControlFlow::Continue
             }
+            KeyCode::Char('s') => {
+                self.toggle_sticky_proc_selection();
+                ControlFlow::Continue
+            }
             KeyCode::Up => {
                 // Note: vim-style `k` for up was dropped after B3a/B3c —
                 // `k` now sends SIGTERM and `j` `n` `m` etc. carry sort
@@ -1102,12 +1165,14 @@ impl App {
                         self.scroll_offset = self.selected_proc;
                     }
                 }
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             KeyCode::Down => {
                 if self.selected_proc + 1 < visible_rows {
                     self.selected_proc += 1;
                 }
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             KeyCode::PageUp => {
@@ -1115,19 +1180,23 @@ impl App {
                 if self.selected_proc < self.scroll_offset {
                     self.scroll_offset = self.selected_proc;
                 }
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             KeyCode::PageDown => {
                 self.selected_proc = (self.selected_proc + 10).min(visible_rows.saturating_sub(1));
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             KeyCode::Home => {
                 self.selected_proc = 0;
                 self.scroll_offset = 0;
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             KeyCode::End => {
                 self.selected_proc = visible_rows.saturating_sub(1);
+                self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
             _ => ControlFlow::Continue,
@@ -1135,35 +1204,35 @@ impl App {
     }
 }
 
-fn sort_processes(rows: &mut [ProcessInfo], sort: ProcessSort, descending: bool) {
+fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {
     use std::cmp::Ordering;
     rows.sort_by(|a, b| {
         let ord = match sort {
-            ProcessSort::Pid => a.pid.cmp(&b.pid),
-            ProcessSort::Name => a.name.cmp(&b.name),
-            ProcessSort::User => a.user.cmp(&b.user),
-            ProcessSort::Threads => a.threads.cmp(&b.threads),
-            ProcessSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
-            ProcessSort::Cpu => a
+            TableSort::Pid => a.pid.cmp(&b.pid),
+            TableSort::Name => a.name.cmp(&b.name),
+            TableSort::User => a.user.cmp(&b.user),
+            TableSort::Threads => a.threads.cmp(&b.threads),
+            TableSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
+            TableSort::Cpu => a
                 .cpu_fraction
                 .partial_cmp(&b.cpu_fraction)
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::NetRx => a
+            TableSort::NetRx => a
                 .net_rx_bytes_per_sec
                 .unwrap_or(0.0)
                 .partial_cmp(&b.net_rx_bytes_per_sec.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::NetTx => a
+            TableSort::NetTx => a
                 .net_tx_bytes_per_sec
                 .unwrap_or(0.0)
                 .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::DiskRead => a
+            TableSort::DiskRead => a
                 .disk_read_bytes_per_sec
                 .unwrap_or(0.0)
                 .partial_cmp(&b.disk_read_bytes_per_sec.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
-            ProcessSort::DiskWrite => a
+            TableSort::DiskWrite => a
                 .disk_write_bytes_per_sec
                 .unwrap_or(0.0)
                 .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
@@ -1336,13 +1405,13 @@ mod tests {
         let two = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         app.handle_input(two);
         assert_eq!(app.layout_preset, LayoutPreset::Full);
-        assert_eq!(app.proc_sort, ProcessSort::Mem);
+        assert_eq!(app.proc_sort, TableSort::Mem);
 
         // Preset 4 (key '4') = Minimal — should disable MEM/DISK/NET boxes.
         let four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
         app.handle_input(four);
         assert_eq!(app.layout_preset, LayoutPreset::Minimal);
-        assert_eq!(app.proc_sort, ProcessSort::Cpu);
+        assert_eq!(app.proc_sort, TableSort::Cpu);
         assert!(!app.boxes.is_enabled(BoxKind::Memory));
         assert!(!app.boxes.is_enabled(BoxKind::Network));
         assert!(app.boxes.is_enabled(BoxKind::Cpu));
@@ -1352,10 +1421,10 @@ mod tests {
         // preset-4 alias. Verify it sorts (and does NOT change layout).
         app.apply_preset(&DEFAULT_PRESETS[0]); // back to slot 1 (sort: Cpu)
         assert_eq!(app.layout_preset, LayoutPreset::Full);
-        assert_eq!(app.proc_sort, ProcessSort::Cpu);
+        assert_eq!(app.proc_sort, TableSort::Cpu);
         let m = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
         app.handle_input(m);
-        assert_eq!(app.proc_sort, ProcessSort::Mem);
+        assert_eq!(app.proc_sort, TableSort::Mem);
         assert_eq!(app.layout_preset, LayoutPreset::Full); // not changed
     }
 
@@ -1455,13 +1524,50 @@ mod tests {
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         app.handle_input(press('p'));
-        assert_eq!(app.proc_sort, ProcessSort::Pid);
+        assert_eq!(app.proc_sort, TableSort::Pid);
         app.handle_input(press('n'));
-        assert_eq!(app.proc_sort, ProcessSort::Name);
+        assert_eq!(app.proc_sort, TableSort::Name);
         app.handle_input(press('m'));
-        assert_eq!(app.proc_sort, ProcessSort::Mem);
+        assert_eq!(app.proc_sort, TableSort::Mem);
         app.handle_input(press('c'));
-        assert_eq!(app.proc_sort, ProcessSort::Cpu);
+        assert_eq!(app.proc_sort, TableSort::Cpu);
+    }
+
+    #[test]
+    fn sticky_selection_follows_process_across_resort() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc(10, "alpha", 0.20),
+                fake_proc(20, "beta", 0.90),
+                fake_proc(30, "gamma", 0.50),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+        assert!(!app.sticky_proc_selection);
+
+        app.toggle_sticky_proc_selection();
+        assert!(app.sticky_proc_selection);
+
+        let rows = app.display_rows();
+        let selected_idx = rows
+            .iter()
+            .position(|row| matches!(row, crate::group::TableRow::Item(p) if p.info.pid == 30))
+            .expect("selected pid should be visible");
+        app.selected_proc = selected_idx;
+        app.sync_selected_process_identity_from_rows(&rows);
+        assert_eq!(app.selected_proc_pid, Some(30));
+
+        app.set_sort(TableSort::Pid);
+        let rows = app.display_rows();
+        let selected_row = rows.get(app.selected_proc).expect("selection should stay visible");
+        let pid = match selected_row {
+            crate::group::TableRow::Item(p) => p.info.pid,
+            crate::group::TableRow::Header(_) => 0,
+        };
+        assert_eq!(pid, 30);
+        assert_eq!(app.selected_proc_pid, Some(30));
     }
 
     #[test]
