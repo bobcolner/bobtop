@@ -16,6 +16,7 @@
 pub mod color;
 pub mod layout;
 pub mod theme;
+pub mod text;
 pub mod widgets;
 
 pub use color::{dim, lerp_color, parse_btop_color, Gradient};
@@ -24,6 +25,7 @@ pub use theme::{
     builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, Theme,
     DEFAULT_THEME_NAME,
 };
+pub use text::{bool_label, format_bytes, format_rate, truncate_chars, write_str_at};
 pub use widgets::{
     BoxedPanel, BrailleGraph, CornerStyle, DualMode, GraphStyle, LegendStyle, Meter, MiniMeter,
     ProcessSort, ProcessTable, Sparkline, StackedBar, StackedSegment, Trace,

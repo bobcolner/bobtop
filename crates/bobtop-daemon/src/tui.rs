@@ -14,7 +14,7 @@ use std::io::{self, Stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bobtop_core::DataBus;
+use bobtop_core::{Box as BoxKind, DataBus};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event};
 use crossterm::execute;
@@ -147,8 +147,10 @@ pub async fn run(
                 }
             }
             _ = heartbeat.tick() => {
-                // No-op wake; falls through to the dirty check below so
-                // any time-derived UI (clock/uptime, future) can repaint.
+                let mut g = lock(&app);
+                if g.boxes.is_enabled(BoxKind::Cpu) {
+                    g.mark_dirty();
+                }
             }
         }
 

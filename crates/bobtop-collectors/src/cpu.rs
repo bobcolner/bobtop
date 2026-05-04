@@ -178,7 +178,7 @@ fn read_loadavg() -> Result<LoadAverage> {
 
 #[cfg(target_os = "linux")]
 fn read_core_frequencies(n: usize) -> Vec<Option<u32>> {
-    (0..n)
+    let mut out: Vec<Option<u32>> = (0..n)
         .map(|i| {
             let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq");
             std::fs::read_to_string(path).ok().and_then(|s| {
@@ -186,7 +186,47 @@ fn read_core_frequencies(n: usize) -> Vec<Option<u32>> {
                 s.trim().parse::<u64>().ok().map(|khz| (khz / 1000) as u32)
             })
         })
-        .collect()
+        .collect();
+    let fallback = read_proc_cpuinfo_frequencies(n);
+    for (dst, src) in out.iter_mut().zip(fallback.into_iter()) {
+        if dst.is_none() {
+            *dst = src;
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cpuinfo_frequencies(n: usize) -> Vec<Option<u32>> {
+    let text = match std::fs::read_to_string("/proc/cpuinfo") {
+        Ok(t) => t,
+        Err(_) => return vec![None; n],
+    };
+    parse_proc_cpuinfo_frequencies(&text, n)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_cpuinfo_frequencies(text: &str, n: usize) -> Vec<Option<u32>> {
+    let mut out = vec![None; n];
+    let mut current_idx: Option<usize> = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next().map(str::trim).unwrap_or("");
+        let value = parts.next().map(str::trim).unwrap_or("");
+        match key {
+            "processor" => {
+                current_idx = value.parse::<usize>().ok().filter(|&i| i < n);
+            }
+            "cpu MHz" => {
+                if let Some(i) = current_idx {
+                    let mhz = value.parse::<f64>().ok().map(|v| v.round() as u32);
+                    out[i] = mhz;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -323,6 +363,19 @@ mod tests {
         let l = parse_loadavg("0.42 0.48 0.55 1/512 12345\n").unwrap();
         assert!((l.one - 0.42).abs() < 1e-3);
         assert!((l.fifteen - 0.55).abs() < 1e-3);
+    }
+
+    #[test]
+    fn parses_proc_cpuinfo_frequencies_by_processor_index() {
+        let sample = "\
+processor   : 0
+cpu MHz     : 2793.454
+
+processor   : 1
+cpu MHz     : 3199.998
+";
+        let freqs = parse_proc_cpuinfo_frequencies(sample, 2);
+        assert_eq!(freqs, vec![Some(2793), Some(3200)]);
     }
 
     #[tokio::test]

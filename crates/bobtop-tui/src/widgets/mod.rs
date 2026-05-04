@@ -15,7 +15,7 @@ pub mod process_table;
 pub mod sparkline;
 pub mod stacked_bar;
 
-pub use boxed::{BoxedPanel, CornerStyle};
+pub use boxed::{panel, BoxedPanel, CornerStyle};
 pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_FILL};
 pub use meter::Meter;
 pub use mini_meter::MiniMeter;

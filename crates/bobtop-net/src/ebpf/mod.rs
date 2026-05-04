@@ -95,6 +95,7 @@ impl EbpfAttributor {
         if !has_bpf_capability() {
             return Err(NetError::MissingCapability("CAP_BPF or root"));
         }
+        bump_memlock_rlimit()?;
 
         // IMPORTANT: use `EbpfLoader` rather than the convenience
         // `aya::Ebpf::load(...)`. Despite the docs claiming they're
@@ -124,6 +125,24 @@ impl EbpfAttributor {
             })),
         })
     }
+}
+
+fn bump_memlock_rlimit() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let lim = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) };
+        if rc != 0 {
+            return Err(NetError::other(format!(
+                "failed to raise RLIMIT_MEMLOCK: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn attach_kprobe(ebpf: &mut aya::Ebpf, prog_name: &str, kernel_fn: &str) -> Result<()> {

@@ -38,6 +38,7 @@ pub struct BoxedPanel {
     pub title_color: ratatui::style::Color,
     pub corner_style: CornerStyle,
     pub top_left: Option<String>,
+    pub center: Option<String>,
     pub top_right: Option<String>,
     pub bottom: Option<String>,
     /// When true, force the original flat-title layout (single chrome row at
@@ -54,6 +55,7 @@ impl BoxedPanel {
             title_color,
             corner_style: CornerStyle::default(),
             top_left: None,
+            center: None,
             top_right: None,
             bottom: None,
             flat_title: false,
@@ -73,6 +75,11 @@ impl BoxedPanel {
 
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.top_left = Some(title.into());
+        self
+    }
+
+    pub fn with_center_title(mut self, title: impl Into<String>) -> Self {
+        self.center = Some(title.into());
         self
     }
 
@@ -132,6 +139,14 @@ impl BoxedPanel {
     }
 }
 
+pub fn panel(
+    border_color: ratatui::style::Color,
+    title_color: ratatui::style::Color,
+    corner_style: CornerStyle,
+) -> BoxedPanel {
+    BoxedPanel::new(border_color, title_color).with_corner_style(corner_style)
+}
+
 impl Widget for &BoxedPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width < 2 || area.height < 2 {
@@ -186,6 +201,38 @@ impl Widget for &BoxedPanel {
                     right_edge,
                 );
                 decorate_bubble(buf, &segs, cap_y, floor_y, bracket_style);
+            }
+        }
+        if let Some(s) = &self.center {
+            let total = measured_segments_width(s);
+            if total > 0 && area.width > total + 2 {
+                let start_x = area.left() + (area.width.saturating_sub(total)) / 2;
+                let left_bound = self
+                    .top_left
+                    .as_ref()
+                    .map(|s| area.left() + 1 + measured_segments_width(s))
+                    .unwrap_or(area.left() + 1);
+                let right_bound = self
+                    .top_right
+                    .as_ref()
+                    .map(|s| {
+                        area.right()
+                            .saturating_sub(1)
+                            .saturating_sub(measured_segments_width(s))
+                    })
+                    .unwrap_or(area.right().saturating_sub(1));
+                if start_x > left_bound && start_x + total <= right_bound {
+                    let segs = write_segments_left(
+                        buf,
+                        start_x,
+                        title_y,
+                        s,
+                        title_style,
+                        bracket_style,
+                        right_bound,
+                    );
+                    decorate_bubble(buf, &segs, cap_y, floor_y, bracket_style);
+                }
             }
         }
         // Bottom: render starting one cell after the left corner on the bottom border.
@@ -408,6 +455,24 @@ mod tests {
         assert_eq!(buf[(7, 0)].symbol(), "╮");
         assert_eq!(buf[(1, 2)].symbol(), "╰");
         assert_eq!(buf[(7, 2)].symbol(), "╯");
+    }
+
+    #[test]
+    fn center_title_renders_in_the_header_middle() {
+        let panel = BoxedPanel::new(Color::Reset, Color::Reset)
+            .with_title("cpu")
+            .with_center_title("2026-05-04 12:34:56 utc")
+            .with_controls("- 250ms +");
+        let area = Rect::new(0, 0, 60, 6);
+        let mut buf = Buffer::empty(area);
+        (&panel).render(area, &mut buf);
+        let header: String = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().to_string())
+            .collect();
+        assert!(
+            header.contains("┤") && header.contains("2026-05-04 12:34:56 utc") && header.contains("├"),
+            "center bubble missing: {header}"
+        );
     }
 
     #[test]
