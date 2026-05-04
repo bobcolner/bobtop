@@ -50,6 +50,9 @@ pub struct OptionsState {
     /// Snapshot of the available theme names so cycling is just an index
     /// step rather than refetching the registry on every keystroke.
     pub themes: Vec<String>,
+    /// Theme name that was active when the overlay opened. Used to revert
+    /// the live-applied theme when the user cancels with Esc.
+    pub original_theme: String,
 }
 
 impl OptionsState {
@@ -135,6 +138,9 @@ impl ProcessDetail {
     /// Read the relevant /proc entries for `pid`. All errors are folded
     /// into placeholders inside the returned struct — the modal opens
     /// even when individual fields are unavailable (kthreads, perms).
+    /// All strings are scrubbed of control characters (especially the
+    /// tabs in /proc/[pid]/{status,io}) so the renderer can call
+    /// `set_char` on every byte without producing terminal artifacts.
     pub fn read(pid: u32, name: &str) -> Self {
         let base = format!("/proc/{pid}");
         let cmdline = std::fs::read(format!("{base}/cmdline"))
@@ -147,6 +153,7 @@ impl ProcessDetail {
                     .collect::<Vec<_>>()
                     .join(" ")
             })
+            .map(|s| sanitize_for_display(&s))
             .unwrap_or_else(|e| format!("(cmdline unavailable: {e})"));
 
         let status_lines = std::fs::read_to_string(format!("{base}/status"))
@@ -171,7 +178,7 @@ impl ProcessDetail {
                                 | "nonvoluntary_ctxt_switches"
                         )
                     })
-                    .map(|l| l.to_string())
+                    .map(sanitize_for_display)
                     .collect()
             })
             .unwrap_or_else(|e| vec![format!("(status unavailable: {e})")]);
@@ -181,7 +188,7 @@ impl ProcessDetail {
             .map_err(|e| e.to_string());
 
         let io_lines = std::fs::read_to_string(format!("{base}/io"))
-            .map(|s| s.lines().map(|l| l.to_string()).collect())
+            .map(|s| s.lines().map(sanitize_for_display).collect())
             .unwrap_or_else(|e| vec![format!("(io unavailable: {e})")]);
 
         Self {
@@ -192,6 +199,64 @@ impl ProcessDetail {
             fd_count,
             io_lines,
         }
+    }
+}
+
+/// Replace tabs with a single space and drop other ASCII control bytes.
+/// /proc files use literal tabs as key/value separators
+/// (e.g. `Name:\tbobtop`), and writing them straight into a terminal
+/// cell via `Cell::set_char('\t')` produces unpredictable cursor jumps
+/// or weird filler glyphs depending on the terminal — the source of
+/// the modal-render artifacts. Collapse runs of whitespace too so
+/// `Name:\t\tbobtop` doesn't render as a wide gap. Allows non-ASCII
+/// (UTF-8 in cmdline arguments survives intact).
+fn sanitize_for_display<S: AsRef<str>>(s: S) -> String {
+    let mut out = String::with_capacity(s.as_ref().len());
+    let mut prev_was_space = false;
+    for ch in s.as_ref().chars() {
+        let ch = match ch {
+            '\t' => ' ',
+            // Strip the rest of the C0 control range (NUL, BEL, BS, ESC, etc.)
+            // and DEL. These are the bytes that confuse terminals when set
+            // directly into a buffer cell.
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if ch == ' ' {
+            if prev_was_space {
+                continue;
+            }
+            prev_was_space = true;
+        } else {
+            prev_was_space = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_for_display;
+
+    #[test]
+    fn tabs_become_single_space() {
+        assert_eq!(sanitize_for_display("Name:\tbobtop"), "Name: bobtop");
+    }
+
+    #[test]
+    fn runs_of_whitespace_collapse() {
+        assert_eq!(sanitize_for_display("a\t\t  b"), "a b");
+    }
+
+    #[test]
+    fn other_controls_dropped() {
+        assert_eq!(sanitize_for_display("hi\x07\x1b\x00there"), "hithere");
+    }
+
+    #[test]
+    fn unicode_survives() {
+        assert_eq!(sanitize_for_display("café — utf"), "café — utf");
     }
 }
 
@@ -623,9 +688,10 @@ impl App {
     pub fn open_options(&mut self) {
         let themes: Vec<String> =
             bobtop_tui::builtin_names().map(|s| s.to_string()).collect();
+        let current_theme = self.theme.name.clone();
         self.options = Some(OptionsState {
             cursor: 0,
-            theme: self.theme.name.clone(),
+            theme: current_theme.clone(),
             tick_ms: self.tick_ms(),
             layout: match self.layout_preset {
                 LayoutPreset::Full => crate::cli::LayoutChoice::Full,
@@ -642,7 +708,29 @@ impl App {
             tty: self.tty_graphs,
             show_virtual_net: self.show_virtual_net,
             themes,
+            original_theme: current_theme,
         });
+    }
+
+    /// Apply the staged theme to the live App immediately, so the user
+    /// sees the colors change as they cycle through themes in the
+    /// options overlay. Other staged options stay snapshot-only — they
+    /// only take effect on Enter (save_options).
+    pub fn preview_theme(&mut self) {
+        let Some(opts) = &self.options else { return };
+        // Use load_theme so the search path + parse + name-tracking are
+        // handled in one place. Earlier code tried to call find_source +
+        // from_source manually and got the tuple destructure backwards
+        // (find_source returns (source, origin), not (name, source)),
+        // which assigned the raw source text to Theme.name.
+        self.theme = bobtop_tui::load_theme(&opts.theme);
+    }
+
+    /// Discard a pending options edit and restore the originally-active
+    /// theme. Called when the user dismisses the overlay with Esc.
+    pub fn cancel_options(&mut self) {
+        let Some(opts) = self.options.take() else { return };
+        self.theme = bobtop_tui::load_theme(&opts.original_theme);
     }
 
     /// Apply the staged options to the live App and persist to disk. The
@@ -655,11 +743,7 @@ impl App {
         // Live-apply the changes that mutate render state immediately so
         // the user sees the effect before we even disk-write. Theme,
         // corners, tick_ms, layout, tty_graphs, show_virtual_net.
-        if let Some(t) = bobtop_tui::theme::find_source(&opts.theme) {
-            self.theme = bobtop_tui::theme::Theme::from_source(t.0, &t.1);
-        } else {
-            self.theme = bobtop_tui::load_theme(&opts.theme);
-        }
+        self.theme = bobtop_tui::load_theme(&opts.theme);
         self.corner_style = opts.corners.into();
         self.tick_ms.store(opts.tick_ms, Ordering::Relaxed);
         self.set_layout(match opts.layout {
@@ -685,6 +769,7 @@ impl App {
             self.group_mode,
             &self.expanded,
             self.proc_sort,
+            self.proc_sort_descending,
         )
     }
 
@@ -768,7 +853,8 @@ impl App {
         if self.options.is_some() {
             match k.code {
                 KeyCode::Esc => {
-                    self.options = None;
+                    // Revert any live previews (currently just theme).
+                    self.cancel_options();
                     return ControlFlow::Continue;
                 }
                 KeyCode::Enter => {
@@ -793,14 +879,30 @@ impl App {
                     return ControlFlow::Continue;
                 }
                 KeyCode::Left => {
-                    if let Some(o) = self.options.as_mut() {
-                        o.cycle_field(-1);
+                    let on_theme = self
+                        .options
+                        .as_mut()
+                        .map(|o| {
+                            o.cycle_field(-1);
+                            o.cursor == 0
+                        })
+                        .unwrap_or(false);
+                    if on_theme {
+                        self.preview_theme();
                     }
                     return ControlFlow::Continue;
                 }
                 KeyCode::Right | KeyCode::Char(' ') => {
-                    if let Some(o) = self.options.as_mut() {
-                        o.cycle_field(1);
+                    let on_theme = self
+                        .options
+                        .as_mut()
+                        .map(|o| {
+                            o.cycle_field(1);
+                            o.cursor == 0
+                        })
+                        .unwrap_or(false);
+                    if on_theme {
+                        self.preview_theme();
                     }
                     return ControlFlow::Continue;
                 }
@@ -1284,6 +1386,35 @@ mod tests {
         app.handle_input(m);
         assert_eq!(app.proc_sort, ProcessSort::Mem);
         assert_eq!(app.layout_preset, LayoutPreset::Full); // not changed
+    }
+
+    #[test]
+    fn options_theme_cycle_live_previews_and_esc_reverts() {
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        let original = app.theme.name.clone();
+
+        // Open options. Cursor starts on theme (field 0).
+        let press = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        app.handle_input(press('O'));
+        assert!(app.options.is_some());
+        assert_eq!(app.options.as_ref().unwrap().cursor, 0);
+
+        // Press → to advance theme. Both the staged opts.theme and the
+        // live app.theme must change in lockstep.
+        let right = Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_input(right);
+        let after_cycle = app.theme.name.clone();
+        assert_ne!(
+            after_cycle, original,
+            "live theme should change when cycling theme field"
+        );
+        assert_eq!(app.options.as_ref().unwrap().theme, after_cycle);
+
+        // Esc closes the modal and reverts the theme.
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input(esc);
+        assert!(app.options.is_none());
+        assert_eq!(app.theme.name, original, "Esc should revert theme");
     }
 
     #[test]

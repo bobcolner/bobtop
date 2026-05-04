@@ -29,6 +29,10 @@ pub struct GroupHeader {
     pub key: String,
     pub label: String,
     pub proc_count: usize,
+    /// Sum of `ProcessInfo.threads` across the group. Surfaced in the
+    /// "Th" column of the header row so users can see "firefox.service:
+    /// 47 procs / 312 threads" at a glance.
+    pub threads_total: u32,
     pub cpu_fraction_total: f32,
     pub mem_rss_total: u64,
     pub net_rx_total: Option<f64>,
@@ -280,7 +284,7 @@ impl<'a> ProcessTable<'a> {
             String::new(),                                     // Pid (blank)
             String::new(),                                     // Program — overlaid below
             String::new(),                                     // User
-            String::new(),                                     // Th
+            h.threads_total.to_string(),                       // Th — sum across group
             format_bytes(h.mem_rss_total),                     // MEM
             format!("{:.1}", h.cpu_fraction_total * 100.0),   // CPU%
             opt_rate(h.net_rx_total),

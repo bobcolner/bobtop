@@ -66,6 +66,7 @@ pub fn build_display(
     mode: GroupMode,
     expanded: &HashSet<String>,
     sort: ProcessSort,
+    descending: bool,
 ) -> Vec<DisplayRow> {
     match mode {
         GroupMode::Flat => procs
@@ -79,8 +80,10 @@ pub fn build_display(
                 })
             })
             .collect(),
-        GroupMode::ByExecutable => build_grouped(procs, expanded, sort, |p| p.name.clone()),
-        GroupMode::ByCgroup => build_grouped(procs, expanded, sort, |p| {
+        GroupMode::ByExecutable => {
+            build_grouped(procs, expanded, sort, descending, |p| p.name.clone())
+        }
+        GroupMode::ByCgroup => build_grouped(procs, expanded, sort, descending, |p| {
             p.cgroup.clone().unwrap_or_else(|| "(no cgroup)".into())
         }),
         GroupMode::ByParent => build_tree(procs, expanded),
@@ -88,11 +91,17 @@ pub fn build_display(
 }
 
 /// Generic grouper: bucket by a key derived from each process, emit
-/// header rows sorted by aggregate, optionally expand to show children.
+/// header rows sorted by the aggregate matching the active sort key
+/// (so pressing `m` puts the heaviest-mem group on top, NetRx puts
+/// the chattiest cgroup on top, etc.), optionally expand to show
+/// children. Children inside an expanded group preserve the input
+/// order — `procs` is already sorted by the active key, so they're
+/// already correct.
 fn build_grouped<F>(
     procs: &[ProcessInfo],
     expanded: &HashSet<String>,
-    _sort: ProcessSort,
+    sort: ProcessSort,
+    descending: bool,
     key_fn: F,
 ) -> Vec<DisplayRow>
 where
@@ -109,6 +118,7 @@ where
             let proc_count = group.len();
             let cpu_total: f32 = group.iter().map(|p| p.cpu_fraction).sum();
             let mem_total: u64 = group.iter().map(|p| p.mem_rss_bytes).sum();
+            let threads_total: u32 = group.iter().map(|p| p.threads).sum();
             let net_rx: Vec<f64> =
                 group.iter().filter_map(|p| p.net_rx_bytes_per_sec).collect();
             let net_tx: Vec<f64> =
@@ -121,6 +131,7 @@ where
                 label: format!("{} ({})", key, proc_count),
                 key: key.clone(),
                 proc_count,
+                threads_total,
                 cpu_fraction_total: cpu_total,
                 mem_rss_total: mem_total,
                 net_rx_total: if net_rx.is_empty() { None } else { Some(net_rx.iter().sum()) },
@@ -133,14 +144,51 @@ where
         })
         .collect();
 
-    // Sort headers by total CPU descending — the most expensive group floats
-    // to the top. Ties broken by mem then proc_count for determinism.
+    // Sort headers by the aggregate matching the active sort key — so
+    // pressing `m` puts the heaviest cgroup on top, `NetRx` puts the
+    // chattiest exec name on top, etc. For per-row sort keys that don't
+    // aggregate (Pid, User), fall back to alphabetical key order. The
+    // `descending` direction follows the user's `r` toggle.
     headers.sort_by(|a, b| {
-        b.0.cpu_fraction_total
-            .partial_cmp(&a.0.cpu_fraction_total)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.mem_rss_total.cmp(&a.0.mem_rss_total))
-            .then_with(|| b.0.proc_count.cmp(&a.0.proc_count))
+        use std::cmp::Ordering;
+        let ord = match sort {
+            ProcessSort::Mem => a.0.mem_rss_total.cmp(&b.0.mem_rss_total),
+            ProcessSort::Threads => a.0.threads_total.cmp(&b.0.threads_total),
+            ProcessSort::NetRx => a
+                .0
+                .net_rx_total
+                .unwrap_or(0.0)
+                .partial_cmp(&b.0.net_rx_total.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::NetTx => a
+                .0
+                .net_tx_total
+                .unwrap_or(0.0)
+                .partial_cmp(&b.0.net_tx_total.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::DiskRead => a
+                .0
+                .disk_read_total
+                .unwrap_or(0.0)
+                .partial_cmp(&b.0.disk_read_total.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            ProcessSort::DiskWrite => a
+                .0
+                .disk_write_total
+                .unwrap_or(0.0)
+                .partial_cmp(&b.0.disk_write_total.unwrap_or(0.0))
+                .unwrap_or(Ordering::Equal),
+            // Per-row keys that don't aggregate cleanly: order by group
+            // key (the exec name or cgroup leaf) so listings are stable
+            // and discoverable.
+            ProcessSort::Pid | ProcessSort::Name | ProcessSort::User => a.0.key.cmp(&b.0.key),
+            ProcessSort::Cpu => a
+                .0
+                .cpu_fraction_total
+                .partial_cmp(&b.0.cpu_fraction_total)
+                .unwrap_or(Ordering::Equal),
+        };
+        if descending { ord.reverse() } else { ord }
     });
 
     let mut out = Vec::new();
@@ -282,7 +330,7 @@ mod tests {
     #[test]
     fn flat_mode_yields_one_row_per_process() {
         let ps = vec![p(1, None, "a", 0.0, 0, None), p(2, None, "b", 0.0, 0, None)];
-        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), ProcessSort::Cpu, true);
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], DisplayRow::Process(_)));
     }
@@ -294,7 +342,7 @@ mod tests {
             p(2, None, "chrome", 0.20, 200, None),
             p(3, None, "vim", 0.05, 50, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
         assert_eq!(rows.len(), 2, "two collapsed headers");
         // First header should be chrome (more total CPU).
         match &rows[0] {
@@ -309,6 +357,56 @@ mod tests {
     }
 
     #[test]
+    fn header_sort_follows_active_sort_key() {
+        // Two groups: "small" has 1 GB total mem but tiny CPU; "huge" has
+        // 100 MB total mem but lots of CPU. With sort by Mem (desc),
+        // "small" must come first; with sort by Cpu (desc), "huge" first.
+        let ps = vec![
+            p(1, None, "small", 0.01, 1024, None),
+            p(2, None, "huge", 0.50, 50, None),
+            p(3, None, "huge", 0.40, 50, None),
+        ];
+
+        let rows_by_mem =
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Mem, true);
+        match &rows_by_mem[0] {
+            DisplayRow::Header(h) => assert_eq!(h.key, "small", "Mem sort should put small first"),
+            _ => panic!("expected Header"),
+        }
+
+        let rows_by_cpu =
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
+        match &rows_by_cpu[0] {
+            DisplayRow::Header(h) => assert_eq!(h.key, "huge", "Cpu sort should put huge first"),
+            _ => panic!("expected Header"),
+        }
+
+        // Ascending direction reverses both.
+        let rows_by_mem_asc =
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Mem, false);
+        match &rows_by_mem_asc[0] {
+            DisplayRow::Header(h) => assert_eq!(h.key, "huge", "Mem asc should flip"),
+            _ => panic!("expected Header"),
+        }
+    }
+
+    #[test]
+    fn header_aggregates_threads_total() {
+        let mut ps = vec![
+            p(1, None, "chrome", 0.1, 100, None),
+            p(2, None, "chrome", 0.2, 200, None),
+        ];
+        ps[0].threads = 5;
+        ps[1].threads = 7;
+        let rows =
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), ProcessSort::Cpu, true);
+        match &rows[0] {
+            DisplayRow::Header(h) => assert_eq!(h.threads_total, 12),
+            _ => panic!("expected Header"),
+        }
+    }
+
+    #[test]
     fn by_executable_expands_only_listed_keys() {
         let ps = vec![
             p(1, None, "chrome", 0.10, 100, None),
@@ -317,7 +415,7 @@ mod tests {
         ];
         let mut expanded = HashSet::new();
         expanded.insert("chrome".to_string());
-        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, ProcessSort::Cpu, true);
         // chrome header + 2 children + vim header.
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[0], DisplayRow::Header(_)));
@@ -332,7 +430,7 @@ mod tests {
             p(1, None, "x", 0.0, 0, Some("firefox.service")),
             p(2, None, "y", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), ProcessSort::Cpu, true);
         let keys: Vec<_> = rows
             .iter()
             .filter_map(|r| match r {
@@ -353,7 +451,7 @@ mod tests {
             p(200, Some(1), "daemon", 0.0, 0, None),
             p(300, Some(100), "cmd", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), ProcessSort::Cpu, true);
         let depths: Vec<u8> = rows
             .iter()
             .filter_map(|r| match r {
@@ -373,7 +471,7 @@ mod tests {
         ];
         let mut collapsed = HashSet::new();
         collapsed.insert("100".to_string());
-        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, ProcessSort::Cpu);
+        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, ProcessSort::Cpu, true);
         // init + shell — cmd should be hidden under collapsed shell.
         assert_eq!(rows.len(), 2);
     }
