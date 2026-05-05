@@ -2,6 +2,7 @@ use bobtop_core::sample::FilesystemSample;
 use bobtop_tui::widgets::Meter;
 use bobtop_tui::widgets::panel as boxed_panel;
 use bobtop_tui::{format_bytes, format_rate};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 use ratatui::Frame;
@@ -20,11 +21,46 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let Some(disk) = &app.latest_disk else { return };
-    if disk.filesystems.is_empty() {
-        return;
-    }
+    // Reserve the last 2 rows for the swap meter when swap exists. Swap
+    // is conceptually backing-store, not RAM — it lives here so users
+    // see disk + swap as one panel and the memory panel has more room
+    // for PSI / breakdown.
+    let swap_h: u16 = if app
+        .latest_mem
+        .as_ref()
+        .map(|m| m.swap_total_bytes > 0)
+        .unwrap_or(false)
+        && inner.height >= 5
+    {
+        2
+    } else {
+        0
+    };
+    let mounts_h = inner.height.saturating_sub(swap_h);
+    let mounts_area = Rect::new(inner.x, inner.y, inner.width, mounts_h);
+    let swap_area = Rect::new(inner.x, inner.y + mounts_h, inner.width, swap_h);
 
+    let Some(disk) = &app.latest_disk else {
+        // Even with no disk sample yet, render swap if we have a memory sample.
+        if swap_h > 0 {
+            draw_swap_row(frame.buffer_mut(), swap_area, app);
+        }
+        return;
+    };
+    if !disk.filesystems.is_empty() {
+        draw_filesystems(frame, mounts_area, disk, app);
+    }
+    if swap_h > 0 {
+        draw_swap_row(frame.buffer_mut(), swap_area, app);
+    }
+}
+
+fn draw_filesystems(
+    frame: &mut Frame,
+    inner: Rect,
+    disk: &bobtop_core::sample::DiskSample,
+    app: &App,
+) {
     match app.track_chart_style {
         crate::app::TrackChartStyle::Bar => {
             let meters: Vec<Meter> = disk
@@ -79,6 +115,31 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
+}
+
+/// Render the swap meter inside the disk panel. Reads swap fields off
+/// `app.latest_mem` (swap is sampled by the memory collector since
+/// /proc/meminfo is the source of truth for SwapTotal/SwapFree).
+fn draw_swap_row(buf: &mut Buffer, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let Some(mem) = app.latest_mem.as_ref() else { return };
+    if mem.swap_total_bytes == 0 {
+        return;
+    }
+    let theme = &app.theme;
+    let frac = mem.swap_used_bytes as f64 / mem.swap_total_bytes as f64;
+    let value = format!(
+        "{} / {}",
+        format_bytes(mem.swap_used_bytes),
+        format_bytes(mem.swap_total_bytes)
+    );
+    let m = Meter::new("Swap:", value, frac)
+        .with_gradient(theme.used)
+        .with_meter_bg(theme.meter_bg)
+        .with_text_colors(theme.main_fg, theme.title);
+    m.render(area, buf);
 }
 
 fn build_disk_meter_used_only(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {

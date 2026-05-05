@@ -60,12 +60,18 @@ pub(super) fn memory_panel_title(app: &App) -> String {
 }
 
 pub(super) fn disk_panel_title(app: &App) -> String {
+    let has_swap = app
+        .latest_mem
+        .as_ref()
+        .map(|m| m.swap_total_bytes > 0)
+        .unwrap_or(false);
+    let label = if has_swap { "²disks + swap" } else { "²disks" };
     match app.latest_disk.as_ref() {
         Some(d) if !d.filesystems.is_empty() => {
             let total: u64 = d.filesystems.iter().map(|fs| fs.total_bytes).sum();
-            format!("²disks  {} total", format_bytes(total))
+            format!("{}  {} total", label, format_bytes(total))
         }
-        _ => "²disks".to_string(),
+        _ => label.to_string(),
     }
 }
 

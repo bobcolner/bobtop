@@ -1,5 +1,5 @@
 use bobtop_core::sample::MemorySample;
-use bobtop_tui::widgets::{BrailleGraph, GraphStyle, LegendStyle, Meter, StackedBar, StackedSegment};
+use bobtop_tui::widgets::{BrailleGraph, GraphStyle, LegendStyle, StackedBar, StackedSegment};
 use bobtop_tui::widgets::panel as boxed_panel;
 use bobtop_tui::{format_bytes, write_str_at};
 use ratatui::layout::Rect;
@@ -80,49 +80,51 @@ fn draw_memory_breakdown(frame: &mut Frame, area: Rect, s: &MemorySample, app: &
     let mut next_y = area.y + bar_h;
     let bottom = area.y + area.height;
 
-    if next_y + 1 < bottom && s.pressure.is_some() {
-        let p = s.pressure.unwrap_or_default();
-        let bar_segs = vec![StackedSegment::new(
-            "PSI",
-            (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0),
-            theme.temp.end,
-        )];
-        let pbar = StackedBar::new(&bar_segs)
-            .with_empty_bg(theme.meter_bg)
-            .with_chrome_fg(theme.main_fg);
-        let pbar_rect = Rect::new(area.x, next_y, area.width, 1);
-        (&pbar).render(pbar_rect, frame.buffer_mut());
-        next_y += 1;
+    // Pressure-Stall Information (PSI). Two rows when shown: a colored
+    // bar gauging current 10s avg + a numeric line for 10s/60s/300s.
+    // Falls back to a single line ("PSI: unavailable") when the kernel
+    // doesn't expose /proc/pressure/memory — better than silently empty
+    // space, which the user can't distinguish from "not yet sampled".
+    if next_y < bottom {
+        match s.pressure {
+            Some(p) => {
+                if next_y + 1 < bottom {
+                    let bar_segs = vec![StackedSegment::new(
+                        "PSI",
+                        (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0),
+                        theme.temp.end,
+                    )];
+                    let pbar = StackedBar::new(&bar_segs)
+                        .with_empty_bg(theme.meter_bg)
+                        .with_chrome_fg(theme.main_fg);
+                    let pbar_rect = Rect::new(area.x, next_y, area.width, 1);
+                    (&pbar).render(pbar_rect, frame.buffer_mut());
+                    next_y += 1;
 
-        let nums = format!(
-            "PSI  10s {:.1}%  60s {:.1}%  300s {:.1}%",
-            p.some_avg10, p.some_avg60, p.some_avg300
-        );
-        write_str_at(
-            frame.buffer_mut(),
-            area.x,
-            next_y,
-            &nums,
-            Style::default().fg(theme.inactive_fg),
-        );
-        next_y += 1;
+                    let nums = format!(
+                        "PSI  10s {:.1}%  60s {:.1}%  300s {:.1}%",
+                        p.some_avg10, p.some_avg60, p.some_avg300
+                    );
+                    write_str_at(
+                        frame.buffer_mut(),
+                        area.x,
+                        next_y,
+                        &nums,
+                        Style::default().fg(theme.inactive_fg),
+                    );
+                }
+            }
+            None => {
+                write_str_at(
+                    frame.buffer_mut(),
+                    area.x,
+                    next_y,
+                    "PSI  unavailable (kernel CONFIG_PSI=n or no /proc/pressure)",
+                    Style::default().fg(theme.inactive_fg),
+                );
+            }
+        }
     }
-
-    if next_y + 2 < bottom && s.swap_total_bytes > 0 {
-        let frac = s.swap_used_bytes as f64 / s.swap_total_bytes as f64;
-        let m = Meter::new(
-            "Swap:",
-            format!(
-                "{} / {}",
-                format_bytes(s.swap_used_bytes),
-                format_bytes(s.swap_total_bytes)
-            ),
-            frac,
-        )
-        .with_gradient(theme.used)
-        .with_meter_bg(theme.meter_bg)
-        .with_text_colors(theme.main_fg, theme.title);
-        let rest_h = bottom.saturating_sub(next_y);
-        m.render(Rect::new(area.x, next_y, area.width, rest_h), frame.buffer_mut());
-    }
+    // Swap moved to the disk panel — see ui/disk.rs::draw_swap_row.
+    let _ = bottom; // suppress unused-warning when only PSI block reads it
 }
