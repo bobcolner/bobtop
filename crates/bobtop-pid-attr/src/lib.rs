@@ -1,4 +1,4 @@
-//! Tiered per-process network attribution for bobtop.
+//! Tiered per-process kernel attribution for bobtop — network and disk I/O.
 //!
 //! Four backends, ordered by accuracy and privilege requirements:
 //!
@@ -21,6 +21,7 @@
 #![deny(unsafe_code)]
 
 pub mod attributor;
+pub mod disk_attributor;
 pub mod error;
 pub mod sample;
 pub mod tier;
@@ -28,6 +29,9 @@ pub mod unavailable;
 
 #[cfg(target_os = "linux")]
 pub mod proc_inode;
+
+#[cfg(target_os = "linux")]
+pub mod proc_io;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod proc_walk;
@@ -42,6 +46,7 @@ pub mod pcap_backend;
 pub mod ebpf;
 
 pub use attributor::NetworkAttributor;
+pub use disk_attributor::{DiskAttributor, DiskAttributorTier, ProcessDiskSample};
 pub use error::{NetError, Result};
 pub use sample::{
     AddrEndpoint, ConnectionInfo, ProcessNetSample, Protocol, SocketState,
@@ -128,4 +133,30 @@ pub fn select(opts: SelectOptions) -> Box<dyn NetworkAttributor> {
     );
     let _ = opts; // silence unused-warning when no tiers are compiled in
     Box::new(UnavailableAttributor::default())
+}
+
+/// Probe each disk-attribution backend in descending tier order. Returns
+/// the highest-tier backend that initializes successfully, or `None` when
+/// nothing is available (the daemon falls back to sysinfo's per-pid disk).
+///
+/// Honors the same `allow_ebpf` knob as the net selector — a single
+/// `--no-ebpf` flag disables eBPF for both subsystems.
+pub fn select_disk(opts: SelectOptions) -> Option<Box<dyn DiskAttributor>> {
+    // Tier 2 — eBPF disk probes (Linux only, feature-gated).
+    // The eBPF *disk* probes don't exist yet — placeholder for the
+    // upcoming commit that adds vfs_read/vfs_write kretprobes.
+    let _ = opts.allow_ebpf;
+
+    // Tier 1 — /proc/[pid]/io.
+    #[cfg(target_os = "linux")]
+    if proc_io::ProcDiskAttributor::available() {
+        tracing::info!(
+            tier = "proc_io",
+            "disk attribution: tier 1 (/proc/[pid]/io) selected"
+        );
+        return Some(Box::new(proc_io::ProcDiskAttributor::new()));
+    }
+
+    tracing::debug!("no disk attribution backend available — falling back to sysinfo");
+    None
 }

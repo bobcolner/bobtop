@@ -152,7 +152,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bobtop-core",
- "bobtop-net",
+ "bobtop-pid-attr",
  "libc",
  "nvml-wrapper",
  "sysinfo",
@@ -180,7 +180,7 @@ dependencies = [
  "async-trait",
  "bobtop-collectors",
  "bobtop-core",
- "bobtop-net",
+ "bobtop-pid-attr",
  "bobtop-tui",
  "clap",
  "criterion",
@@ -195,7 +195,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bobtop-net"
+name = "bobtop-pid-attr"
 version = "0.2.0"
 dependencies = [
  "anyhow",

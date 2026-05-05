@@ -23,7 +23,7 @@ use bobtop_core::sample::{
 use bobtop_core::MetricEvent;
 use bobtop_daemon::app::App;
 use bobtop_daemon::ui;
-use bobtop_net::{AttributorTier, ProcessNetSample};
+use bobtop_pid_attr::{AttributorTier, ProcessNetSample};
 use bobtop_tui::LayoutPreset;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ratatui::backend::TestBackend;

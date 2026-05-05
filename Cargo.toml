@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/bobtop-core",
     "crates/bobtop-collectors",
-    "crates/bobtop-net",
+    "crates/bobtop-pid-attr",
     "crates/bobtop-tui",
     "crates/bobtop-daemon",
 ]
@@ -20,7 +20,7 @@ authors = ["bobtop contributors"]
 # First-party crates (path-resolved within the workspace)
 bobtop-core = { path = "crates/bobtop-core" }
 bobtop-collectors = { path = "crates/bobtop-collectors" }
-bobtop-net = { path = "crates/bobtop-net" }
+bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
 bobtop-tui = { path = "crates/bobtop-tui" }
 
 # TUI rendering

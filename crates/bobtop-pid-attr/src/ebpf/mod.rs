@@ -5,7 +5,7 @@
 //! Two kprobes maintain a `BPF_MAP_TYPE_HASH` keyed by tgid (process pid)
 //! holding `(rx, tx)` byte counters. Userspace polls the map every sample
 //! interval and computes per-pid bytes-per-second from deltas. See the
-//! companion C source at `crates/bobtop-net/bpf/bobtop_net.bpf.c`.
+//! companion C source at `crates/bobtop-pid-attr/bpf/bobtop_net.bpf.c`.
 //!
 //! - `tcp_sendmsg(struct sock*, struct msghdr*, size_t size)` → `+= size` to TX
 //! - `tcp_cleanup_rbuf(struct sock*, int copied)` → `+= copied` to RX

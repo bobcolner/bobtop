@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 bobtop-core = { workspace = true }
 bobtop-collectors = { workspace = true }
-bobtop-net = { workspace = true }
+bobtop-pid-attr = { workspace = true }
 bobtop-tui = { workspace = true }
 
 tokio = { workspace = true }
@@ -41,10 +41,10 @@ name = "render_loop"
 harness = false
 
 [features]
-# eBPF on by default — build.rs in bobtop-net gracefully no-ops when
+# eBPF on by default — build.rs in bobtop-pid-attr gracefully no-ops when
 # clang/libbpf-dev aren't present, so the daemon still builds on bare-bones
 # systems; it just falls through to Tier 2/1 attribution at runtime.
 default = ["ebpf"]
-ebpf = ["bobtop-net/ebpf"]
-pcap = ["bobtop-net/pcap"]
+ebpf = ["bobtop-pid-attr/ebpf"]
+pcap = ["bobtop-pid-attr/pcap"]
 nvidia = ["bobtop-collectors/nvidia"]

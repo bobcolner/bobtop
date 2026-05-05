@@ -1,7 +1,7 @@
 //! Data table — sortable row list for dense, structured tabular data.
 //!
 //! Columns: PID, Program, User, Threads, MEM (RSS), CPU%. Optional NET RX /
-//! NET TX columns appear when the active [`bobtop_net::AttributorTier`]
+//! NET TX columns appear when the active [`bobtop_pid_attr::AttributorTier`]
 //! provides per-process bandwidth (Tiers 2 and 3).
 //!
 //! Selection state is owned by the caller — pass `selected: Some(idx)` and

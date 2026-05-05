@@ -1,6 +1,6 @@
 [package]
-name = "bobtop-net"
-description = "Tiered per-process network attribution for bobtop (proc inode, libpcap, eBPF)"
+name = "bobtop-pid-attr"
+description = "Tiered per-process kernel attribution for bobtop — network and disk I/O via eBPF / libpcap / /proc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

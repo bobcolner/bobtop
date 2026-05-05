@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 bobtop-core = { workspace = true }
-bobtop-net = { workspace = true }
+bobtop-pid-attr = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }

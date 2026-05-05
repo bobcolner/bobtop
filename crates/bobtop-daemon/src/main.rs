@@ -15,7 +15,9 @@ use tokio::sync::broadcast;
 
 use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
-use bobtop_net::{select as select_attributor, NetworkAttributor, SelectOptions};
+use bobtop_pid_attr::{
+    select as select_attributor, select_disk, DiskAttributor, NetworkAttributor, SelectOptions,
+};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
 
 use bobtop_daemon::app::App;
@@ -60,6 +62,22 @@ async fn main() -> Result<()> {
         allow_pcap: !eff.no_pcap,
     }));
     let net_tier = attributor.tier();
+
+    // Disk attribution — independent tier ladder. Honors the same --no-ebpf
+    // flag (a single CLI knob disables eBPF for both subsystems). Returns
+    // None when nothing better than sysinfo's own /proc/[pid]/io read is
+    // available; in that case the existing process collector's disk fields
+    // remain the source of truth.
+    let disk_attributor: Option<Arc<dyn DiskAttributor>> = select_disk(SelectOptions {
+        allow_ebpf: !eff.no_ebpf,
+        allow_pcap: !eff.no_pcap,
+    })
+    .map(Arc::from);
+    let disk_tier = disk_attributor
+        .as_ref()
+        .map(|a| a.tier())
+        .unwrap_or(bobtop_pid_attr::DiskAttributorTier::Unavailable);
+
     // Self-diagnosing startup line — always logged at warn so users see it
     // even at default RUST_LOG. Helps explain why per-pid net columns are
     // empty without requiring `RUST_LOG=info`.
@@ -67,6 +85,7 @@ async fn main() -> Result<()> {
         compiled_features = features_str(),
         selected_tier = net_tier.name(),
         per_pid_bandwidth = net_tier.has_bandwidth(),
+        disk_tier = disk_tier.name(),
         "bobtop start"
     );
 
@@ -80,6 +99,7 @@ async fn main() -> Result<()> {
         eff.show_virtual_net,
     );
     app.net_tier = net_tier;
+    app.disk_tier = disk_tier;
     app.corner_style = eff.corners.into();
     app.theme_background = eff.theme_background;
     app.truecolor = eff.truecolor;
@@ -119,6 +139,9 @@ async fn main() -> Result<()> {
         Arc::clone(&tick_ms),
         boxes.clone(),
     );
+    if let Some(da) = disk_attributor.as_ref().map(Arc::clone) {
+        spawn_disk_attributor_loop(da, Arc::clone(&app), Arc::clone(&tick_ms), boxes.clone());
+    }
 
     // Input thread (blocking crossterm reads).
     let input_rx = tui::spawn_input_thread();
@@ -320,6 +343,35 @@ fn spawn_attributor_loop(
                     g.apply_net(samples, tier);
                 }
                 Err(e) => tracing::warn!(error = %e, "net attributor sample failed"),
+            }
+        }
+    });
+}
+
+/// Independent loop for per-pid disk attribution. Same cadence + box-gating
+/// rules as the net loop. Lives in its own task so net and disk samples
+/// don't queue behind each other when one tier is slow.
+fn spawn_disk_attributor_loop(
+    attr: Arc<dyn DiskAttributor>,
+    app: Arc<Mutex<App>>,
+    tick_ms: Arc<AtomicU64>,
+    boxes: BoxesEnabled,
+) {
+    tokio::spawn(async move {
+        let tier = attr.tier();
+        loop {
+            let dur =
+                Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(250));
+            tokio::time::sleep(dur).await;
+            if !boxes.is_enabled(Box::Process) {
+                continue;
+            }
+            match attr.sample().await {
+                Ok(samples) => {
+                    let mut g = app.lock().unwrap_or_else(|p| p.into_inner());
+                    g.apply_disk(samples, tier);
+                }
+                Err(e) => tracing::warn!(error = %e, "disk attributor sample failed"),
             }
         }
     });

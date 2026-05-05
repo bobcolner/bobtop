@@ -15,7 +15,9 @@ use bobtop_core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
 };
 use bobtop_core::{BoxesEnabled, MetricEvent};
-use bobtop_net::{AttributorTier, ProcessNetSample};
+use bobtop_pid_attr::{
+    AttributorTier, DiskAttributorTier, ProcessDiskSample, ProcessNetSample,
+};
 use bobtop_tui::widgets::{CornerStyle, ProcessTableSort as TableSort};
 use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -383,6 +385,12 @@ pub struct App {
     pub iface_history: std::collections::HashMap<String, VecDeque<(f64, f64)>>,
     pub net_samples: Vec<ProcessNetSample>,
     pub net_tier: AttributorTier,
+    /// Per-pid disk-IO samples from the active disk attributor (Tier 1+).
+    /// When non-empty AND the rate is `Some`, these override the sysinfo
+    /// values that the process collector populates. When empty (no tier
+    /// available, or first sample after init) the sysinfo values stand.
+    pub disk_samples: Vec<ProcessDiskSample>,
+    pub disk_tier: DiskAttributorTier,
 
     /// Sorted-by-CPU process list, ready to render.
     pub processes_sorted: Vec<ProcessInfo>,
@@ -448,6 +456,8 @@ impl App {
             iface_history: std::collections::HashMap::new(),
             net_samples: Vec::new(),
             net_tier: AttributorTier::Unavailable,
+            disk_samples: Vec::new(),
+            disk_tier: DiskAttributorTier::Unavailable,
             processes_sorted: Vec::new(),
             selected_proc: 0,
             selected_proc_pid: None,
@@ -618,6 +628,18 @@ impl App {
         self.ui.dirty = true;
     }
 
+    /// Replace the per-pid disk attribution snapshot. When the active tier
+    /// reports rates (proc_io, ebpf), `rebuild_sorted` will join them into
+    /// `ProcessInfo.disk_*` fields, overriding the sysinfo values from the
+    /// process collector. Pids missing from the snapshot keep their sysinfo
+    /// values (graceful fallback during the first-sample warmup).
+    pub fn apply_disk(&mut self, samples: Vec<ProcessDiskSample>, tier: DiskAttributorTier) {
+        self.disk_samples = samples;
+        self.disk_tier = tier;
+        self.rebuild_sorted();
+        self.ui.dirty = true;
+    }
+
     /// Rebuild `processes_sorted` from `latest_processes`, joining in
     /// per-pid net samples (so sorting by NetRx/NetTx works against real
     /// values rather than `None`s). Always called when either a Process
@@ -631,6 +653,13 @@ impl App {
         let net_idx: HashMap<u32, &ProcessNetSample> =
             self.net_samples.iter().map(|s| (s.pid, s)).collect();
         let has_bw = self.net_tier.has_bandwidth();
+        // Per-pid disk attribution overrides the sysinfo-derived rates the
+        // process collector populated. We only override when the attributor
+        // has a *real* rate for the pid (Some, not None) — otherwise the
+        // sysinfo value stands (graceful fallback for first-sample warmup
+        // and pids the attributor hasn't seen yet).
+        let disk_idx: HashMap<u32, &ProcessDiskSample> =
+            self.disk_samples.iter().map(|s| (s.pid, s)).collect();
         for p in joined.iter_mut() {
             if let Some(n) = net_idx.get(&p.pid) {
                 p.net_rx_bytes_per_sec = n.rx_bytes_per_sec;
@@ -638,6 +667,14 @@ impl App {
             } else if has_bw {
                 p.net_rx_bytes_per_sec = Some(0.0);
                 p.net_tx_bytes_per_sec = Some(0.0);
+            }
+            if let Some(d) = disk_idx.get(&p.pid) {
+                if let Some(r) = d.read_bytes_per_sec {
+                    p.disk_read_bytes_per_sec = Some(r);
+                }
+                if let Some(w) = d.write_bytes_per_sec {
+                    p.disk_write_bytes_per_sec = Some(w);
+                }
             }
         }
         // Apply text filter (B3b) if any. Match name OR cmdline,

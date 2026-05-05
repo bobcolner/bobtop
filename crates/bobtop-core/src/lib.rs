@@ -1,6 +1,6 @@
 //! Shared types and traits for the bobtop system monitor.
 //!
-//! Crates downstream of this one (`bobtop-collectors`, `bobtop-net`,
+//! Crates downstream of this one (`bobtop-collectors`, `bobtop-pid-attr`,
 //! `bobtop-tui`, `bobtop-daemon`) all build on the abstractions defined here:
 //!
 //! - [`Collector`] — the async data-source trait every subsystem implements.
