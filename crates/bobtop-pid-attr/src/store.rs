@@ -61,7 +61,14 @@ impl AttributionStore {
 
     /// Replace the net snapshot. Called by the network attributor loop.
     pub fn set_net(&self, samples: Vec<ProcessNetSample>, tier: AttributorTier) {
-        let mut g = self.inner.write().expect("attribution store poisoned");
+        // Recover from a poisoned lock instead of propagating panic.
+        // A poisoned lock means a previous writer panicked mid-write,
+        // not that the data is corrupt — clearing the maps fully on
+        // every set is safe regardless.
+        let mut g = self
+            .inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         g.net.clear();
         g.net.reserve(samples.len());
         for s in &samples {
@@ -78,7 +85,10 @@ impl AttributionStore {
 
     /// Replace the disk snapshot. Called by the disk attributor loop.
     pub fn set_disk(&self, samples: Vec<ProcessDiskSample>, tier: DiskAttributorTier) {
-        let mut g = self.inner.write().expect("attribution store poisoned");
+        let mut g = self
+            .inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         g.disk.clear();
         g.disk.reserve(samples.len());
         for s in &samples {
@@ -95,7 +105,10 @@ impl AttributionStore {
 
     /// One-shot read snapshot via the closure. Avoids exposing the lock.
     pub fn read<R>(&self, f: impl FnOnce(&AttributionState) -> R) -> R {
-        let g = self.inner.read().expect("attribution store poisoned");
+        let g = self
+            .inner
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         f(&g)
     }
 

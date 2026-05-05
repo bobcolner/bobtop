@@ -302,17 +302,20 @@ impl History {
                 let snap = store.latest();
                 let host = snap_to_host_metrics(&snap);
                 let procs = snap_to_top_procs(&snap);
-                if let Ok(mut g) = writer_inner.write() {
-                    g.push(host, procs);
-                }
+                let mut g = writer_inner
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner());
+                g.push(host, procs);
             }
         });
         Self { inner }
     }
 
     /// One-shot read snapshot via the closure. Avoids exposing the lock.
+    /// Recovers from a poisoned lock — a poisoned read means a previous
+    /// reader/writer panicked, not that the ring is corrupt.
     pub fn read<R>(&self, f: impl FnOnce(&HistoryRing) -> R) -> R {
-        let g = self.inner.read().expect("history lock poisoned");
+        let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
         f(&g)
     }
 }

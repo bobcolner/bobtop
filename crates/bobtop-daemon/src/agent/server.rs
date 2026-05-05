@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bobtop_core::{History, SampleStore};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::query::{
@@ -147,6 +147,17 @@ async fn run_accept_loop(
     }
 }
 
+/// Max bytes accepted in a single request line. Defends against a
+/// malformed or hostile peer streaming an unbounded line and OOM'ing
+/// the daemon. Real requests are <1 KB; 64 KB is generous headroom.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Drop connections that have been silent for this long. The typical
+/// request-response cycle is sub-millisecond, so a 5-minute idle is
+/// already extreme — anything beyond is almost certainly a forgotten
+/// client holding a tokio task hostage.
+const CONNECTION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 async fn handle_connection(
     stream: UnixStream,
     store: SampleStore,
@@ -154,14 +165,44 @@ async fn handle_connection(
     last_activity: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    // Cap the buffered reader's read budget per `read_line` call so a
+    // peer can't trickle bytes forever without a newline.
+    let mut reader = BufReader::with_capacity(8 * 1024, reader).take(MAX_REQUEST_BYTES as u64);
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        // Per-line read with idle timeout. EOF (n == 0) and timeout
+        // both shut the connection cleanly.
+        let n = match tokio::time::timeout(
+            CONNECTION_IDLE_TIMEOUT,
+            reader.read_line(&mut line),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => return Ok(()), // idle timeout
+        };
         if n == 0 {
             return Ok(()); // peer closed
         }
+        if line.len() >= MAX_REQUEST_BYTES && !line.ends_with('\n') {
+            // Hit the size cap mid-line; reject this request and drop
+            // the connection — keeping it open after a half-read line
+            // would desync subsequent requests.
+            let err = serde_json::to_string(&ErrorResponse::new(
+                "bad_query",
+                format!("request exceeds {MAX_REQUEST_BYTES} bytes"),
+            ))
+            .unwrap_or_default();
+            let _ = writer.write_all(err.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+            return Ok(());
+        }
+        // After each successful line, refill the take() budget so the
+        // connection stays usable for the next request.
+        reader.set_limit(MAX_REQUEST_BYTES as u64);
         last_activity.store(now_unix(), Ordering::Relaxed);
         let response = dispatch(line.trim(), &store, &history);
         writer.write_all(response.as_bytes()).await?;
@@ -591,5 +632,196 @@ mod tests {
             &history,
         );
         assert!(r.contains("\"code\":\"unknown_metric\""));
+    }
+
+    /// Test helper: store seeded with a small process list.
+    fn store_with_processes() -> (DataBus, SampleStore, History) {
+        use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
+        let bus = DataBus::default();
+        let store = SampleStore::spawn(&bus);
+        let history = History::spawn(store.clone());
+        let mk = |pid, name: &str, cpu: f32, mem: u64| ProcessInfo {
+            pid,
+            parent_pid: None,
+            name: name.into(),
+            cmdline: format!("{name} arg"),
+            user: "u".into(),
+            state: ProcessState::Sleeping,
+            cpu_fraction: cpu,
+            mem_rss_bytes: mem,
+            mem_vsz_bytes: mem,
+            threads: 1,
+            net_rx_bytes_per_sec: None,
+            net_tx_bytes_per_sec: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
+            cgroup: None,
+        };
+        bus.publish(ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                mk(101, "node", 0.5, 1024),
+                mk(102, "node", 0.2, 512),
+                mk(103, "redis", 0.1, 256),
+            ],
+        });
+        (bus, store, history)
+    }
+
+    async fn wait_for_processes(store: &SampleStore) {
+        // Bus → SampleStore is async; poll briefly until the publish lands.
+        for _ in 0..20 {
+            if store.latest().processes.is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("ProcessSample never folded into SampleStore");
+    }
+
+    #[tokio::test]
+    async fn top_cgroup_dispatches_with_no_cgroup_bucket() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(
+            r#"{"q":"top","by":"cpu","group":"cgroup"}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"group\":\"cgroup\""));
+        // None of the processes had a cgroup; they all land in (no cgroup).
+        assert!(r.contains("(no cgroup)"));
+    }
+
+    #[tokio::test]
+    async fn top_tree_dispatches() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(
+            r#"{"q":"top","by":"cpu","group":"tree"}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"group\":\"tree\""));
+        assert!(r.contains("\"kind\":\"tree\""));
+    }
+
+    #[tokio::test]
+    async fn summary_match_returns_aggregate() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(r#"{"q":"summary","match":"node"}"#, &store, &history);
+        assert!(r.contains("\"scope\":\"match\""));
+        // Two `node` pids → 1024 + 512 = 1536 bytes RSS.
+        assert!(r.contains("\"mem_used_bytes\":1536"));
+        assert!(r.contains("\"pid_count\":2"));
+    }
+
+    #[tokio::test]
+    async fn summary_pid_returns_drilldown() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(r#"{"q":"summary","pid":101}"#, &store, &history);
+        assert!(r.contains("\"scope\":\"pid\""));
+        assert!(r.contains("\"matched\":\"node\""));
+    }
+
+    #[tokio::test]
+    async fn summary_pid_not_found_errors() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(r#"{"q":"summary","pid":999999}"#, &store, &history);
+        assert!(r.contains("\"code\":\"pid_not_found\""));
+    }
+
+    #[tokio::test]
+    async fn pid_inspect_by_pid_returns_full_detail() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(r#"{"q":"pid_inspect","pid":103}"#, &store, &history);
+        assert!(r.contains("\"pid\":103"));
+        assert!(r.contains("\"name\":\"redis\""));
+        assert!(r.contains("\"mem_rss_bytes\":256"));
+    }
+
+    #[tokio::test]
+    async fn pid_inspect_match_resolves_uniquely() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(
+            r#"{"q":"pid_inspect","match":"redis"}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"pid\":103"));
+    }
+
+    #[tokio::test]
+    async fn pid_inspect_match_ambiguous_errors() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        // "node" matches two pids → bad_query with count.
+        let r = dispatch(
+            r#"{"q":"pid_inspect","match":"node"}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"code\":\"bad_query\""));
+        assert!(r.contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn responsible_for_requires_metric_and_at() {
+        let bus = DataBus::default();
+        let store = SampleStore::spawn(&bus);
+        let history = History::spawn(store.clone());
+        let r = dispatch(r#"{"q":"responsible_for"}"#, &store, &history);
+        assert!(r.contains("\"code\":\"bad_query\""));
+        let r = dispatch(
+            r#"{"q":"responsible_for","metric":"cpu"}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"code\":\"bad_query\""));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected() {
+        // End-to-end via a Unix socket pair so we exercise the real
+        // `handle_connection` path (size cap + connection drop).
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (a, b) = tokio::net::UnixStream::pair().expect("pair");
+        let bus = DataBus::default();
+        let store = SampleStore::spawn(&bus);
+        let history = History::spawn(store.clone());
+        let activity = Arc::new(AtomicU64::new(now_unix()));
+        let server_task = tokio::spawn(handle_connection(b, store, history, activity));
+        // Stream more than MAX_REQUEST_BYTES without a newline.
+        let big = vec![b'x'; MAX_REQUEST_BYTES + 1024];
+        let mut a = a;
+        let _ = a.write_all(&big).await;
+        // Server should respond with a bad_query error then close.
+        let mut buf = Vec::new();
+        let _ = a.read_to_end(&mut buf).await;
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(
+            resp.contains("\"code\":\"bad_query\""),
+            "expected bad_query, got: {resp}"
+        );
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn responsible_for_returns_window_unavailable_when_empty() {
+        let bus = DataBus::default();
+        let store = SampleStore::spawn(&bus);
+        let history = History::spawn(store.clone());
+        let r = dispatch(
+            r#"{"q":"responsible_for","metric":"cpu","at":"5s"}"#,
+            &store,
+            &history,
+        );
+        // No history samples yet → window_unavailable.
+        assert!(r.contains("\"code\":\"window_unavailable\""));
     }
 }
