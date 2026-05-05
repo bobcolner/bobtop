@@ -1,24 +1,15 @@
 //! bobtop daemon — wires CLI parsing, capability detection, collector spawn,
 //! TUI render loop, and signal handling.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::Result;
-use bobtop_collectors::{
-    CpuCollector, DiskCollector, MemoryCollector, NetworkGlobalCollector, ProcessCollector,
-};
-use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, History, MetricEvent, SampleStore};
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
-use tokio::sync::broadcast;
 
 use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
-use bobtop_pid_attr::{
-    select as select_attributor, select_disk, AttributionStore, DiskAttributor,
-    NetworkAttributor, SelectOptions,
-};
+use bobtop_daemon::engine::{Engine, EngineConfig};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
 
 use bobtop_daemon::app::App;
@@ -67,53 +58,9 @@ async fn main() -> Result<()> {
         LayoutChoice::Minimal => LayoutPreset::Minimal,
     };
 
-    // Capability detection — pick the highest-tier network attributor available.
-    let attributor: Arc<dyn NetworkAttributor> = Arc::from(select_attributor(SelectOptions {
-        allow_ebpf: !eff.no_ebpf,
-        allow_pcap: !eff.no_pcap,
-    }));
-    let net_tier = attributor.tier();
-
-    // Disk attribution — independent tier ladder. Honors the same --no-ebpf
-    // flag (a single CLI knob disables eBPF for both subsystems). Returns
-    // None when nothing better than sysinfo's own /proc/[pid]/io read is
-    // available; in that case the existing process collector's disk fields
-    // remain the source of truth.
-    let disk_attributor: Option<Arc<dyn DiskAttributor>> = select_disk(SelectOptions {
-        allow_ebpf: !eff.no_ebpf,
-        allow_pcap: !eff.no_pcap,
-    })
-    .map(Arc::from);
-    let disk_tier = disk_attributor
-        .as_ref()
-        .map(|a| a.tier())
-        .unwrap_or(bobtop_pid_attr::DiskAttributorTier::Unavailable);
-
-    // Self-diagnosing startup line — always logged at warn so users see it
-    // even at default RUST_LOG. Helps explain why per-pid net columns are
-    // empty without requiring `RUST_LOG=info`.
-    tracing::warn!(
-        compiled_features = features_str(),
-        selected_tier = net_tier.name(),
-        per_pid_bandwidth = net_tier.has_bandwidth(),
-        disk_tier = disk_tier.name(),
-        "bobtop start"
-    );
-
-    let bus = DataBus::default();
-    // Latest-value aggregator — parallel subscriber to the bus. The TUI
-    // continues to read its own subscription; this exists so the agent
-    // socket can answer ad-hoc queries without going through `App`.
-    let sample_store = SampleStore::spawn(&bus);
-    // Bounded retrospective ring (≈200 KB max). Tracks host-level metrics
-    // and per-pid top-N at three resolution tiers; powers future `peak` /
-    // `responsible_for` queries.
-    let history = History::spawn(sample_store.clone());
-    // Agent query socket. Listener failure (e.g. permission denied on
-    // /tmp) is non-fatal — the TUI keeps running without the agent surface.
-    let agent_socket_path =
-        bobtop_daemon::agent::spawn(sample_store.clone(), history.clone());
-    let _ = history;
+    // Build `App` first so we can take its `boxes` handle (the TUI mutates
+    // panel visibility there; the engine reads it every tick). The engine
+    // then owns every sampling task; the TUI subscribes to its bus.
     let tick_ms = Arc::new(AtomicU64::new(eff.tick_ms_clamped()));
     let mut app = App::new(
         theme,
@@ -122,63 +69,42 @@ async fn main() -> Result<()> {
         eff.tty,
         eff.show_virtual_net,
     );
-    app.net_tier = net_tier;
-    app.disk_tier = disk_tier;
     app.corner_style = eff.corners.into();
     app.theme_background = eff.theme_background;
     app.truecolor = eff.truecolor;
     app.apply_color_options();
     let boxes = app.boxes.clone();
+
+    // Spawn the entire sampling stack: bus, store, history, attribution,
+    // tick driver, five collectors, two attributor loops.
+    let (engine, meta) = Engine::start(EngineConfig {
+        tick_ms: Arc::clone(&tick_ms),
+        boxes: boxes.clone(),
+        allow_ebpf: !eff.no_ebpf,
+        allow_pcap: !eff.no_pcap,
+    });
+
+    app.net_tier = meta.net_tier;
+    app.disk_tier = meta.disk_tier;
     let app = Arc::new(Mutex::new(app));
 
-    // Single tick driver fans out to every collector via a broadcast
-    // channel. One sleep instead of five — collectors all wake on the same
-    // boundary, eliminating the alignment-window CPU spikes that
-    // independent timers produce. Live `+`/`-` adjustments are picked up
-    // by the driver on the *next* iteration, just like before.
-    let (tick_tx, _) = broadcast::channel::<()>(4);
-    spawn_tick_driver(tick_tx.clone(), Arc::clone(&tick_ms));
-
-    // Single source of truth for per-pid net/disk attribution. The
-    // attributor sampler tasks write into it; the process collector reads
-    // from it and joins per-pid rates into each `ProcessInfo` before
-    // publishing on the bus. Replaces the prior path that mutated `App`
-    // directly via apply_net / apply_disk.
-    let attribution_store = AttributionStore::new();
-
-    // Collectors consult `boxes` and skip the actual `collect()` call when
-    // their panel is hidden, which keeps idle CPU low under narrow layouts
-    // (matches btop's preset model).
-    let cpu = Arc::new(CpuCollector::new());
-    let mem = Arc::new(MemoryCollector::new());
-    let proc = Arc::new(ProcessCollector::new().with_attribution(attribution_store.clone()));
-    let net = Arc::new(NetworkGlobalCollector::new());
-    let disk = Arc::new(DiskCollector::new());
-    spawn_collector(cpu, Box::Cpu, bus.clone(), tick_tx.subscribe(), boxes.clone());
-    spawn_collector(mem, Box::Memory, bus.clone(), tick_tx.subscribe(), boxes.clone());
-    spawn_collector(proc, Box::Process, bus.clone(), tick_tx.subscribe(), boxes.clone());
-    spawn_collector(net, Box::Network, bus.clone(), tick_tx.subscribe(), boxes.clone());
-    spawn_collector(disk, Box::Disk, bus.clone(), tick_tx.subscribe(), boxes.clone());
-
-    // Per-pid attribution samplers — separate cadence (≥250ms) because
-    // each tier has different cost. Gated on the PROC box: when the
-    // process panel is hidden the eBPF/pcap drain parks, just like
-    // before. The samplers now publish into `attribution_store`; the
-    // process collector picks the data up on its next tick.
-    spawn_attributor_loop(
-        Arc::clone(&attributor),
-        attribution_store.clone(),
-        Arc::clone(&tick_ms),
-        boxes.clone(),
+    // Self-diagnosing startup line — always logged at warn so users see it
+    // even at default RUST_LOG. Helps explain why per-pid net columns are
+    // empty without requiring `RUST_LOG=info`.
+    tracing::warn!(
+        compiled_features = features_str(),
+        selected_tier = meta.net_tier.name(),
+        per_pid_bandwidth = meta.net_tier.has_bandwidth(),
+        disk_tier = meta.disk_tier.name(),
+        "bobtop start"
     );
-    if let Some(da) = disk_attributor.as_ref().map(Arc::clone) {
-        spawn_disk_attributor_loop(
-            da,
-            attribution_store.clone(),
-            Arc::clone(&tick_ms),
-            boxes.clone(),
-        );
-    }
+
+    // Agent query socket. Listener failure (e.g. permission denied on
+    // /tmp) is non-fatal — the TUI keeps running without the agent surface.
+    let agent_socket_path = bobtop_daemon::agent::spawn(
+        engine.store.clone(),
+        engine.history.clone(),
+    );
 
     if cli.daemon {
         // Headless mode: the engine + agent socket are already running.
@@ -201,7 +127,7 @@ async fn main() -> Result<()> {
 
     // Terminal lifecycle. Always restore on exit, even on error.
     let mut term = tui::init_terminal()?;
-    let result = tui::run(&mut term, app, bus, input_rx).await;
+    let result = tui::run(&mut term, app, engine.bus.clone(), input_rx).await;
     tui::restore_terminal(&mut term)?;
 
     result.map_err(Into::into)
@@ -347,104 +273,3 @@ fn init_tracing() {
         .try_init();
 }
 
-fn spawn_tick_driver(tx: broadcast::Sender<()>, tick_ms: Arc<AtomicU64>) {
-    tokio::spawn(async move {
-        loop {
-            let dur = Duration::from_millis(tick_ms.load(Ordering::Relaxed));
-            tokio::time::sleep(dur).await;
-            // No subscribers (e.g. all collectors panicked) — keep ticking
-            // anyway so a new subscriber would still get fresh ticks.
-            let _ = tx.send(());
-        }
-    });
-}
-
-fn spawn_collector<C>(
-    collector: Arc<C>,
-    box_kind: Box,
-    bus: DataBus,
-    mut tick_rx: broadcast::Receiver<()>,
-    boxes: BoxesEnabled,
-) where
-    C: Collector + 'static,
-    C::Sample: Into<MetricEvent>,
-{
-    let name = collector.name();
-    tokio::spawn(async move {
-        loop {
-            match tick_rx.recv().await {
-                Ok(()) => {}
-                // Channel lag (a slow collector missed ticks): treat as a
-                // single wake — we don't want to back-fill skipped samples.
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => return,
-            }
-            // Skip collect entirely when the panel is hidden. The wake
-            // still happens so we resume promptly when re-enabled.
-            if !boxes.is_enabled(box_kind) {
-                continue;
-            }
-            match collector.collect().await {
-                Ok(s) => {
-                    bus.publish(s);
-                }
-                Err(e) => {
-                    tracing::warn!(collector = name, error = %e, "collect failed");
-                }
-            }
-        }
-    });
-}
-
-fn spawn_attributor_loop(
-    attr: Arc<dyn NetworkAttributor>,
-    store: AttributionStore,
-    tick_ms: Arc<AtomicU64>,
-    boxes: BoxesEnabled,
-) {
-    tokio::spawn(async move {
-        let tier = attr.tier();
-        loop {
-            // Attributor sampling is heavier than /proc parsing, so floor it
-            // at 250ms even when the global tick is faster.
-            let dur =
-                Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(250));
-            tokio::time::sleep(dur).await;
-            // Per-pid net is consumed only by the process table — when PROC
-            // is hidden we have nowhere to render it, so skip the sample.
-            if !boxes.is_enabled(Box::Process) {
-                continue;
-            }
-            match attr.sample().await {
-                Ok(samples) => store.set_net(samples, tier),
-                Err(e) => tracing::warn!(error = %e, "net attributor sample failed"),
-            }
-        }
-    });
-}
-
-/// Independent loop for per-pid disk attribution. Same cadence + box-gating
-/// rules as the net loop. Lives in its own task so net and disk samples
-/// don't queue behind each other when one tier is slow.
-fn spawn_disk_attributor_loop(
-    attr: Arc<dyn DiskAttributor>,
-    store: AttributionStore,
-    tick_ms: Arc<AtomicU64>,
-    boxes: BoxesEnabled,
-) {
-    tokio::spawn(async move {
-        let tier = attr.tier();
-        loop {
-            let dur =
-                Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(250));
-            tokio::time::sleep(dur).await;
-            if !boxes.is_enabled(Box::Process) {
-                continue;
-            }
-            match attr.sample().await {
-                Ok(samples) => store.set_disk(samples, tier),
-                Err(e) => tracing::warn!(error = %e, "disk attributor sample failed"),
-            }
-        }
-    });
-}
