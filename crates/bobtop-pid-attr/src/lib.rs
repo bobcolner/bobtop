@@ -142,21 +142,32 @@ pub fn select(opts: SelectOptions) -> Box<dyn NetworkAttributor> {
 /// Honors the same `allow_ebpf` knob as the net selector — a single
 /// `--no-ebpf` flag disables eBPF for both subsystems.
 pub fn select_disk(opts: SelectOptions) -> Option<Box<dyn DiskAttributor>> {
-    // Tier 2 — eBPF disk probes (Linux only, feature-gated).
-    // The eBPF *disk* probes don't exist yet — placeholder for the
-    // upcoming commit that adds vfs_read/vfs_write kretprobes.
-    let _ = opts.allow_ebpf;
+    // Tier 2 — eBPF disk probes (vfs_read/vfs_write kretprobes).
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    if opts.allow_ebpf && ebpf::disk::EbpfDiskAttributor::available() {
+        match ebpf::disk::EbpfDiskAttributor::new() {
+            Ok(a) => {
+                tracing::info!(
+                    tier = "ebpf",
+                    "disk attribution: tier 2 (eBPF) selected — accurate per-pid attribution"
+                );
+                return Some(Box::new(a));
+            }
+            Err(e) => tracing::warn!(error = %e, "eBPF disk available but failed to initialize"),
+        }
+    }
 
     // Tier 1 — /proc/[pid]/io.
     #[cfg(target_os = "linux")]
     if proc_io::ProcDiskAttributor::available() {
         tracing::info!(
             tier = "proc_io",
-            "disk attribution: tier 1 (/proc/[pid]/io) selected"
+            "disk attribution: tier 1 (/proc/[pid]/io) selected — buffered writes credited to writeback threads"
         );
         return Some(Box::new(proc_io::ProcDiskAttributor::new()));
     }
 
+    let _ = opts.allow_ebpf; // silence unused-warning on non-Linux / no-ebpf builds
     tracing::debug!("no disk attribution backend available — falling back to sysinfo");
     None
 }
