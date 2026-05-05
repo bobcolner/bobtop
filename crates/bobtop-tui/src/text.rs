@@ -6,6 +6,16 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Style;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Terminal display width of `s` in cells.
+///
+/// Use this — not `chars().count()` — for any layout math (column fitting,
+/// right-alignment, truncation). `chars().count()` gives one per scalar, but
+/// CJK and emoji glyphs take two cells while combining marks take zero.
+pub fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
 
 pub fn write_str_at(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
     let mut col = x;
@@ -17,7 +27,10 @@ pub fn write_str_at(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
         let cell = &mut buf[(col, y)];
         cell.set_char(ch);
         cell.set_style(style);
-        col = col.saturating_add(1);
+        // Advance by the glyph's display width so wide chars (CJK, emoji)
+        // claim two cells and the next char starts past them.
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
+        col = col.saturating_add(cw);
     }
 }
 
@@ -72,11 +85,24 @@ pub fn format_rate(bps: f64) -> String {
     }
 }
 
-pub fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
+/// Truncate `s` to at most `max_cells` terminal cells, accounting for
+/// wide glyphs (CJK, emoji = 2 cells) and zero-width combining marks.
+/// Truncates whole grapheme-equivalent units; never splits a char.
+pub fn truncate_chars(s: &str, max_cells: usize) -> String {
+    if display_width(s) <= max_cells {
         return s.to_string();
     }
-    s.chars().take(max_chars).collect()
+    let mut out = String::with_capacity(s.len());
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max_cells {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -115,5 +141,36 @@ mod tests {
     fn truncates_by_character_count() {
         assert_eq!(truncate_chars("abcdef", 4), "abcd");
         assert_eq!(truncate_chars("abc", 4), "abc");
+    }
+
+    #[test]
+    fn display_width_counts_cell_columns_not_codepoints() {
+        // Latin: 1 cell each.
+        assert_eq!(display_width("hello"), 5);
+        // CJK: 2 cells each.
+        assert_eq!(display_width("测试"), 4);
+        // Mixed.
+        assert_eq!(display_width("测a试"), 5);
+    }
+
+    #[test]
+    fn truncate_keeps_whole_wide_chars() {
+        // Cells = 2 each. Budget 3 fits one wide char (2) + nothing else.
+        assert_eq!(truncate_chars("测试名", 3), "测");
+        // Budget 4 fits two wide chars (4 cells exactly).
+        assert_eq!(truncate_chars("测试名", 4), "测试");
+        // Budget 5 still fits two wide (4 cells) — third would overflow.
+        assert_eq!(truncate_chars("测试名", 5), "测试");
+    }
+
+    #[test]
+    fn write_str_at_advances_two_cells_for_wide_chars() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        // CJK uses 2 cells per glyph; "测a" should write 测 at x=0..1, a at x=2.
+        write_str_at(&mut buf, 0, 0, "测a", Style::default());
+        assert_eq!(buf[(0, 0)].symbol(), "测");
+        // The cell at x=2 (after the wide glyph) holds the 'a'.
+        assert_eq!(buf[(2, 0)].symbol(), "a");
     }
 }

@@ -26,6 +26,7 @@ bobtop-tui = { path = "crates/bobtop-tui" }
 # TUI rendering
 ratatui = "0.29"
 crossterm = "0.28"
+unicode-width = "0.2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

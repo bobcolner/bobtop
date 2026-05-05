@@ -5,7 +5,9 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 
+use crate::text::display_width;
 use crate::{format_bytes_compact, format_rate, Theme};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone)]
 pub struct Column<'a> {
@@ -237,14 +239,15 @@ fn render_row<'a, F>(
             break;
         }
         let (text, style, right_align) = cell_fn(i);
-        let len = text.chars().count() as u16;
+        // Layout math is in *terminal cells*, not chars: CJK/emoji glyphs
+        // claim two cells. Counting chars instead made cells overrun their
+        // gutter for any user with non-Latin process names.
+        let len = display_width(text) as u16;
         let text_x = if right_align && len < avail {
             cursor + (avail - len)
         } else {
             cursor
         };
-        // truncate_to_chars returns &str when no truncation is needed —
-        // only allocates when we actually need to append the ellipsis.
         let drawn: std::borrow::Cow<'_, str> = if len > avail {
             std::borrow::Cow::Owned(truncate(text, avail as usize))
         } else {
@@ -259,24 +262,37 @@ fn write_str(buf: &mut Buffer, x: u16, y: u16, s: &str, max_cols: usize, style: 
     let mut col = x;
     let right = x.saturating_add(max_cols as u16).min(buf.area.right());
     for ch in s.chars() {
-        if col >= right {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
+        if col.saturating_add(cw) > right {
             break;
         }
         let c = &mut buf[(col, y)];
         c.set_char(ch);
         c.set_style(c.style().patch(style));
-        col = col.saturating_add(1);
+        col = col.saturating_add(cw);
     }
 }
 
-/// Truncate `s` to at most `max_chars` characters, appending `…` when shortened.
-/// Caller has already verified `s.chars().count() > max_chars`, so this always
-/// allocates — the common no-truncation path stays borrowed at the call site.
-fn truncate(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Truncate `s` to at most `max_cells` *terminal cells*, appending `…` when
+/// shortened. Reserves 1 cell for the ellipsis. Caller has already verified
+/// `display_width(s) > max_cells`, so this always allocates.
+fn truncate(s: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
         return String::new();
     }
-    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    // Reserve one cell for the ellipsis (it's a 1-cell glyph in every font
+    // we care about; UnicodeWidthChar agrees).
+    let budget = max_cells.saturating_sub(1);
+    let mut out = String::with_capacity(s.len());
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
     out.push('…');
     out
 }
