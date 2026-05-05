@@ -10,6 +10,7 @@
 pub mod boxed;
 pub mod action_bar;
 pub mod braille_graph;
+pub mod braille_text;
 pub mod meter;
 pub mod modal;
 pub mod mini_meter;
@@ -25,6 +26,7 @@ pub mod table;
 pub use boxed::{panel, BoxedPanel, CornerStyle};
 pub use action_bar::ActionBar;
 pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_FILL};
+pub use braille_text::BrailleText;
 pub use meter::Meter;
 pub use modal::ModalShell;
 pub use mini_meter::MiniMeter;

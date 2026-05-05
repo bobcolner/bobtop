@@ -29,9 +29,9 @@ pub use text::{
     write_str_at, write_str_clipped,
 };
 pub use widgets::{
-    ActionBar, BrailleGraph, BoxedPanel, CornerStyle, DataTable, DualMode, GraphStyle,
-    LegendStyle, Meter, MiniMeter, ModalShell, SectionHeader, SelectableList, SettingRow,
-    SettingValue, SettingsForm, Sparkline, StackedBar, StackedSegment, Cell, Column,
+    ActionBar, BrailleGraph, BrailleText, BoxedPanel, CornerStyle, DataTable, DualMode,
+    GraphStyle, LegendStyle, Meter, MiniMeter, ModalShell, SectionHeader, SelectableList,
+    SettingRow, SettingValue, SettingsForm, Sparkline, StackedBar, StackedSegment, Cell, Column,
     ProcessTableGroupHeader, ProcessTableRow, ProcessTableRowMeta, ProcessTableSort, Row,
     RowKind, Table, ToggleRow, Trace,
 };

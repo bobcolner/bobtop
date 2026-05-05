@@ -1,7 +1,7 @@
 use bobtop_core::Box as BoxKind;
 use crate::options_editor::OptionsEditor;
 use bobtop_tui::widgets::{
-    panel as boxed_panel, ActionBar, ModalShell, SectionHeader, ToggleRow,
+    panel as boxed_panel, ActionBar, BrailleText, ModalShell, SectionHeader, ToggleRow,
 };
 use bobtop_tui::write_str_clipped;
 use ratatui::layout::Rect;
@@ -249,46 +249,56 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
+    // panels
+    ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk size (default → large → off)"),
+    ("B", "boxes overlay — quick on/off toggle for each panel"),
+    ("! / @ / # / $", "apply preset 1-4 (Shift+1-4: full+CPU / full+MEM / full+NET / minimal)"),
+    // process table
     ("↑ / ↓", "select process"),
     ("PgUp / PgDn / Home / End", "jump in process list"),
     ("← / →", "cycle sort column"),
     ("r", "reverse sort direction"),
-    ("+ / -", "adjust global tick"),
-    ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk panel size (off → default → large)"),
-    ("! / @ / # / $", "apply preset 1-4 (Shift+1-4: full+CPU / full+MEM / full+NET / minimal)"),
     ("p / n / m / c", "sort by Pid / Name / Mem / Cpu"),
-    ("B", "boxes — show/hide individual panels"),
-    ("f", "filter processes by name/cmdline"),
-    ("k / K", "kill (SIGTERM / SIGKILL) — confirm dialog"),
-    ("Enter", "detail (process) | expand (header)"),
     ("g", "cycle group mode: flat → exec → cgroup → tree"),
-    ("[ / ]", "cycle network interface in net panel (back / next)"),
     ("Space", "expand/collapse selected group or subtree"),
+    ("Enter", "detail (process row) | expand (header)"),
+    ("f", "filter processes by name/cmdline"),
+    ("k / K", "kill SIGTERM / SIGKILL (confirm dialog)"),
+    // misc
+    ("[ / ]", "cycle network interface in net panel (back / next)"),
+    ("+ / -", "adjust global tick (sample rate)"),
     ("O", "options — edit config + save to disk"),
 ];
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    // Compute the natural width (longest "key  desc" line + chrome) but
-    // clamp to the viewport so the modal always fits. Description text
-    // gets truncated when it would overflow the modal's body width —
-    // better than silently disappearing on smaller terminals.
+    // Help is the largest dialog in the app — perfect place for a
+    // braille-art "BOBTOP" banner at the top of the body. The banner is
+    // 2 cells tall + 1 cell of padding above and below = 4 reserved
+    // rows. Skipped on tight terminals where the modal can't afford it.
+    let banner_text = "BOBTOP";
+    let banner = BrailleText::new(banner_text)
+        .with_style(Style::default().fg(app.theme.cpu.end));
+    let banner_w = banner.width();
+    let banner_h = banner.height();
+
     let key_w = HELP_LINES
         .iter()
         .map(|(k, _)| k.chars().count())
         .max()
         .unwrap_or(8) as u16;
-    let natural_w: u16 = HELP_LINES
+    let longest_line: u16 = HELP_LINES
         .iter()
         .map(|(k, d)| (k.chars().count() + d.chars().count() + 4) as u16)
         .max()
-        .unwrap_or(40)
-        + 4;
-    // Reserve at least 4 cols for the modal frame; leave a 2-col margin
-    // on each side of the screen.
+        .unwrap_or(40);
+    let natural_w: u16 = longest_line.max(banner_w + 4) + 4;
     let max_w = area.width.saturating_sub(4).max(20);
     let want_w = natural_w.min(max_w);
+    // 4 extra rows: banner (2) + padding (1 above, 1 below) + 1 footer.
     let max_h = area.height.saturating_sub(2).max(8);
-    let want_h = ((HELP_LINES.len() as u16) + 4).min(max_h);
+    let banner_rows = banner_h + 2;
+    let want_h = ((HELP_LINES.len() as u16) + banner_rows + 3).min(max_h);
+
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::help_title());
@@ -298,18 +308,36 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .render(frame, area) else {
         return;
     };
+
+    // Banner: render only when the modal has room to spare. Centered.
+    let show_banner = body.height >= (HELP_LINES.len() as u16) + banner_rows + 3
+        && body.width >= banner_w + 2;
+    let key_rows_y = if show_banner {
+        let banner_x = body.x + (body.width.saturating_sub(banner_w)) / 2;
+        let banner_y = body.y + 1;
+        frame.render_widget(
+            &banner,
+            Rect::new(banner_x, banner_y, banner_w, banner_h),
+        );
+        body.y + banner_rows + 1
+    } else {
+        body.y + 1
+    };
+
     let buf = frame.buffer_mut();
-    // Reserve 2 cols left margin + key column + 2 cols gap; everything
-    // else is the desc area we clip into.
     let desc_x = body.x + 2 + key_w + 2;
     let desc_w = body
         .x
         .saturating_add(body.width)
         .saturating_sub(desc_x)
         .saturating_sub(2);
-    let max_lines = body.height.saturating_sub(3) as usize; // skip top, bottom border, footer row
-    for (i, (key, desc)) in HELP_LINES.iter().take(max_lines).enumerate() {
-        let row_y = body.y + 1 + i as u16;
+    let lines_avail = body
+        .y
+        .saturating_add(body.height)
+        .saturating_sub(key_rows_y)
+        .saturating_sub(2) as usize; // leave room for footer
+    for (i, (key, desc)) in HELP_LINES.iter().take(lines_avail).enumerate() {
+        let row_y = key_rows_y + i as u16;
         write_str_clipped(
             buf,
             body.x + 2,
