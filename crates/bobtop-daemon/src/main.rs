@@ -1,7 +1,7 @@
 //! bobtop daemon — wires CLI parsing, capability detection, collector spawn,
 //! TUI render loop, and signal handling.
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -101,20 +101,35 @@ async fn main() -> Result<()> {
 
     // Agent query socket. Listener failure (e.g. permission denied on
     // /tmp) is non-fatal — the TUI keeps running without the agent surface.
-    let agent_socket_path = bobtop_daemon::agent::spawn(
+    let agent_handle = bobtop_daemon::agent::spawn(
         engine.store.clone(),
         engine.history.clone(),
     );
 
     if cli.daemon {
         // Headless mode: the engine + agent socket are already running.
-        // Block until the operator signals shutdown, then explicitly unlink
-        // the socket — Tokio doesn't unwind the listener task's Drop on
-        // SIGTERM, so we can't rely on the listener-task cleanup path here.
-        tracing::warn!("running in --daemon mode; press Ctrl-C to exit");
-        wait_for_shutdown().await;
-        if let Some(p) = agent_socket_path.as_ref() {
-            let _ = std::fs::remove_file(p);
+        // Block until the operator signals shutdown OR the idle watchdog
+        // fires (default 30 min of no socket activity). Tokio doesn't
+        // unwind the listener task's Drop on SIGTERM, so we explicitly
+        // unlink the socket on the way out.
+        tracing::warn!(
+            idle_exit_secs = DAEMON_IDLE_EXIT_SECS,
+            "running in --daemon mode; press Ctrl-C to exit"
+        );
+        let activity_for_watch = agent_handle.as_ref().map(|h| h.last_activity.clone());
+        tokio::select! {
+            _ = wait_for_shutdown() => {
+                tracing::info!("daemon: shutdown signal received");
+            }
+            _ = idle_watchdog(activity_for_watch, DAEMON_IDLE_EXIT_SECS) => {
+                tracing::warn!(
+                    idle_exit_secs = DAEMON_IDLE_EXIT_SECS,
+                    "daemon: idle exit — no agent activity for the configured window"
+                );
+            }
+        }
+        if let Some(h) = agent_handle.as_ref() {
+            let _ = std::fs::remove_file(&h.socket_path);
         }
         // Attributor loops still write into App at runtime even though it
         // never renders; suppress the "unused" warning explicitly.
@@ -131,6 +146,39 @@ async fn main() -> Result<()> {
     tui::restore_terminal(&mut term)?;
 
     result.map_err(Into::into)
+}
+
+/// Daemon idle-exit threshold. When `--daemon` mode runs for this many
+/// seconds with no agent socket activity, the daemon shuts down on its
+/// own. Keeps forgotten background daemons from living forever.
+const DAEMON_IDLE_EXIT_SECS: u64 = 30 * 60;
+
+/// Watchdog: completes when the agent socket has been idle for
+/// `idle_secs` continuously. If `last_activity` is `None` (the socket
+/// failed to bind), this future never resolves — the daemon stays
+/// alive until SIGTERM, which is the safe default.
+async fn idle_watchdog(last_activity: Option<Arc<AtomicU64>>, idle_secs: u64) {
+    let activity = match last_activity {
+        Some(a) => a,
+        None => {
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    // Coarse polling — the deadline is 30 min, so 60s resolution is plenty.
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let last = activity.load(Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(last) >= idle_secs {
+            return;
+        }
+    }
 }
 
 /// Block on Ctrl-C or SIGTERM, whichever arrives first. Used by `--daemon`

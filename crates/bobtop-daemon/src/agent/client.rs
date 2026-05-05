@@ -6,7 +6,8 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -64,6 +65,13 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        "responsible_for" | "who" => match parse_responsible_for(&args[1..]) {
+            Ok(req) => send(req),
+            Err(msg) => {
+                eprintln!("bobtop agent responsible_for: {msg}");
+                2
+            }
+        },
         "help" | "-h" | "--help" => {
             println!("bobtop agent — query the running daemon over its Unix socket");
             println!();
@@ -75,6 +83,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("  peak --metric <m> --window <w>              peak value + responsible pids");
             println!("  summary [--match PAT | --pid N]             host or scoped rollup");
             println!("  pid_inspect (--pid N | --match PAT)         full detail for one pid");
+            println!("  responsible_for --metric <m> --at <off>     who owned <m> at <off> ago");
             println!();
             println!("metrics: cpu | mem | net.tx | net.rx | disk.r | disk.w");
             println!("groups:  flat (default) | exec | cgroup | tree");
@@ -90,6 +99,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("  bobtop agent peak --metric net.tx --window 1m");
             println!("  bobtop agent summary --match 'python*'");
             println!("  bobtop agent pid_inspect --pid 1234");
+            println!("  bobtop agent responsible_for --metric cpu --at 30s");
             0
         }
         other => {
@@ -164,6 +174,84 @@ fn parse_pid_inspect(args: &[String]) -> Result<serde_json::Value, String> {
         req["pid"] = json!(p);
     }
     Ok(req)
+}
+
+/// Spawn `bobtop --daemon` in the background and poll for the socket to
+/// appear. Returns a connected stream on success, or a human-readable
+/// reason on failure (used to inform the user). Honors
+/// `BOBTOP_NO_AUTOSPAWN=1` so CI / security contexts can opt out.
+fn auto_spawn_and_connect(path: &Path) -> Result<UnixStream, String> {
+    if std::env::var("BOBTOP_NO_AUTOSPAWN")
+        .ok()
+        .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .is_some()
+    {
+        return Err("socket missing and BOBTOP_NO_AUTOSPAWN=1 is set".into());
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot locate bobtop binary: {e}"))?;
+    // `Stdio::null` everywhere so the daemon doesn't bind to our terminal.
+    // Detach via setsid so it survives this client's exit.
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe; pre-exec runs in the
+        // child between fork and execve where only such functions are
+        // permitted.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let _child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn bobtop --daemon: {e}"))?;
+
+    // Poll for the socket. Daemon startup is dominated by collector
+    // initialization (sysinfo refresh, /proc walk) — typically <1s.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(s) = UnixStream::connect(path) {
+            return Ok(s);
+        }
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    Err("daemon spawned but socket did not appear within 3s".into())
+}
+
+fn parse_responsible_for(args: &[String]) -> Result<serde_json::Value, String> {
+    let mut metric: Option<String> = None;
+    let mut at: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let take = || -> Result<&String, String> {
+            args.get(i + 1).ok_or_else(|| format!("`{a}` expects a value"))
+        };
+        match a.as_str() {
+            "--metric" => {
+                metric = Some(take()?.clone());
+                i += 2;
+            }
+            "--at" => {
+                at = Some(take()?.clone());
+                i += 2;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    let metric = metric.ok_or_else(|| "`--metric <m>` is required".to_string())?;
+    let at = at.ok_or_else(|| "`--at <offset>` is required (e.g. 30s, 5m)".to_string())?;
+    Ok(json!({ "q": "responsible_for", "metric": metric, "at": at }))
 }
 
 /// Parse arg list for `window` / `peak`. Both take the same `--metric`
@@ -250,12 +338,20 @@ fn send(request: serde_json::Value) -> i32 {
     let path = socket_path();
     let mut stream = match UnixStream::connect(&path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "bobtop agent: cannot connect to {} ({e}). Is bobtop running?",
-                path.display()
-            );
-            return 3;
+        Err(_) => {
+            // Socket missing — try to auto-spawn the daemon and reconnect.
+            // Honors BOBTOP_NO_AUTOSPAWN=1 for users who want explicit
+            // control (CI, security-sensitive contexts).
+            match auto_spawn_and_connect(&path) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!(
+                        "bobtop agent: cannot connect to {} ({msg}). Try `bobtop --daemon &` or run a TUI.",
+                        path.display()
+                    );
+                    return 3;
+                }
+            }
         }
     };
     // Generous read timeout — the daemon answers in microseconds, but a

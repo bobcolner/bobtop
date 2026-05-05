@@ -16,6 +16,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bobtop_core::{History, SampleStore};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,8 +29,8 @@ use super::query::{
     Group, MatchPattern, Metric, DEFAULT_N,
 };
 use super::schema::{
-    build_peak, build_snapshot, build_window, ErrorResponse, HostSummary, PidInspectResponse,
-    Request, SummaryResponse, SCHEMA_VERSION,
+    build_peak, build_responsible, build_snapshot, build_window, ErrorResponse, HostSummary,
+    PidInspectResponse, Request, SummaryResponse, SCHEMA_VERSION,
 };
 
 /// Resolve the socket path using the first available of:
@@ -43,12 +46,23 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(format!("/tmp/bobtop-{uid}.sock"))
 }
 
-/// Spawn the listener task. Returns the bound socket path on success.
+/// Handle returned by [`spawn`]: the bound socket path plus an atomic
+/// timestamp the listener bumps on every dispatched request. Daemon
+/// mode uses the timestamp to implement an idle-exit watchdog without
+/// the server itself having to know about lifecycle.
+#[derive(Debug, Clone)]
+pub struct AgentHandle {
+    pub socket_path: PathBuf,
+    pub last_activity: Arc<AtomicU64>,
+}
+
+/// Spawn the listener task. Returns a handle to the bound socket on
+/// success.
 ///
 /// Failures (path collision with a live peer, permission denied) are logged
 /// and the daemon keeps running without the agent surface — the TUI is the
 /// primary product, the socket is supplementary.
-pub fn spawn(store: SampleStore, history: History) -> Option<PathBuf> {
+pub fn spawn(store: SampleStore, history: History) -> Option<AgentHandle> {
     let path = socket_path();
     let listener = match bind_with_stale_recovery(&path) {
         Ok(l) => l,
@@ -58,14 +72,28 @@ pub fn spawn(store: SampleStore, history: History) -> Option<PathBuf> {
         }
     };
     tracing::info!(path = %path.display(), "agent socket listening");
+    // Initialize to startup time so a freshly-launched daemon doesn't
+    // idle-exit before any agent has had a chance to connect.
+    let last_activity = Arc::new(AtomicU64::new(now_unix()));
     let path_for_task = path.clone();
+    let activity_for_task = Arc::clone(&last_activity);
     tokio::spawn(async move {
-        run_accept_loop(listener, store, history).await;
+        run_accept_loop(listener, store, history, activity_for_task).await;
         // Best-effort cleanup. Leaving a stale socket is recovered from on
         // next startup, so failure here is non-fatal.
         let _ = std::fs::remove_file(&path_for_task);
     });
-    Some(path)
+    Some(AgentHandle {
+        socket_path: path,
+        last_activity,
+    })
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Bind, recovering from a stale socket file left by a crashed predecessor.
@@ -91,14 +119,20 @@ fn bind_with_stale_recovery(path: &Path) -> io::Result<UnixListener> {
     }
 }
 
-async fn run_accept_loop(listener: UnixListener, store: SampleStore, history: History) {
+async fn run_accept_loop(
+    listener: UnixListener,
+    store: SampleStore,
+    history: History,
+    last_activity: Arc<AtomicU64>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let s = store.clone();
                 let h = history.clone();
+                let a = Arc::clone(&last_activity);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, s, h).await {
+                    if let Err(e) = handle_connection(stream, s, h, a).await {
                         tracing::debug!(error = %e, "agent connection ended");
                     }
                 });
@@ -117,6 +151,7 @@ async fn handle_connection(
     stream: UnixStream,
     store: SampleStore,
     history: History,
+    last_activity: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -127,6 +162,7 @@ async fn handle_connection(
         if n == 0 {
             return Ok(()); // peer closed
         }
+        last_activity.store(now_unix(), Ordering::Relaxed);
         let response = dispatch(line.trim(), &store, &history);
         writer.write_all(response.as_bytes()).await?;
         writer.write_all(b"\n").await?;
@@ -154,6 +190,7 @@ fn dispatch(raw: &str, store: &SampleStore, history: &History) -> String {
         "peak" => handle_peak(req, history),
         "summary" => handle_summary(req, store),
         "pid_inspect" => handle_pid_inspect(req, store),
+        "responsible_for" => handle_responsible_for(req, history),
         other => encode(&ErrorResponse::new(
             "unknown_verb",
             format!("verb '{other}' is not supported in bobtop/v1 yet"),
@@ -344,6 +381,51 @@ fn handle_pid_inspect(req: Request, store: &SampleStore) -> String {
         disk_w_bps: p.disk_write_bytes_per_sec,
         cgroup: p.cgroup.clone(),
     })
+}
+
+fn handle_responsible_for(req: Request, history: &History) -> String {
+    let metric_raw = match req.metric.as_deref() {
+        Some(s) => s.to_string(),
+        None => {
+            return encode(&ErrorResponse::new(
+                "bad_query",
+                "`responsible_for` requires `metric` (cpu | mem | net.tx | net.rx)",
+            ))
+        }
+    };
+    let metric = match Metric::parse(&metric_raw) {
+        Some(m) => m,
+        None => {
+            return encode(&ErrorResponse::new(
+                "unknown_metric",
+                format!("unknown metric '{metric_raw}'"),
+            ))
+        }
+    };
+    let hist_metric = match history_metric_for(metric) {
+        Ok(m) => m,
+        Err(msg) => return encode(&ErrorResponse::new("unknown_metric", msg)),
+    };
+    let at_raw = match req.at.as_deref() {
+        Some(s) => s.to_string(),
+        None => {
+            return encode(&ErrorResponse::new(
+                "bad_query",
+                "`responsible_for` requires `at` (e.g. 30s, 5m)",
+            ))
+        }
+    };
+    let at = match parse_window(&at_raw) {
+        Ok(d) => d,
+        Err(msg) => return encode(&ErrorResponse::new("bad_query", msg)),
+    };
+    match history.responsible_at(at, hist_metric) {
+        Some(refs) => encode(&build_responsible(&metric_raw, &at_raw, at.as_secs(), refs)),
+        None => encode(&ErrorResponse::new(
+            "window_unavailable",
+            format!("no history sample at offset {at_raw}"),
+        )),
+    }
 }
 
 fn handle_window(req: Request, history: &History) -> String {

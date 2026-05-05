@@ -81,28 +81,29 @@ It subscribes to `engine.store` and rebuilds presentation state per tick.
 benchmarks, library bindings, or a future MCP server. Optional but pays
 off the next time we want to reuse the engine.
 
-## After Phase 3-R
+## After Phase 3-R (shipped)
 
-These ride on top of the refactored engine and are mostly additive.
+- ✅ **`summary` verb** — host / match / pid scopes, uniform envelope.
+- ✅ **`pid_inspect` verb** — single-pid drilldown; `--match` must
+  resolve uniquely or returns `bad_query` with the count.
+- ✅ **`cgroup` grouping** — buckets by `/proc/<pid>/cgroup` last segment
+  (`docker-<sha>.scope`, `bars_signalgen_consumer.service`, etc.).
+- ✅ **`tree` grouping** — parent-rooted subtree aggregation; memoizes
+  via a `root_of` map so deep chains don't re-traverse.
+- ✅ **`responsible_for` verb** — point-in-time variant of `peak`. Picks
+  the smallest tier covering the offset for max fidelity.
+- ✅ **Idle-exit timer** — daemon-mode auto-shutdown after 30 min of no
+  socket activity. Suppressed when the socket failed to bind.
+- ✅ **Auto-spawn from CLI client** — when `bobtop agent` finds the socket
+  missing it forks `bobtop --daemon` (detached via `setsid`), polls for
+  the socket up to 3s, then connects. Honors `BOBTOP_NO_AUTOSPAWN=1`.
 
-- **`summary` verb** — host or per-pid aggregate. `{q:"summary"}` for host;
-  `{q:"summary","pid":N}` or `{q:"summary","match":"node*"}` for a scoped
-  rollup. Returns a single object, not a row list.
-- **`pid_inspect` verb** — full detail for one pid (or one match resolving
-  to a single pid): name, cmdline, user, state, parent_pid, cgroup,
-  threads, all metrics, started_ago. The "drill down" verb.
-- **`cgroup` grouping** — `top --group cgroup` aggregates rows by the
-  trailing `/proc/<pid>/cgroup` segment (`firefox.service`,
-  `docker-<sha>.scope`, etc.). The `bobtop-daemon::group` module already
-  does this for the TUI; lift its core logic into the engine and reuse.
-- **`tree` grouping** — `top --group tree` returns subtree-rooted rows
-  with descendant lists. Same source-of-truth move.
-- **`responsible_for` verb** — point-in-time variant of `peak`.
-- **Idle-exit timer** — daemon-mode polish; auto-shutdown after N min of
-  no socket activity.
-- **Auto-spawn from CLI client** — when the socket is missing, fork
-  `bobtop --daemon` transparently before the request.
-- **MCP shim** — once the verb set is stable.
+## Still on the wishlist
+
+- **MCP shim** — once the verb set is locked, expose verbs as MCP tools.
+- **Phase 3-R Step 3** — move `Engine` to its own crate so embedders
+  (benchmarks, MCP, future remote sinks) can pull it in without
+  dragging the daemon binary's deps along.
 
 ## Out of scope (v1)
 

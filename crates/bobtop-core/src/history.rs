@@ -214,6 +214,42 @@ impl History {
         })
     }
 
+    /// Top-N pids responsible for `metric` at a specific point in the past,
+    /// expressed as `offset` from "now". Returns `None` when the offset is
+    /// outside the longest tier or no data has been captured yet. Picks the
+    /// smallest tier that covers `offset` so a 30-second-ago query reads
+    /// from the 1-second ring (high-fidelity) rather than the 30-second one.
+    pub fn responsible_at(&self, offset: Duration, by: Metric) -> Option<Vec<ProcRef>> {
+        self.read(|r| {
+            let secs = offset.as_secs();
+            let (procs_ring, step_secs) = if secs <= 60 {
+                (&r.procs_1s, 1u64)
+            } else if secs <= 300 {
+                (&r.procs_5s, 5u64)
+            } else if secs <= 1800 {
+                (&r.procs_30s, 30u64)
+            } else {
+                return None;
+            };
+            if procs_ring.is_empty() {
+                return None;
+            }
+            // Snap the requested offset to the nearest tier slot. Most
+            // recent slot is at the back of the deque (offset 0).
+            let idx_from_back = (secs / step_secs) as usize;
+            if idx_from_back >= procs_ring.len() {
+                return None;
+            }
+            let entry = &procs_ring[procs_ring.len() - 1 - idx_from_back];
+            Some(match by {
+                Metric::Cpu => entry.by_cpu.clone(),
+                Metric::Mem => entry.by_mem.clone(),
+                Metric::NetTx => entry.by_net_tx.clone(),
+                Metric::NetRx => entry.by_net_rx.clone(),
+            })
+        })
+    }
+
     /// Locate the peak of `by` within `window` and return the responsible
     /// processes captured at that tick. Returns `None` when no samples
     /// have been recorded yet.
@@ -569,6 +605,32 @@ mod tests {
         // Most recent push was i=4; peak was i=2 → offset_secs = (4 - 2) * 1 = 2
         assert_eq!(p.offset_secs, 2);
         assert_eq!(p.responsible.first().map(|r| r.pid), Some(999));
+    }
+
+    #[test]
+    fn responsible_at_returns_top_n_at_offset() {
+        let mut r = HistoryRing::default();
+        // Push 5 ticks. Tick at index 1 (offset_secs=3 from latest) gets a
+        // distinctive proc-ref so we can verify offset arithmetic.
+        for i in 0..5 {
+            let mut tp = TopProcs::default();
+            if i == 1 {
+                tp.by_cpu.push(ProcRef {
+                    pid: 42,
+                    name: "marker".into(),
+                    value: 0.5,
+                });
+            }
+            r.push(HostMetrics::default(), tp);
+        }
+        let h = History {
+            inner: Arc::new(RwLock::new(r)),
+        };
+        // Latest is i=4; marker is at i=1 → offset = 3 seconds (1s tier).
+        let got = h.responsible_at(Duration::from_secs(3), Metric::Cpu).unwrap();
+        assert_eq!(got.first().map(|p| p.pid), Some(42));
+        // Outside the longest tier returns None.
+        assert!(h.responsible_at(Duration::from_secs(2000), Metric::Cpu).is_none());
     }
 
     #[test]

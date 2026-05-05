@@ -44,6 +44,9 @@ pub struct Request {
     /// `summary` scope: `host` (default) | `match` | `pid`.
     #[serde(default)]
     pub scope: Option<String>,
+    /// Point-in-time offset for `responsible_for` (e.g. `30s`, `5m`).
+    #[serde(default)]
+    pub at: Option<String>,
 }
 
 /// Successful `snapshot` response — a single point-in-time aggregate of
@@ -130,6 +133,34 @@ pub struct WindowResponse {
     pub avg: f64,
     pub peak: f64,
     pub p95: f64,
+}
+
+/// `responsible_for` response — the top-N pids that owned `metric` at a
+/// specific point in the past (`ago_secs` from now).
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsibleResponse {
+    pub schema: &'static str,
+    pub ts: String,
+    pub metric: String,
+    pub at: String,
+    pub ago_secs: u64,
+    pub responsible: Vec<RespRef>,
+}
+
+pub fn build_responsible(
+    metric: &str,
+    at_raw: &str,
+    ago_secs: u64,
+    responsible: Vec<ProcRef>,
+) -> ResponsibleResponse {
+    ResponsibleResponse {
+        schema: SCHEMA_VERSION,
+        ts: rfc3339_now_pub(),
+        metric: metric.into(),
+        at: at_raw.into(),
+        ago_secs,
+        responsible: responsible.iter().map(RespRef::from).collect(),
+    }
 }
 
 /// `summary` response. Either a host-wide `HostSummary` (the same shape
