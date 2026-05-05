@@ -14,16 +14,25 @@ use bobtop_core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
 };
 use bobtop_core::{BoxesEnabled, MetricEvent};
-use bobtop_pid_attr::{
-    AttributorTier, DiskAttributorTier, ProcessDiskSample, ProcessNetSample,
-};
+use bobtop_pid_attr::{AttributorTier, DiskAttributorTier};
 use bobtop_tui::widgets::{CornerStyle, ProcessTableSort as TableSort};
 use bobtop_tui::{LayoutPreset, Theme};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::{MAX_TICK_MS, MIN_TICK_MS, TICK_STEP_MS};
+use crate::cpuinfo::read_cpu_model;
+use crate::kill::send_signal;
 use crate::options_editor::{OptionsEditor, OptionsOutcome};
+use crate::proc_sort::sort_processes;
 use crate::state::UiState;
+
+// Re-exports so existing callers (state.rs, ui::presenter, tests) keep
+// using `crate::app::*` paths after the structural extraction. Each
+// type's canonical home is the named module; this is just a compat
+// shim for the transition.
+pub use crate::kill::{KillRequest, KillSignal};
+pub use crate::presets::{Preset, DEFAULT_PRESETS};
+pub use crate::process_detail::ProcessDetail;
 
 /// Maximum historical samples kept for graphing. 600 = 10 min at 1 Hz.
 pub const HISTORY_CAP: usize = 600;
@@ -50,261 +59,6 @@ pub enum ControlFlow {
     Quit,
 }
 
-/// Editable working copy of `Config`, plus a cursor identifying which
-/// field is currently being edited. The fields here intentionally mirror
-/// the on-disk Config — when the user hits Enter we Serialize this back
-/// out via `Config::save`. On Esc we throw the snapshot away.
-/// Snapshot of /proc data shown in the detail modal (B3d). Captured
-/// once when the user presses `Enter`; no live refresh — the modal is
-/// for inspection, not monitoring. Fields that fail to read (perm denied,
-/// process gone) get an explanatory placeholder rather than aborting.
-#[derive(Debug, Clone)]
-pub struct ProcessDetail {
-    pub pid: u32,
-    pub name: String,
-    pub cmdline: String,
-    pub status_lines: Vec<String>,
-    pub fd_count: Result<usize, String>,
-    pub io_lines: Vec<String>,
-}
-
-impl ProcessDetail {
-    /// Read the relevant /proc entries for `pid`. All errors are folded
-    /// into placeholders inside the returned struct — the modal opens
-    /// even when individual fields are unavailable (kthreads, perms).
-    /// All strings are scrubbed of control characters (especially the
-    /// tabs in /proc/[pid]/{status,io}) so the renderer can call
-    /// `set_char` on every byte without producing terminal artifacts.
-    pub fn read(pid: u32, name: &str) -> Self {
-        let base = format!("/proc/{pid}");
-        let cmdline = std::fs::read(format!("{base}/cmdline"))
-            .map(|bytes| {
-                // /proc cmdline uses NUL separators between argv entries.
-                bytes
-                    .split(|b| *b == 0)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| String::from_utf8_lossy(s).into_owned())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .map(|s| sanitize_for_display(&s))
-            .unwrap_or_else(|e| format!("(cmdline unavailable: {e})"));
-
-        let status_lines = std::fs::read_to_string(format!("{base}/status"))
-            .map(|s| {
-                // Pull the rows users actually care about; full status is 50+ lines.
-                s.lines()
-                    .filter(|l| {
-                        let key = l.split(':').next().unwrap_or("");
-                        matches!(
-                            key,
-                            "Name"
-                                | "State"
-                                | "Tgid"
-                                | "Pid"
-                                | "PPid"
-                                | "Uid"
-                                | "Gid"
-                                | "Threads"
-                                | "VmRSS"
-                                | "VmSize"
-                                | "voluntary_ctxt_switches"
-                                | "nonvoluntary_ctxt_switches"
-                        )
-                    })
-                    .map(sanitize_for_display)
-                    .collect()
-            })
-            .unwrap_or_else(|e| vec![format!("(status unavailable: {e})")]);
-
-        let fd_count = std::fs::read_dir(format!("{base}/fd"))
-            .map(|it| it.count())
-            .map_err(|e| e.to_string());
-
-        let io_lines = std::fs::read_to_string(format!("{base}/io"))
-            .map(|s| s.lines().map(sanitize_for_display).collect())
-            .unwrap_or_else(|e| vec![format!("(io unavailable: {e})")]);
-
-        Self {
-            pid,
-            name: name.to_string(),
-            cmdline,
-            status_lines,
-            fd_count,
-            io_lines,
-        }
-    }
-}
-
-/// Replace tabs with a single space and drop other ASCII control bytes.
-/// /proc files use literal tabs as key/value separators
-/// (e.g. `Name:\tbobtop`), and writing them straight into a terminal
-/// cell via `Cell::set_char('\t')` produces unpredictable cursor jumps
-/// or weird filler glyphs depending on the terminal — the source of
-/// the modal-render artifacts. Collapse runs of whitespace too so
-/// `Name:\t\tbobtop` doesn't render as a wide gap. Allows non-ASCII
-/// (UTF-8 in cmdline arguments survives intact).
-/// Read the CPU model name from `/proc/cpuinfo`. Returns the first
-/// `model name` line's value, trimmed and de-whitespaced. Strips the
-/// common AMD/Intel marketing tail (`Processor`, `CPU @ 3.40GHz`,
-/// `XX-Core Processor`) so the panel title doesn't blow past 30 chars.
-fn read_cpu_model() -> Option<String> {
-    let body = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-    let raw = body
-        .lines()
-        .find_map(|l| l.strip_prefix("model name").and_then(|r| r.split_once(':')))
-        .map(|(_, v)| v.trim().to_string())?;
-    // Trim noisy suffixes for compactness.
-    let cleaned = raw
-        .replace("(R)", "")
-        .replace("(TM)", "")
-        .replace("CPU ", "")
-        .split('@')
-        .next()
-        .unwrap_or(&raw)
-        .split("-Core")
-        .next()
-        .unwrap_or(&raw)
-        .trim()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    // Drop trailing "<digits>" leftover from "96-Core Processor" splits.
-    let cleaned = cleaned.trim_end_matches(char::is_whitespace).to_string();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
-    }
-}
-
-fn sanitize_for_display<S: AsRef<str>>(s: S) -> String {
-    let mut out = String::with_capacity(s.as_ref().len());
-    let mut prev_was_space = false;
-    for ch in s.as_ref().chars() {
-        let ch = match ch {
-            '\t' => ' ',
-            // Strip the rest of the C0 control range (NUL, BEL, BS, ESC, etc.)
-            // and DEL. These are the bytes that confuse terminals when set
-            // directly into a buffer cell.
-            c if c.is_control() => continue,
-            c => c,
-        };
-        if ch == ' ' {
-            if prev_was_space {
-                continue;
-            }
-            prev_was_space = true;
-        } else {
-            prev_was_space = false;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-#[cfg(test)]
-mod sanitize_tests {
-    use super::sanitize_for_display;
-
-    #[test]
-    fn tabs_become_single_space() {
-        assert_eq!(sanitize_for_display("Name:\tbobtop"), "Name: bobtop");
-    }
-
-    #[test]
-    fn runs_of_whitespace_collapse() {
-        assert_eq!(sanitize_for_display("a\t\t  b"), "a b");
-    }
-
-    #[test]
-    fn other_controls_dropped() {
-        assert_eq!(sanitize_for_display("hi\x07\x1b\x00there"), "hithere");
-    }
-
-    #[test]
-    fn unicode_survives() {
-        assert_eq!(sanitize_for_display("café — utf"), "café — utf");
-    }
-}
-
-/// Pending kill confirmation — when `App.pending_kill` is `Some`, the
-/// kill modal is showing and the user is one keypress away from sending
-/// the signal. `name` is captured at request time so the modal still
-/// reads sensibly if the process disappears between request + confirm.
-#[derive(Debug, Clone)]
-pub struct KillRequest {
-    pub pid: u32,
-    pub name: String,
-    pub signal: KillSignal,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KillSignal {
-    /// SIGTERM — polite "please exit." Process can catch and clean up.
-    Term,
-    /// SIGKILL — immediate, uncatchable. Last resort.
-    Kill,
-}
-
-impl KillSignal {
-    pub fn label(self) -> &'static str {
-        match self {
-            KillSignal::Term => "SIGTERM",
-            KillSignal::Kill => "SIGKILL",
-        }
-    }
-    pub fn libc_value(self) -> i32 {
-        match self {
-            KillSignal::Term => libc::SIGTERM,
-            KillSignal::Kill => libc::SIGKILL,
-        }
-    }
-}
-
-/// One "preset" — a complete saved view that the user can recall with a
-/// single keystroke. btop calls these "presets" and binds them to 1–4;
-/// we ship the same 4-slot scheme. Each preset bundles the layout, the
-/// process-table sort key, and the sort direction. (Theme is intentionally
-/// *not* in here — it's a per-session choice that survives preset swaps.)
-#[derive(Debug, Clone, Copy)]
-pub struct Preset {
-    pub label: &'static str,
-    pub layout: LayoutPreset,
-    pub sort: TableSort,
-    pub descending: bool,
-}
-
-/// Default 4-slot preset bank. Slot 0 (key `1`) is the "everything-on"
-/// view; slots 1–3 (keys `2`/`3`/`4`) sharpen focus on memory, network,
-/// and minimal layouts respectively. Once B10 (config file) lands these
-/// will be user-overridable; for now they're a sensible fixed bank.
-pub const DEFAULT_PRESETS: [Preset; 4] = [
-    Preset {
-        label: "all panels, sort by CPU",
-        layout: LayoutPreset::Full,
-        sort: TableSort::Cpu,
-        descending: true,
-    },
-    Preset {
-        label: "all panels, sort by MEM",
-        layout: LayoutPreset::Full,
-        sort: TableSort::Mem,
-        descending: true,
-    },
-    Preset {
-        label: "all panels, sort by NET RX",
-        layout: LayoutPreset::Full,
-        sort: TableSort::NetRx,
-        descending: true,
-    },
-    Preset {
-        label: "minimal (CPU + processes only)",
-        layout: LayoutPreset::Minimal,
-        sort: TableSort::Cpu,
-        descending: true,
-    },
-];
 
 #[derive(Debug)]
 pub struct App {
@@ -387,13 +141,11 @@ pub struct App {
     /// iface. Populated alongside the aggregate `net_history`. Used when
     /// `selected_iface` scopes the network panel to a single interface.
     pub iface_history: std::collections::HashMap<String, VecDeque<(f64, f64)>>,
-    pub net_samples: Vec<ProcessNetSample>,
+    /// Active per-pid network attribution tier. Set once at startup from
+    /// the engine's selected attributor; read by the TUI to decide which
+    /// network columns to render and to label the process panel.
     pub net_tier: AttributorTier,
-    /// Per-pid disk-IO samples from the active disk attributor (Tier 1+).
-    /// When non-empty AND the rate is `Some`, these override the sysinfo
-    /// values that the process collector populates. When empty (no tier
-    /// available, or first sample after init) the sysinfo values stand.
-    pub disk_samples: Vec<ProcessDiskSample>,
+    /// Active per-pid disk attribution tier — same role as `net_tier`.
     pub disk_tier: DiskAttributorTier,
 
     /// Sorted-by-CPU process list, ready to render.
@@ -460,9 +212,7 @@ impl App {
             latest_disk: None,
             net_history: VecDeque::with_capacity(HISTORY_CAP),
             iface_history: std::collections::HashMap::new(),
-            net_samples: Vec::new(),
             net_tier: AttributorTier::Unavailable,
-            disk_samples: Vec::new(),
             disk_tier: DiskAttributorTier::Unavailable,
             processes_sorted: Vec::new(),
             selected_proc: 0,
@@ -503,104 +253,92 @@ impl App {
         self.ui.dirty = true;
     }
 
+    /// Fold a freshly-arrived bus event into the App's render-time
+    /// caches. Each subsystem has a dedicated `fold_*` helper so the
+    /// per-arm history-pushing logic stays readable; the dispatch here
+    /// is the only place that knows about `MetricEvent`'s shape.
     pub fn apply_event(&mut self, ev: MetricEvent) {
-        // Mark dirty per arm so events that produce no UI change (e.g. GPU,
-        // not yet wired) don't trigger a render. The render-on-change loop
-        // depends on `dirty` reflecting actual visible state changes.
         match ev {
-            MetricEvent::Cpu(s) => {
-                self.ui.dirty = true;
-                if self.cpu_history.len() == CPU_HISTORY_CAP {
-                    self.cpu_history.pop_front();
-                }
-                self.cpu_history.push_back(s.aggregate_utilization as f64);
-                // Per-core sparkline history. Only push values for cores in
-                // this sample — never auto-zero an absent core, since that
-                // would draw a misleading "down to 0" stair into the graph.
-                for core in &s.cores {
-                    let h = self
-                        .core_history
-                        .entry(core.id)
-                        .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
-                    if h.len() == PER_TRACK_HISTORY_CAP {
-                        h.pop_front();
-                    }
-                    h.push_back(core.utilization as f64);
-                }
-                self.latest_cpu = Some(s);
-            }
-            MetricEvent::Memory(s) => {
-                self.ui.dirty = true;
-                if s.total_bytes > 0 {
-                    let used_frac = s.used_bytes as f64 / s.total_bytes as f64;
-                    if self.mem_history.len() == HISTORY_CAP {
-                        self.mem_history.pop_front();
-                    }
-                    self.mem_history.push_back(used_frac.clamp(0.0, 1.0));
-                }
-                // Push the most-responsive PSI window (`some_avg10`) into the
-                // sparkline ring. Stored as 0..=1 fraction of "100% stalled
-                // for the entire 10s window" — kernel value `100.00` means
-                // every task waited on memory.
-                if let Some(p) = s.pressure {
-                    if self.mem_pressure_history.len() == PER_TRACK_HISTORY_CAP {
-                        self.mem_pressure_history.pop_front();
-                    }
-                    self.mem_pressure_history
-                        .push_back((p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0));
-                }
-                self.latest_mem = Some(s);
-            }
-            MetricEvent::Process(s) => {
-                self.ui.dirty = true;
-                self.latest_processes = Some(s);
-                self.rebuild_sorted();
-            }
-            MetricEvent::Network(s) => {
-                self.ui.dirty = true;
-                let (rx, tx) = aggregate_net_rates(&s, self.show_virtual_net);
-                if self.net_history.len() == HISTORY_CAP {
-                    self.net_history.pop_front();
-                }
-                self.net_history.push_back((rx, tx));
-                // Per-interface history powers the `b`/`n` scope cycle on
-                // the net panel. Each iface gets its own ring; absent
-                // interfaces never show in the cycle.
-                for iface in &s.interfaces {
-                    let h = self
-                        .iface_history
-                        .entry(iface.name.clone())
-                        .or_insert_with(|| VecDeque::with_capacity(HISTORY_CAP));
-                    if h.len() == HISTORY_CAP {
-                        h.pop_front();
-                    }
-                    h.push_back((iface.rx_bytes_per_sec, iface.tx_bytes_per_sec));
-                }
-                self.latest_network = Some(s);
-            }
-            MetricEvent::Disk(s) => {
-                self.ui.dirty = true;
-                // Per-mount sparkline history. Normalize each rate against a
-                // rolling per-mount peak at render time; the deque stores raw
-                // bytes/sec so the renderer can compute its own scale ceiling.
-                for fs in &s.filesystems {
-                    let r = fs.read_bytes_per_sec.unwrap_or(0.0);
-                    let w = fs.write_bytes_per_sec.unwrap_or(0.0);
-                    let h = self
-                        .disk_history
-                        .entry(fs.label.clone())
-                        .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
-                    if h.len() == PER_TRACK_HISTORY_CAP {
-                        h.pop_front();
-                    }
-                    h.push_back((r, w));
-                }
-                self.latest_disk = Some(s);
-            }
+            MetricEvent::Cpu(s) => self.fold_cpu(s),
+            MetricEvent::Memory(s) => self.fold_memory(s),
+            MetricEvent::Process(s) => self.fold_process(s),
+            MetricEvent::Network(s) => self.fold_network(s),
+            MetricEvent::Disk(s) => self.fold_disk(s),
             MetricEvent::Gpu(_) => {
-                // Not yet wired into the UI; receiving is fine.
+                // Not yet wired into the UI; ignoring is fine and stays
+                // off the dirty-flag path so we don't trigger spurious
+                // renders from samples nothing reads.
             }
         }
+    }
+
+    fn fold_cpu(&mut self, s: CpuSample) {
+        self.ui.dirty = true;
+        push_capped(&mut self.cpu_history, s.aggregate_utilization as f64, CPU_HISTORY_CAP);
+        // Per-core sparkline history. Only push values for cores in this
+        // sample — never auto-zero an absent core, since that would draw
+        // a misleading "down to 0" stair into the graph.
+        for core in &s.cores {
+            let h = self
+                .core_history
+                .entry(core.id)
+                .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
+            push_capped(h, core.utilization as f64, PER_TRACK_HISTORY_CAP);
+        }
+        self.latest_cpu = Some(s);
+    }
+
+    fn fold_memory(&mut self, s: MemorySample) {
+        self.ui.dirty = true;
+        if s.total_bytes > 0 {
+            let used_frac = (s.used_bytes as f64 / s.total_bytes as f64).clamp(0.0, 1.0);
+            push_capped(&mut self.mem_history, used_frac, HISTORY_CAP);
+        }
+        // PSI: most-responsive window (`some_avg10`) as 0..=1 fraction of
+        // "100% stalled for the full 10s window."
+        if let Some(p) = s.pressure {
+            let frac = (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0);
+            push_capped(&mut self.mem_pressure_history, frac, PER_TRACK_HISTORY_CAP);
+        }
+        self.latest_mem = Some(s);
+    }
+
+    fn fold_process(&mut self, s: ProcessSample) {
+        self.ui.dirty = true;
+        self.latest_processes = Some(s);
+        self.rebuild_sorted();
+    }
+
+    fn fold_network(&mut self, s: NetworkSample) {
+        self.ui.dirty = true;
+        let (rx, tx) = aggregate_net_rates(&s, self.show_virtual_net);
+        push_capped(&mut self.net_history, (rx, tx), HISTORY_CAP);
+        // Per-interface history powers the `[`/`]` scope cycle on the
+        // net panel.
+        for iface in &s.interfaces {
+            let h = self
+                .iface_history
+                .entry(iface.name.clone())
+                .or_insert_with(|| VecDeque::with_capacity(HISTORY_CAP));
+            push_capped(h, (iface.rx_bytes_per_sec, iface.tx_bytes_per_sec), HISTORY_CAP);
+        }
+        self.latest_network = Some(s);
+    }
+
+    fn fold_disk(&mut self, s: DiskSample) {
+        self.ui.dirty = true;
+        // Per-mount sparkline history. Renderer normalizes against a
+        // rolling per-mount peak at draw time, so we store raw bytes/sec.
+        for fs in &s.filesystems {
+            let r = fs.read_bytes_per_sec.unwrap_or(0.0);
+            let w = fs.write_bytes_per_sec.unwrap_or(0.0);
+            let h = self
+                .disk_history
+                .entry(fs.label.clone())
+                .or_insert_with(|| VecDeque::with_capacity(PER_TRACK_HISTORY_CAP));
+            push_capped(h, (r, w), PER_TRACK_HISTORY_CAP);
+        }
+        self.latest_disk = Some(s);
     }
 
     /// Most recent normalized (rx, tx) pair for the BrailleGraph, in 0..=1.
@@ -639,25 +377,6 @@ impl App {
             .iter()
             .map(|(_, tx)| *tx)
             .fold(0.0_f64, |a, b| a.max(b))
-    }
-
-    pub fn apply_net(&mut self, samples: Vec<ProcessNetSample>, tier: AttributorTier) {
-        self.net_samples = samples;
-        self.net_tier = tier;
-        self.rebuild_sorted();
-        self.ui.dirty = true;
-    }
-
-    /// Replace the per-pid disk attribution snapshot. When the active tier
-    /// reports rates (proc_io, ebpf), `rebuild_sorted` will join them into
-    /// `ProcessInfo.disk_*` fields, overriding the sysinfo values from the
-    /// process collector. Pids missing from the snapshot keep their sysinfo
-    /// values (graceful fallback during the first-sample warmup).
-    pub fn apply_disk(&mut self, samples: Vec<ProcessDiskSample>, tier: DiskAttributorTier) {
-        self.disk_samples = samples;
-        self.disk_tier = tier;
-        self.rebuild_sorted();
-        self.ui.dirty = true;
     }
 
     /// Apply the user's text filter + sort to `latest_processes`, then
@@ -983,154 +702,33 @@ impl App {
 
     fn handle_key(&mut self, k: KeyEvent) -> ControlFlow {
         // visible_rows = total render-row count (group headers + visible
-        // processes). Bounding selection on this so cursor stops at the
-        // bottom of what's actually painted, not the underlying process
-        // count which excludes headers and includes hidden subtree members.
+        // processes). Bounds selection on the rendered list, not the
+        // underlying process count.
         let rows = self.display_rows();
         let visible_rows = rows.len();
 
-        // Options overlay (B11b) — modal. ↑/↓ moves cursor, ←/→ cycles
-        // the value at the cursor, Enter saves to disk + applies live,
-        // Esc closes without saving. Routed before everything else so
-        // the rest of the keybinds can't fire while the user is editing.
-        if let Some(editor) = self.ui.options.take() {
-            match editor.handle_key(k) {
-                OptionsOutcome::KeepOpen(editor) => {
-                    self.ui.options = Some(editor);
-                }
-                OptionsOutcome::Preview { editor, preview } => {
-                    preview.apply_to(self);
-                    self.ui.options = Some(editor);
-                }
-                OptionsOutcome::Cancel { preview } => {
-                    preview.apply_to(self);
-                }
-                OptionsOutcome::Save { commit, message } => {
-                    commit.apply_to(self);
-                    self.ui.last_options_msg = Some(message);
-                }
-            }
-            return ControlFlow::Continue;
+        // Modal cascade: each handler either consumes the key (Some) or
+        // declines to handle it (None) so the next handler / the main
+        // keymap gets a turn. Order matches priority — options first
+        // (most consuming), boxes overlay last (permissive: lets +/-
+        // through to tune tick while open).
+        if let Some(flow) = self.handle_options_modal(k) {
+            return flow;
         }
-
-        // Detail modal (B3d) — Esc closes. While open the rest of the
-        // UI is read-only so we don't lose the user's place if they
-        // accidentally press a sort key.
-        if self.ui.detail.is_some() {
-            match k.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.ui.detail = None;
-                    return ControlFlow::Continue;
-                }
-                _ => return ControlFlow::Continue,
-            }
+        if let Some(flow) = self.handle_detail_modal(k) {
+            return flow;
         }
-
-        // Kill confirm dialog (B3c) — modal. Enter sends the signal,
-        // Esc/n cancels. We route this first so the user can't
-        // accidentally take other action with the modal up.
-        if let Some(req) = self.ui.pending_kill.clone() {
-            match k.code {
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let outcome = send_signal(req.pid, req.signal);
-                    self.ui.last_kill_msg = Some(outcome);
-                    self.ui.pending_kill = None;
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.ui.pending_kill = None;
-                    return ControlFlow::Continue;
-                }
-                _ => return ControlFlow::Continue,
-            }
+        if let Some(flow) = self.handle_kill_modal(k) {
+            return flow;
         }
-
-        // Filter input (B3b) — when active, every keystroke goes into the
-        // filter text. Esc cancels the filter entirely; Enter commits and
-        // exits edit mode (filter stays applied). This must come BEFORE
-        // any other modal so e.g. `q` / `B` while typing don't quit/open menus.
-        if self.ui.filter_active {
-            match k.code {
-                KeyCode::Esc => {
-                    self.ui.filter_active = false;
-                    self.ui.filter_text.clear();
-                    self.rebuild_sorted();
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Enter => {
-                    self.ui.filter_active = false;
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Backspace => {
-                    self.ui.filter_text.pop();
-                    self.rebuild_sorted();
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Char(c) => {
-                    self.ui.filter_text.push(c);
-                    self.rebuild_sorted();
-                    return ControlFlow::Continue;
-                }
-                _ => return ControlFlow::Continue,
-            }
+        if let Some(flow) = self.handle_filter_input(k) {
+            return flow;
         }
-
-        // When the help overlay is open, only `?` / Esc / `q` are routed —
-        // everything else is swallowed so the user doesn't accidentally
-        // mutate state while reading the keybinds.
-        if self.ui.show_help {
-            match k.code {
-                KeyCode::Char('?') | KeyCode::Esc => {
-                    self.ui.show_help = false;
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Char('q') => return ControlFlow::Quit,
-                _ => return ControlFlow::Continue,
-            }
+        if let Some(flow) = self.handle_help_overlay(k) {
+            return flow;
         }
-        // Boxes overlay (B5): ↑/↓ moves cursor, space toggles, B/Esc closes.
-        // Other keys pass through (so e.g. `+`/`-` still tunes tick while
-        // the overlay is visible) — that matches btop's modal-but-permissive
-        // boxes menu.
-        if self.ui.show_boxes_overlay {
-            use bobtop_core::Box as BoxKind;
-            let n = BoxKind::ALL.len();
-            match k.code {
-                KeyCode::Char('B') | KeyCode::Char('b') | KeyCode::Esc => {
-                    self.ui.show_boxes_overlay = false;
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Up => {
-                    if self.ui.boxes_overlay_cursor > 0 {
-                        self.ui.boxes_overlay_cursor -= 1;
-                    }
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Down => {
-                    if self.ui.boxes_overlay_cursor + 1 < n {
-                        self.ui.boxes_overlay_cursor += 1;
-                    }
-                    return ControlFlow::Continue;
-                }
-                KeyCode::Char(' ') | KeyCode::Enter => {
-                    let b = BoxKind::ALL[self.ui.boxes_overlay_cursor];
-                    // Toggle on/off via panel_sizes so the layout source
-                    // of truth stays consistent. On = Default size;
-                    // pressing 1-5 lets users grow it to Large after.
-                    let cur = self.panel_sizes.enabled(b);
-                    self.panel_sizes.set(
-                        b,
-                        if cur {
-                            bobtop_tui::PanelSize::Off
-                        } else {
-                            bobtop_tui::PanelSize::Default
-                        },
-                    );
-                    self.sync_boxes_from_sizes();
-                    return ControlFlow::Continue;
-                }
-                _ => {} // fall through to normal handling
-            }
+        if let Some(flow) = self.handle_boxes_overlay(k) {
+            return flow;
         }
         match k.code {
             KeyCode::Char('?') => {
@@ -1318,67 +916,175 @@ impl App {
             _ => ControlFlow::Continue,
         }
     }
-}
 
-fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {
-    use std::cmp::Ordering;
-    rows.sort_by(|a, b| {
-        let primary = match sort {
-            TableSort::Pid => a.pid.cmp(&b.pid),
-            TableSort::Name => a.name.cmp(&b.name),
-            TableSort::User => a.user.cmp(&b.user),
-            TableSort::Threads => a.threads.cmp(&b.threads),
-            TableSort::Mem => a.mem_rss_bytes.cmp(&b.mem_rss_bytes),
-            TableSort::Cpu => a
-                .cpu_fraction
-                .partial_cmp(&b.cpu_fraction)
-                .unwrap_or(Ordering::Equal),
-            TableSort::NetRx => a
-                .net_rx_bytes_per_sec
-                .unwrap_or(0.0)
-                .partial_cmp(&b.net_rx_bytes_per_sec.unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-            TableSort::NetTx => a
-                .net_tx_bytes_per_sec
-                .unwrap_or(0.0)
-                .partial_cmp(&b.net_tx_bytes_per_sec.unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-            TableSort::DiskRead => a
-                .disk_read_bytes_per_sec
-                .unwrap_or(0.0)
-                .partial_cmp(&b.disk_read_bytes_per_sec.unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-            TableSort::DiskWrite => a
-                .disk_write_bytes_per_sec
-                .unwrap_or(0.0)
-                .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
-                .unwrap_or(Ordering::Equal),
-        };
-        // Reverse the primary key for descending mode, but keep the PID
-        // tiebreaker ascending so equal-valued rows have a deterministic
-        // order across samples (process samples arrive in HashMap order,
-        // which varies).
-        let primary = if descending { primary.reverse() } else { primary };
-        primary.then_with(|| a.pid.cmp(&b.pid))
-    });
-}
+    // ---- modal handlers --------------------------------------------------
+    //
+    // Each handler returns `Some(ControlFlow)` when it owns the key
+    // event (modal was open and consumed the press) and `None` when
+    // the key should fall through to the next handler / main keymap.
 
-/// Send `signal` to `pid` via libc::kill. Returns a short human-readable
-/// outcome ("sent SIGTERM to pid 1234" / "kill(1234) failed: EPERM") for
-/// the status-bar toast. Errors are surfaced to the user but never
-/// propagated up — kill failures are routine (perm denied, race with
-/// process exit) and should not crash the TUI.
-fn send_signal(pid: u32, signal: KillSignal) -> String {
-    // SAFETY: libc::kill is async-signal-safe; we pass a valid (positive)
-    // pid_t and a known constant signal number. Worst case the kernel
-    // returns EINVAL/EPERM/ESRCH, which we surface as a string.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, signal.libc_value()) };
-    if rc == 0 {
-        format!("sent {} to pid {}", signal.label(), pid)
-    } else {
-        let err = std::io::Error::last_os_error();
-        format!("kill(pid={pid}, {sig}) failed: {err}", sig = signal.label())
+    /// Options overlay (live-preview editor). Routed first so the rest
+    /// of the keymap can't fire while the user is editing settings.
+    fn handle_options_modal(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        let editor = self.ui.options.take()?;
+        match editor.handle_key(k) {
+            OptionsOutcome::KeepOpen(editor) => {
+                self.ui.options = Some(editor);
+            }
+            OptionsOutcome::Preview { editor, preview } => {
+                preview.apply_to(self);
+                self.ui.options = Some(editor);
+            }
+            OptionsOutcome::Cancel { preview } => {
+                preview.apply_to(self);
+            }
+            OptionsOutcome::Save { commit, message } => {
+                commit.apply_to(self);
+                self.ui.last_options_msg = Some(message);
+            }
+        }
+        Some(ControlFlow::Continue)
     }
+
+    /// Process-detail modal. Read-only — Esc/Enter/`q` close it; every
+    /// other key is swallowed so the user doesn't lose their place
+    /// accidentally pressing a sort key.
+    fn handle_detail_modal(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        if self.ui.detail.is_none() {
+            return None;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                self.ui.detail = None;
+            }
+            _ => {}
+        }
+        Some(ControlFlow::Continue)
+    }
+
+    /// Kill confirmation dialog. Enter / y sends the signal; Esc / n
+    /// cancels. Every other key is swallowed so the user can't take
+    /// other action with the modal up.
+    fn handle_kill_modal(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        let req = self.ui.pending_kill.clone()?;
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let outcome = send_signal(req.pid, req.signal);
+                self.ui.last_kill_msg = Some(outcome);
+                self.ui.pending_kill = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.ui.pending_kill = None;
+            }
+            _ => {}
+        }
+        Some(ControlFlow::Continue)
+    }
+
+    /// Process-table filter input. Every keystroke is captured into
+    /// `filter_text`; Esc cancels, Enter commits and exits edit mode.
+    /// Comes BEFORE other modals so `q` / `B` don't quit/open menus
+    /// mid-typing.
+    fn handle_filter_input(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        if !self.ui.filter_active {
+            return None;
+        }
+        match k.code {
+            KeyCode::Esc => {
+                self.ui.filter_active = false;
+                self.ui.filter_text.clear();
+                self.rebuild_sorted();
+            }
+            KeyCode::Enter => {
+                self.ui.filter_active = false;
+            }
+            KeyCode::Backspace => {
+                self.ui.filter_text.pop();
+                self.rebuild_sorted();
+            }
+            KeyCode::Char(c) => {
+                self.ui.filter_text.push(c);
+                self.rebuild_sorted();
+            }
+            _ => {}
+        }
+        Some(ControlFlow::Continue)
+    }
+
+    /// Help overlay. `?` / Esc close it; `q` quits even with the
+    /// overlay up; everything else is swallowed.
+    fn handle_help_overlay(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        if !self.ui.show_help {
+            return None;
+        }
+        match k.code {
+            KeyCode::Char('?') | KeyCode::Esc => {
+                self.ui.show_help = false;
+                Some(ControlFlow::Continue)
+            }
+            KeyCode::Char('q') => Some(ControlFlow::Quit),
+            _ => Some(ControlFlow::Continue),
+        }
+    }
+
+    /// Boxes overlay — ↑/↓ moves cursor, space/Enter toggles. Note this
+    /// handler returns `None` for unhandled keys (rather than swallowing
+    /// like other modals) so `+`/`-` still tunes tick while the overlay
+    /// is visible — matches btop's modal-but-permissive boxes menu.
+    fn handle_boxes_overlay(&mut self, k: KeyEvent) -> Option<ControlFlow> {
+        if !self.ui.show_boxes_overlay {
+            return None;
+        }
+        use bobtop_core::Box as BoxKind;
+        let n = BoxKind::ALL.len();
+        match k.code {
+            KeyCode::Char('B') | KeyCode::Char('b') | KeyCode::Esc => {
+                self.ui.show_boxes_overlay = false;
+                Some(ControlFlow::Continue)
+            }
+            KeyCode::Up => {
+                if self.ui.boxes_overlay_cursor > 0 {
+                    self.ui.boxes_overlay_cursor -= 1;
+                }
+                Some(ControlFlow::Continue)
+            }
+            KeyCode::Down => {
+                if self.ui.boxes_overlay_cursor + 1 < n {
+                    self.ui.boxes_overlay_cursor += 1;
+                }
+                Some(ControlFlow::Continue)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let b = BoxKind::ALL[self.ui.boxes_overlay_cursor];
+                // Toggle via panel_sizes so the layout source of truth
+                // stays consistent. On = Default size; pressing 1-5
+                // lets users grow it to Large after.
+                let cur = self.panel_sizes.enabled(b);
+                self.panel_sizes.set(
+                    b,
+                    if cur {
+                        bobtop_tui::PanelSize::Off
+                    } else {
+                        bobtop_tui::PanelSize::Default
+                    },
+                );
+                self.sync_boxes_from_sizes();
+                Some(ControlFlow::Continue)
+            }
+            _ => None, // fall through so non-modal keys still work
+        }
+    }
+}
+
+/// Bounded ring push — enforces the cap by popping the oldest entry
+/// when full. Keeps every history-VecDeque follows the same eviction
+/// policy without re-implementing the if-len-then-pop pattern at every
+/// fold call site.
+fn push_capped<T>(q: &mut VecDeque<T>, v: T, cap: usize) {
+    if q.len() == cap {
+        q.pop_front();
+    }
+    q.push_back(v);
 }
 
 fn aggregate_net_rates(s: &NetworkSample, include_virtual: bool) -> (f64, f64) {
