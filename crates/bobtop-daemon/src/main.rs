@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 
+use bobtop_core::BoxesEnabled;
 use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
-use bobtop_daemon::engine::{Engine, EngineConfig};
+use bobtop_engine::{Engine, EngineConfig};
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
 
 use bobtop_daemon::app::App;
@@ -58,60 +59,31 @@ async fn main() -> Result<()> {
         LayoutChoice::Minimal => LayoutPreset::Minimal,
     };
 
-    // Build `App` first so we can take its `boxes` handle (the TUI mutates
-    // panel visibility there; the engine reads it every tick). The engine
-    // then owns every sampling task; the TUI subscribes to its bus.
     let tick_ms = Arc::new(AtomicU64::new(eff.tick_ms_clamped()));
-    let mut app = App::new(
-        theme,
-        layout_preset,
-        Arc::clone(&tick_ms),
-        eff.tty,
-        eff.show_virtual_net,
-    );
-    app.corner_style = eff.corners.into();
-    app.theme_background = eff.theme_background;
-    app.truecolor = eff.truecolor;
-    app.apply_color_options();
-    let boxes = app.boxes.clone();
-
-    // Spawn the entire sampling stack: bus, store, history, attribution,
-    // tick driver, five collectors, two attributor loops.
-    let (engine, meta) = Engine::start(EngineConfig {
-        tick_ms: Arc::clone(&tick_ms),
-        boxes: boxes.clone(),
-        allow_ebpf: !eff.no_ebpf,
-        allow_pcap: !eff.no_pcap,
-    });
-
-    app.net_tier = meta.net_tier;
-    app.disk_tier = meta.disk_tier;
-    let app = Arc::new(Mutex::new(app));
-
-    // Self-diagnosing startup line — always logged at warn so users see it
-    // even at default RUST_LOG. Helps explain why per-pid net columns are
-    // empty without requiring `RUST_LOG=info`.
-    tracing::warn!(
-        compiled_features = features_str(),
-        selected_tier = meta.net_tier.name(),
-        per_pid_bandwidth = meta.net_tier.has_bandwidth(),
-        disk_tier = meta.disk_tier.name(),
-        "bobtop start"
-    );
-
-    // Agent query socket. Listener failure (e.g. permission denied on
-    // /tmp) is non-fatal — the TUI keeps running without the agent surface.
-    let agent_handle = bobtop_daemon::agent::spawn(
-        engine.store.clone(),
-        engine.history.clone(),
-    );
 
     if cli.daemon {
-        // Headless mode: the engine + agent socket are already running.
-        // Block until the operator signals shutdown OR the idle watchdog
-        // fires (default 30 min of no socket activity). Tokio doesn't
-        // unwind the listener task's Drop on SIGTERM, so we explicitly
-        // unlink the socket on the way out.
+        // Headless mode: skip App construction entirely (it's a TUI
+        // presentation cache with ~150 KB of history queues + theme
+        // data; useless when nothing is rendering). All collectors are
+        // box-enabled so the engine samples the full host.
+        let boxes = BoxesEnabled::all();
+        let (engine, meta) = Engine::start(EngineConfig {
+            tick_ms: Arc::clone(&tick_ms),
+            boxes,
+            allow_ebpf: !eff.no_ebpf,
+            allow_pcap: !eff.no_pcap,
+        });
+        tracing::warn!(
+            compiled_features = features_str(),
+            selected_tier = meta.net_tier.name(),
+            per_pid_bandwidth = meta.net_tier.has_bandwidth(),
+            disk_tier = meta.disk_tier.name(),
+            "bobtop --daemon start"
+        );
+        let agent_handle = bobtop_daemon::agent::spawn(
+            engine.store.clone(),
+            engine.history.clone(),
+        );
         tracing::warn!(
             idle_exit_secs = DAEMON_IDLE_EXIT_SECS,
             "running in --daemon mode; press Ctrl-C to exit"
@@ -131,11 +103,47 @@ async fn main() -> Result<()> {
         if let Some(h) = agent_handle.as_ref() {
             let _ = std::fs::remove_file(&h.socket_path);
         }
-        // Attributor loops still write into App at runtime even though it
-        // never renders; suppress the "unused" warning explicitly.
-        let _ = app;
         return Ok(());
     }
+
+    // TUI mode: build App first so we can take its `boxes` handle (the
+    // TUI mutates panel visibility there; the engine reads it every tick).
+    let mut app = App::new(
+        theme,
+        layout_preset,
+        Arc::clone(&tick_ms),
+        eff.tty,
+        eff.show_virtual_net,
+    );
+    app.corner_style = eff.corners.into();
+    app.theme_background = eff.theme_background;
+    app.truecolor = eff.truecolor;
+    app.apply_color_options();
+    let boxes = app.boxes.clone();
+
+    let (engine, meta) = Engine::start(EngineConfig {
+        tick_ms: Arc::clone(&tick_ms),
+        boxes: boxes.clone(),
+        allow_ebpf: !eff.no_ebpf,
+        allow_pcap: !eff.no_pcap,
+    });
+
+    app.net_tier = meta.net_tier;
+    app.disk_tier = meta.disk_tier;
+    let app = Arc::new(Mutex::new(app));
+
+    tracing::warn!(
+        compiled_features = features_str(),
+        selected_tier = meta.net_tier.name(),
+        per_pid_bandwidth = meta.net_tier.has_bandwidth(),
+        disk_tier = meta.disk_tier.name(),
+        "bobtop start"
+    );
+
+    let _agent_handle = bobtop_daemon::agent::spawn(
+        engine.store.clone(),
+        engine.history.clone(),
+    );
 
     // Input thread (blocking crossterm reads).
     let input_rx = tui::spawn_input_thread();

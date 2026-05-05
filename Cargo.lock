@@ -152,6 +152,7 @@ dependencies = [
  "async-trait",
  "bobtop-collectors",
  "bobtop-core",
+ "bobtop-engine",
  "bobtop-pid-attr",
  "bobtop-tui",
  "clap",
@@ -165,6 +166,17 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bobtop-engine"
+version = "0.2.0"
+dependencies = [
+ "bobtop-collectors",
+ "bobtop-core",
+ "bobtop-pid-attr",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -1,6 +1,10 @@
 //! The bobtop sampling engine — bus + collectors + per-pid attribution +
 //! latest-value store + retrospective ring buffer, packaged behind one
 //! handle so callers don't have to spawn each task individually.
+
+#![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
+
 //!
 //! Two consumers today: the TUI (subscribes to the bus, renders frames)
 //! and the agent socket server (queries `store` / `history`). A third

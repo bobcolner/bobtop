@@ -4,6 +4,7 @@ members = [
     "crates/bobtop-core",
     "crates/bobtop-collectors",
     "crates/bobtop-pid-attr",
+    "crates/bobtop-engine",
     "crates/bobtop-tui",
     "crates/bobtop-daemon",
 ]
@@ -21,6 +22,7 @@ authors = ["bobtop contributors"]
 bobtop-core = { path = "crates/bobtop-core" }
 bobtop-collectors = { path = "crates/bobtop-collectors" }
 bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
+bobtop-engine = { path = "crates/bobtop-engine" }
 bobtop-tui = { path = "crates/bobtop-tui" }
 
 # TUI rendering
