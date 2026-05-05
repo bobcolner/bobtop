@@ -289,8 +289,8 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&form).render(area, &mut buf);
         assert_eq!(buf[(0, 1)].symbol(), "▶");
-        assert_eq!(buf[(3, 1)].symbol(), "[");
-        assert_eq!(buf[(4, 1)].symbol(), "x");
+        assert_eq!(buf[(2, 1)].symbol(), "[");
+        assert_eq!(buf[(3, 1)].symbol(), "x");
     }
 
     #[test]

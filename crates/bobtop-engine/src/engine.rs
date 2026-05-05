@@ -19,7 +19,7 @@ use std::time::Duration;
 use bobtop_collectors::{
     CpuCollector, DiskCollector, MemoryCollector, NetworkGlobalCollector, ProcessCollector,
 };
-use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, History, MetricEvent, SampleStore};
+use bobtop_core::{BoxesEnabled, Collector, DataBus, History, MetricEvent, SampleStore};
 use bobtop_pid_attr::{
     select as select_attributor, select_disk, AttributionStore, AttributorTier,
     DiskAttributor, DiskAttributorTier, NetworkAttributor, SelectOptions,
@@ -100,38 +100,28 @@ impl Engine {
         let disk = Arc::new(DiskCollector::new());
         spawn_collector(
             cpu,
-            Box::Cpu,
             bus.clone(),
             tick_tx.subscribe(),
-            cfg.boxes.clone(),
         );
         spawn_collector(
             mem,
-            Box::Memory,
             bus.clone(),
             tick_tx.subscribe(),
-            cfg.boxes.clone(),
         );
         spawn_collector(
             proc,
-            Box::Process,
             bus.clone(),
             tick_tx.subscribe(),
-            cfg.boxes.clone(),
         );
         spawn_collector(
             net,
-            Box::Network,
             bus.clone(),
             tick_tx.subscribe(),
-            cfg.boxes.clone(),
         );
         spawn_collector(
             disk,
-            Box::Disk,
             bus.clone(),
             tick_tx.subscribe(),
-            cfg.boxes.clone(),
         );
 
         // Per-pid attribution samplers — separate cadence (≥250ms)
@@ -141,14 +131,12 @@ impl Engine {
             attributor,
             attribution.clone(),
             Arc::clone(&cfg.tick_ms),
-            cfg.boxes.clone(),
         );
         if let Some(da) = disk_attributor {
             spawn_disk_attributor_loop(
                 da,
                 attribution.clone(),
                 Arc::clone(&cfg.tick_ms),
-                cfg.boxes.clone(),
             );
         }
 
@@ -182,10 +170,8 @@ fn spawn_tick_driver(tx: broadcast::Sender<()>, tick_ms: Arc<AtomicU64>) {
 
 fn spawn_collector<C>(
     collector: Arc<C>,
-    box_kind: Box,
     bus: DataBus,
     mut tick_rx: broadcast::Receiver<()>,
-    boxes: BoxesEnabled,
 ) where
     C: Collector + 'static,
     C::Sample: Into<MetricEvent>,
@@ -199,11 +185,6 @@ fn spawn_collector<C>(
                 // single wake — we don't back-fill skipped samples.
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
-            }
-            // Skip collect entirely when the panel is hidden. The wake
-            // still happens so we resume promptly when re-enabled.
-            if !boxes.is_enabled(box_kind) {
-                continue;
             }
             match collector.collect().await {
                 Ok(s) => {
@@ -221,7 +202,6 @@ fn spawn_attributor_loop(
     attr: Arc<dyn NetworkAttributor>,
     store: AttributionStore,
     tick_ms: Arc<AtomicU64>,
-    boxes: BoxesEnabled,
 ) {
     tokio::spawn(async move {
         let tier = attr.tier();
@@ -231,12 +211,6 @@ fn spawn_attributor_loop(
             let dur =
                 Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(250));
             tokio::time::sleep(dur).await;
-            // Per-pid net is consumed by the process collector — when
-            // PROC is hidden we have nowhere to render it, so skip the
-            // sample.
-            if !boxes.is_enabled(Box::Process) {
-                continue;
-            }
             match attr.sample().await {
                 Ok(samples) => store.set_net(samples, tier),
                 Err(e) => tracing::warn!(error = %e, "net attributor sample failed"),
@@ -249,7 +223,6 @@ fn spawn_disk_attributor_loop(
     attr: Arc<dyn DiskAttributor>,
     store: AttributionStore,
     tick_ms: Arc<AtomicU64>,
-    boxes: BoxesEnabled,
 ) {
     tokio::spawn(async move {
         let tier = attr.tier();
@@ -257,9 +230,6 @@ fn spawn_disk_attributor_loop(
             let dur =
                 Duration::from_millis(tick_ms.load(Ordering::Relaxed).max(250));
             tokio::time::sleep(dur).await;
-            if !boxes.is_enabled(Box::Process) {
-                continue;
-            }
             match attr.sample().await {
                 Ok(samples) => store.set_disk(samples, tier),
                 Err(e) => tracing::warn!(error = %e, "disk attributor sample failed"),

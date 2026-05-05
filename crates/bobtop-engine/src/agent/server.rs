@@ -25,8 +25,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::query::{
-    find_pid, history_metric_for, match_summary, parse_window, resolve_pid_by_match, run_top,
-    Group, MatchPattern, Metric, DEFAULT_N,
+    compile_matchers, find_pid, history_metric_for, match_summary, parse_window,
+    resolve_pid_by_match, run_top, Group, MatchPattern, Metric, DEFAULT_N,
 };
 use super::schema::{
     build_peak, build_responsible, build_snapshot, build_window, ErrorResponse, HostSummary,
@@ -266,100 +266,78 @@ fn handle_top(req: Request, store: &SampleStore) -> String {
                 return encode(&ErrorResponse::new(
                     "bad_query",
                     format!(
-                        "group '{s}' not supported in bobtop/v1 (use `flat` or `exec`)"
+                        "group '{s}' not supported in bobtop/v1 (use `flat`, `exec`, `cgroup`, or `tree`)"
                     ),
                 ))
             }
         },
     };
     let n = req.n.unwrap_or(DEFAULT_N);
-    let pat = req.match_.as_deref().map(MatchPattern::new);
-    let resp = run_top(&store.latest(), metric, n, group, pat.as_ref());
+    let patterns = match compile_request_matchers(req.match_.as_ref()) {
+        Ok(p) => p,
+        Err(msg) => return encode(&ErrorResponse::new("bad_query", msg)),
+    };
+    let resp = run_top(&store.latest(), metric, n, group, patterns.as_deref());
     encode(&resp)
 }
 
 fn handle_summary(req: Request, store: &SampleStore) -> String {
     let snap = store.latest();
-    // Pid-scoped summary — single-pid drilldown that returns the same
-    // SummaryResponse shape so clients can parse uniformly.
-    if let Some(pid) = req.pid {
-        let p = match find_pid(&snap, pid) {
-            Some(p) => p,
-            None => {
-                return encode(&ErrorResponse::new(
-                    "pid_not_found",
-                    format!("pid {pid} not in current snapshot"),
-                ))
-            }
-        };
-        return encode(&SummaryResponse {
-            schema: SCHEMA_VERSION,
-            ts: super::schema::rfc3339_now_pub(),
-            scope: "pid".into(),
-            host: HostSummary {
-                cpu_pct: p.cpu_fraction * 100.0,
-                mem_used_bytes: p.mem_rss_bytes,
-                mem_total_bytes: 0,
-                swap_used_bytes: 0,
-                swap_total_bytes: 0,
-                load_1m: None,
-                load_5m: None,
-                load_15m: None,
-                net_rx_bps: p.net_rx_bytes_per_sec.unwrap_or(0.0) as u64,
-                net_tx_bps: p.net_tx_bytes_per_sec.unwrap_or(0.0) as u64,
-                disk_r_bps: p.disk_read_bytes_per_sec.unwrap_or(0.0) as u64,
-                disk_w_bps: p.disk_write_bytes_per_sec.unwrap_or(0.0) as u64,
-                n_procs: 1,
+    let scope = req.scope.as_deref().unwrap_or("auto");
+    match scope {
+        "host" => {
+            let snap_resp = build_snapshot(&snap);
+            encode(&SummaryResponse {
+                schema: SCHEMA_VERSION,
+                ts: snap_resp.ts.clone(),
+                scope: "host".into(),
+                host: snap_resp.host,
+                pid_count: 0,
+                matched: None,
+            })
+        }
+        "pid" => match req.pid {
+            Some(pid) => summary_for_pid(&snap, pid),
+            None => encode(&ErrorResponse::new(
+                "bad_query",
+                "`summary` scope=pid requires `pid`",
+            )),
+        },
+        "match" => match req.match_.as_ref() {
+            Some(_) => match compile_request_matchers(req.match_.as_ref()) {
+                Ok(patterns) => summary_for_match(&snap, patterns.as_deref()),
+                Err(msg) => encode(&ErrorResponse::new("bad_query", msg)),
             },
-            pid_count: 1,
-            matched: Some(p.name.clone()),
-        });
-    }
-    // Match-scoped summary — aggregate over a process family.
-    if let Some(pat_raw) = req.match_.as_deref() {
-        let pat = MatchPattern::new(pat_raw);
-        let agg = match match_summary(&snap, Some(&pat)) {
-            Some(a) => a,
-            None => {
-                return encode(&ErrorResponse::new(
-                    "pid_not_found",
-                    format!("no pids match '{pat_raw}'"),
-                ))
+            None => encode(&ErrorResponse::new(
+                "bad_query",
+                "`summary` scope=match requires `match`",
+            )),
+        },
+        "auto" => {
+            if let Some(pid) = req.pid {
+                return summary_for_pid(&snap, pid);
             }
-        };
-        return encode(&SummaryResponse {
-            schema: SCHEMA_VERSION,
-            ts: super::schema::rfc3339_now_pub(),
-            scope: "match".into(),
-            host: HostSummary {
-                cpu_pct: agg.cpu_pct,
-                mem_used_bytes: agg.mem_bytes,
-                mem_total_bytes: 0,
-                swap_used_bytes: 0,
-                swap_total_bytes: 0,
-                load_1m: None,
-                load_5m: None,
-                load_15m: None,
-                net_rx_bps: agg.net_rx_bps,
-                net_tx_bps: agg.net_tx_bps,
-                disk_r_bps: agg.disk_r_bps,
-                disk_w_bps: agg.disk_w_bps,
-                n_procs: agg.pid_count,
-            },
-            pid_count: agg.pid_count,
-            matched: Some(pat_raw.into()),
-        });
+            if req.match_.is_some() {
+                return match compile_request_matchers(req.match_.as_ref()) {
+                    Ok(patterns) => summary_for_match(&snap, patterns.as_deref()),
+                    Err(msg) => encode(&ErrorResponse::new("bad_query", msg)),
+                };
+            }
+            let snap_resp = build_snapshot(&snap);
+            encode(&SummaryResponse {
+                schema: SCHEMA_VERSION,
+                ts: snap_resp.ts.clone(),
+                scope: "host".into(),
+                host: snap_resp.host,
+                pid_count: 0,
+                matched: None,
+            })
+        }
+        other => encode(&ErrorResponse::new(
+            "bad_query",
+            format!("unknown summary scope '{other}' (use host, pid, or match)"),
+        )),
     }
-    // Default: host scope. Reuse the snapshot builder's HostSummary.
-    let snap_resp = build_snapshot(&snap);
-    encode(&SummaryResponse {
-        schema: SCHEMA_VERSION,
-        ts: snap_resp.ts.clone(),
-        scope: "host".into(),
-        host: snap_resp.host,
-        pid_count: 0,
-        matched: None,
-    })
 }
 
 fn handle_pid_inspect(req: Request, store: &SampleStore) -> String {
@@ -368,22 +346,25 @@ fn handle_pid_inspect(req: Request, store: &SampleStore) -> String {
     // pattern that resolves to exactly one pid.
     let pid: u32 = if let Some(p) = req.pid {
         p
-    } else if let Some(pat_raw) = req.match_.as_deref() {
-        let pat = MatchPattern::new(pat_raw);
-        match resolve_pid_by_match(&snap, &pat) {
+    } else if req.match_.is_some() {
+        let patterns = match compile_request_matchers(req.match_.as_ref()) {
+            Ok(p) => p,
+            Err(msg) => return encode(&ErrorResponse::new("bad_query", msg)),
+        };
+        let pats = patterns.as_deref().unwrap_or(&[]);
+        match resolve_pid_by_match(&snap, pats) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 return encode(&ErrorResponse::new(
                     "pid_not_found",
-                    format!("no pid matches '{pat_raw}'"),
+                    "no pid matches the supplied match patterns",
                 ))
             }
             Err(count) => {
                 return encode(&ErrorResponse::new(
                     "bad_query",
                     format!(
-                        "match '{pat_raw}' is ambiguous ({count}+ pids); \
-                         use --pid <n> or a stricter pattern"
+                        "match patterns are ambiguous ({count}+ pids); use --pid <n> or a stricter pattern"
                     ),
                 ))
             }
@@ -422,6 +403,86 @@ fn handle_pid_inspect(req: Request, store: &SampleStore) -> String {
         disk_w_bps: p.disk_write_bytes_per_sec,
         cgroup: p.cgroup.clone(),
     })
+}
+
+fn summary_for_pid(snap: &bobtop_core::HostSample, pid: u32) -> String {
+    let p = match find_pid(snap, pid) {
+        Some(p) => p,
+        None => {
+            return encode(&ErrorResponse::new(
+                "pid_not_found",
+                format!("pid {pid} not in current snapshot"),
+            ));
+        }
+    };
+    encode(&SummaryResponse {
+        schema: SCHEMA_VERSION,
+        ts: super::schema::rfc3339_now_pub(),
+        scope: "pid".into(),
+        host: HostSummary {
+            cpu_pct: p.cpu_fraction * 100.0,
+            mem_used_bytes: p.mem_rss_bytes,
+            mem_total_bytes: 0,
+            swap_used_bytes: 0,
+            swap_total_bytes: 0,
+            load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            net_rx_bps: p.net_rx_bytes_per_sec.unwrap_or(0.0) as u64,
+            net_tx_bps: p.net_tx_bytes_per_sec.unwrap_or(0.0) as u64,
+            disk_r_bps: p.disk_read_bytes_per_sec.unwrap_or(0.0) as u64,
+            disk_w_bps: p.disk_write_bytes_per_sec.unwrap_or(0.0) as u64,
+            n_procs: 1,
+        },
+        pid_count: 1,
+        matched: Some(p.name.clone()),
+    })
+}
+
+fn summary_for_match(
+    snap: &bobtop_core::HostSample,
+    pats: Option<&[MatchPattern]>,
+) -> String {
+    let agg = match match_summary(snap, pats) {
+        Some(a) => a,
+        None => {
+            return encode(&ErrorResponse::new(
+                "pid_not_found",
+                "no pids match the supplied match patterns",
+            ));
+        }
+    };
+    encode(&SummaryResponse {
+        schema: SCHEMA_VERSION,
+        ts: super::schema::rfc3339_now_pub(),
+        scope: "match".into(),
+        host: HostSummary {
+            cpu_pct: agg.cpu_pct,
+            mem_used_bytes: agg.mem_bytes,
+            mem_total_bytes: 0,
+            swap_used_bytes: 0,
+            swap_total_bytes: 0,
+            load_1m: None,
+            load_5m: None,
+            load_15m: None,
+            net_rx_bps: agg.net_rx_bps,
+            net_tx_bps: agg.net_tx_bps,
+            disk_r_bps: agg.disk_r_bps,
+            disk_w_bps: agg.disk_w_bps,
+            n_procs: agg.pid_count,
+        },
+        pid_count: agg.pid_count,
+        matched: None,
+    })
+}
+
+fn compile_request_matchers(
+    query: Option<&super::schema::MatchQuery>,
+) -> Result<Option<Vec<MatchPattern>>, String> {
+    match query {
+        Some(q) => Ok(Some(compile_matchers(q.as_slice())?)),
+        None => Ok(None),
+    }
 }
 
 fn handle_responsible_for(req: Request, history: &History) -> String {
@@ -718,6 +779,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_match_array_dispatches() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(
+            r#"{"q":"top","by":"cpu","match":["node","redis"]}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"group\":\"flat\""));
+        assert!(r.contains("\"name\":\"node\""));
+        assert!(r.contains("\"name\":\"redis\""));
+    }
+
+    #[tokio::test]
     async fn summary_pid_returns_drilldown() {
         let (_bus, store, history) = store_with_processes();
         wait_for_processes(&store).await;
@@ -768,6 +843,19 @@ mod tests {
         );
         assert!(r.contains("\"code\":\"bad_query\""));
         assert!(r.contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn pid_inspect_match_array_no_match_errors() {
+        let (_bus, store, history) = store_with_processes();
+        wait_for_processes(&store).await;
+        let r = dispatch(
+            r#"{"q":"pid_inspect","match":["does-not-exist","still-nope"]}"#,
+            &store,
+            &history,
+        );
+        assert!(r.contains("\"code\":\"pid_not_found\""));
+        assert!(r.contains("no pid matches"));
     }
 
     #[tokio::test]

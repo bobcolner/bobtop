@@ -126,6 +126,6 @@ mod tests {
         let mut buf = Buffer::empty(area);
         (&list).render(area, &mut buf);
         assert_eq!(buf[(0, 1)].symbol(), "▶");
-        assert_eq!(buf[(4, 1)].symbol(), "t");
+        assert_eq!(buf[(2, 1)].symbol(), "t");
     }
 }

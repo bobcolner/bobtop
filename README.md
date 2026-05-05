@@ -1,10 +1,58 @@
 # bobtop
 
-A best-in-class terminal system monitor in Rust — btop-quality visuals, async-first
-runtime, and **per-process network bandwidth attribution** (which neither btop nor
-btm provide).
+bobtop is a terminal system monitor in Rust with a btop-style TUI, async
+sampling, and per-process network bandwidth attribution. It is Linux-first;
+macOS support is best-effort.
 
-Linux-first; macOS support is best-effort.
+## Summary
+
+bobtop gives you two ways to work with the same engine:
+
+1. The TUI for interactive monitoring.
+2. The agent query mode for structured host-state questions over a Unix socket.
+
+Key capabilities:
+
+- CPU, memory, disk, network, and process views.
+- Per-process network attribution with fallback tiers.
+- Process clustering by executable, cgroup, or tree.
+- Theme support for btop `.theme` files.
+- Headless daemon mode plus auto-spawning agent clients.
+
+### Agent prompt
+
+Use this prompt for an agent that should operate bobtop:
+
+```text
+You are operating bobtop through its agent interface.
+Use `snapshot` for current host state, `top` for ranked process lists,
+`summary` for host or process-family rollups, `pid_inspect` for a single
+process, `window` and `peak` for history, and `responsible_for` for
+point-in-time ownership.
+
+Prefer the smallest query that answers the question.
+Use `--group flat|exec|cgroup|tree` when ranking processes.
+Use `--match` to narrow by process name or command line. In the raw JSON
+wire format, `match` accepts a single string or an array of strings, and
+array entries are OR'd together. In the `bobtop agent` CLI, pass one
+pattern per `--match`.
+Use `re:` for regex matching and glob wildcards like `*chrome*` for pattern
+matching.
+If a match is ambiguous, refine it or switch to `--pid`.
+Return the answer and the exact bobtop query you used.
+```
+
+### Agent verbs
+
+- `snapshot` - latest host-level summary.
+- `top --by <metric> [--n N] [--group G] [--match PATTERN]` - ranked
+  processes or groups.
+- `summary [--match PAT]... [--pid N]` - host, match, or pid rollup.
+- `pid_inspect (--pid N | --match PATTERN)...` - full detail for one process.
+- `window --metric <m> --window <w>` - avg, peak, and p95 over history.
+- `peak --metric <m> --window <w>` - peak value and who owned it.
+- `responsible_for --metric <m> --at <offset>` - who owned a metric at a
+  point in the past.
 
 ## Install
 
@@ -12,23 +60,24 @@ Linux-first; macOS support is best-effort.
 git clone https://github.com/bobcolner/bobtop
 cd bobtop
 cargo build --release -p bobtop-daemon
-# binary at ./target/release/bobtop
 ```
 
 Optional features:
 
-| feature   | adds                                            | system deps                |
-|-----------|-------------------------------------------------|----------------------------|
-| `pcap`    | Tier 2 per-process bandwidth via libpcap        | `libpcap-dev`              |
-| `ebpf`    | Tier 3 per-process bandwidth via eBPF kprobes   | `clang`, `libbpf-dev`      |
-| `nvidia`  | NVIDIA GPU stats via NVML (not yet wired in UI) | proprietary NVIDIA drivers |
+| feature | adds | system deps |
+|---|---|---|
+| `pcap` | Tier 2 per-process bandwidth attribution | `libpcap-dev` |
+| `ebpf` | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
+| `nvidia` | NVIDIA GPU stats via NVML | proprietary NVIDIA drivers |
+
+Examples:
 
 ```bash
 # Linux + libpcap
 sudo apt install libpcap-dev
 cargo build --release -p bobtop-daemon --features pcap
 
-# Linux + eBPF (best per-process net data)
+# Linux + eBPF
 sudo apt install clang libbpf-dev
 cargo build --release -p bobtop-daemon --features ebpf
 ```
@@ -42,132 +91,148 @@ cargo build --release -p bobtop-daemon --features ebpf
 Useful flags:
 
 ```bash
-./target/release/bobtop --theme tokyo-night        # any of 41 bundled btop themes
-./target/release/bobtop --list-themes              # print every theme name and exit
-./target/release/bobtop --help-keys                # print all keybinds and exit
-./target/release/bobtop --layout minimal           # cpu + processes only
-./target/release/bobtop --tick-ms 500              # faster updates (default 1500ms)
-./target/release/bobtop --corners square           # plain box corners (default rounded)
-./target/release/bobtop --tty                      # block-char fallback for VTs without braille
-./target/release/bobtop --show-virtual-net         # include lo, docker0, veth*, tun* in net aggregate
-./target/release/bobtop --no-ebpf --no-pcap        # force lower-tier net attribution
-RUST_LOG=info ./target/release/bobtop              # log tier selection + collector errors to stderr
+./target/release/bobtop --theme tokyo-night
+./target/release/bobtop --list-themes
+./target/release/bobtop --help-keys
+./target/release/bobtop --layout minimal
+./target/release/bobtop --tick-ms 500
+./target/release/bobtop --corners square
+./target/release/bobtop --tty
+./target/release/bobtop --show-virtual-net
+./target/release/bobtop --no-ebpf --no-pcap
+RUST_LOG=info ./target/release/bobtop
 ```
 
-Sticky preferences live at `~/.config/bobtop/bobtop.toml` (XDG-respected);
-CLI flags override file values. Edit live in-app via the `O` overlay
-(see Keyboard below).
+Sticky preferences live at `~/.config/bobtop/bobtop.toml`. CLI flags override
+file values. Edit live in the TUI via the `O` overlay.
+
+Agent mode:
+
+```bash
+./target/release/bobtop agent snapshot
+./target/release/bobtop agent top --by cpu --n 5
+./target/release/bobtop agent top --by mem --group exec --match '*chrome*' --match 're:^pg_'
+./target/release/bobtop agent summary --match 'node' --match 'redis'
+./target/release/bobtop agent pid_inspect --match 'postgres' --match 're:^pg_'
+./target/release/bobtop agent summary --pid 1234
+```
+
+Raw socket example:
+
+```json
+{"q":"top","by":"mem","group":"exec","match":["*chrome*","re:^pg_"]}
+```
 
 ### Keyboard
 
-| key                 | action                                                     |
-|---------------------|------------------------------------------------------------|
-| `q` / Ctrl-C        | quit                                                       |
-| `Esc`               | close overlay (or quit when none open)                     |
-| `?`                 | help overlay                                               |
-| `↑` `↓`             | move process selection                                     |
-| `PgUp` `PgDn`       | jump 10 rows                                               |
-| `Home` `End`        | jump to top / bottom                                       |
-| `+` `-`             | tune update tick by ±100ms (live)                          |
-| `←` `→`             | cycle sort column                                          |
-| `r`                 | reverse sort direction                                     |
-| `p` `n` `m` `c`     | sort by Pid / Name / Mem / Cpu                             |
-| `1` `2` `3` `4`     | preset layouts (CPU / MEM / NET-RX / minimal)              |
-| `B`                 | boxes overlay — show/hide individual panels live           |
-| `O`                 | options overlay — edit config + save to disk               |
-| `f`                 | filter processes by name/cmdline                           |
-| `g`                 | cycle group mode: flat → exec → cgroup → tree              |
-| `Space`             | expand/collapse selected group or subtree                  |
-| `Enter`             | process detail (read-only) or expand on group header       |
-| `k` / `K`           | send SIGTERM / SIGKILL to selected process (confirm modal) |
+| key | action |
+|---|---|
+| `q` / Ctrl-C | quit |
+| `Esc` | close overlay, or quit when none is open |
+| `?` | help overlay |
+| `↑` `↓` | move process selection |
+| `PgUp` `PgDn` | jump 10 rows |
+| `Home` `End` | jump to top or bottom |
+| `+` `-` | change update tick by 100 ms |
+| `←` `→` | cycle sort column |
+| `r` | reverse sort direction |
+| `p` `n` `m` `c` | sort by pid, name, memory, or cpu |
+| `1` `2` `3` `4` | preset layouts |
+| `B` | show or hide panels |
+| `O` | edit config and save to disk |
+| `f` | filter processes by name or cmdline |
+| `g` | cycle group mode |
+| `Space` | expand or collapse the selected group |
+| `Enter` | process detail or expand a group header |
+| `k` / `K` | send SIGTERM or SIGKILL to the selected process |
 
-## Themes
+## Architecture
 
-bobtop reads btop's native `.theme` format directly. All 41 upstream
-btop themes ship embedded in the binary. Drop your own at:
+bobtop is organized around a shared engine and thin front-ends.
 
-- `~/.config/bobtop/themes/<name>.theme`
-- `~/.config/btop/themes/<name>.theme` (existing btop users get them for free)
+### Runtime design
 
-Then `--theme <name>` to load it.
+- Collectors gather system data.
+- The engine publishes samples into a latest-value store and a history ring.
+- The TUI reads the same engine state for display.
+- The agent server exposes that state over a Unix socket as line-delimited JSON.
+- The CLI client can auto-connect or auto-spawn `bobtop --daemon` when the
+  socket is missing.
 
-## Network attribution tiers
+### Workspace layout
 
-bobtop picks the most accurate available backend at startup; lower tiers are
-graceful fallbacks.
+| crate | role |
+|---|---|
+| `bobtop-core` | shared types, history, sample store, bus, and common helpers |
+| `bobtop-collectors` | CPU, memory, network, disk, and process collectors |
+| `bobtop-pid-attr` | per-process network and disk attribution helpers |
+| `bobtop-engine` | sampling engine plus agent query surface |
+| `bobtop-tui` | ratatui widgets, themes, and layout code |
+| `bobtop-daemon` | binary, CLI, and TUI wiring |
 
-| tier | backend             | per-pid bytes | privilege            |
-|------|---------------------|---------------|----------------------|
-| 3    | eBPF kprobes        | exact         | `CAP_BPF + CAP_PERFMON` (or root) |
-| 2    | libpcap + inode map | sampled       | `CAP_NET_RAW` (or root)           |
-| 1    | `/proc/net/tcp` walk| —             | none (sees own user only)         |
-| 0    | unavailable         | —             | —                                 |
+### Agent surface
 
-To unlock Tier 3 on Linux without running as root:
+The agent socket lives at `$XDG_RUNTIME_DIR/bobtop.sock`, with a fallback to
+`/tmp/bobtop-$UID.sock`. Responses are schema-versioned as `bobtop/v1`.
+
+The current query surface is read-only and includes:
+
+- `snapshot`
+- `top`
+- `window`
+- `peak`
+- `summary`
+- `pid_inspect`
+- `responsible_for`
+
+Process grouping supports `flat`, `exec`, `cgroup`, and `tree`.
+`match` accepts a single string or an array of strings in the raw wire
+format. Each entry can use substring, glob, or `re:` regex matching, and
+array entries are OR'd.
+
+### Attribution tiers
+
+bobtop chooses the best available bandwidth attribution backend at startup.
+
+| tier | backend | per-pid bytes | privilege |
+|---|---|---|---|
+| 3 | eBPF kprobes | exact | `CAP_BPF + CAP_PERFMON` or root |
+| 2 | libpcap + inode map | sampled | `CAP_NET_RAW` or root |
+| 1 | `/proc/net/tcp` walk | no per-pid attribution | none |
+| 0 | unavailable | none | none |
+
+To unlock tier 3 on Linux without root:
 
 ```bash
 sudo setcap 'cap_bpf,cap_perfmon=ep' ./target/release/bobtop
-./target/release/bobtop                            # process table now shows RX/s, TX/s columns
+./target/release/bobtop
 ```
 
-The CPU panel title shows the active tier (e.g. `attributor: ebpf`) and the
-process table grows two extra columns (`RX/s`, `TX/s`) automatically when the
-tier provides bandwidth.
+## Themes
 
-## Workspace layout
+bobtop reads btop's native `.theme` format directly. All bundled themes ship
+in the binary. Drop your own at:
 
-```
-crates/
-  bobtop-core/         shared types, Collector trait, DataBus
-  bobtop-collectors/   CPU, memory, network, disk, process collectors
-  bobtop-net/          tiered network attribution (proc / pcap / ebpf)
-  bobtop-tui/          ratatui widgets, themes, layout
-  bobtop-daemon/       binary
-```
+- `~/.config/bobtop/themes/<name>.theme`
+- `~/.config/btop/themes/<name>.theme`
 
-## Process clustering
-
-`g` cycles between four views of the process list:
-
-- **flat** — one row per process (default)
-- **exec** — collapse by executable name; "chrome (47)" sums to one row
-- **cgroup** — collapse by `/proc/[pid]/cgroup` leaf; on systemd hosts
-  this groups by service / container — `firefox.service`,
-  `docker-<sha>.scope`, `user@1000.service` — and containers + k8s
-  pods show up as named cgroups for free
-- **tree** — parent_pid hierarchy with collapsible subtrees
-
-Headers carry aggregated CPU / MEM / threads / RX / TX / DR / DW so the
-collapsed view is informative on its own. Headers sort by the
-aggregate matching the active sort key, so `m` (sort by mem) +
-`g`-to-cgroup gives "which cgroup is using the most memory" — the
-clustering question, answered.
-
-Per-mode column layouts: Flat shows everything; Grouped drops Pid,
-Command, User (no aggregate value at header level — Program flexes for
-long group keys); Tree drops Command (Program flexes for indent +
-branch glyphs).
-
-## Status
-
-See [ROADMAP.md](ROADMAP.md) for shipped Phase A (perf) + Phase B (UX)
-items and what remains open.
+Then run `--theme <name>`.
 
 ## Tests
 
 ```bash
-cargo test --workspace                              # 115 tests, default features
-cargo test --workspace --features bobtop-net/pcap   # +pcap parser tests
-cargo bench -p bobtop-daemon                        # render-loop perf benches
+cargo test --workspace
+cargo test -p bobtop-daemon --features pcap
+cargo bench -p bobtop-daemon
 ```
 
-Visual smoke tests (render full frame with truecolor ANSI, no real terminal needed):
+Visual smoke tests:
 
 ```bash
 cargo run --example frame_smoke -p bobtop-daemon
 cargo run --example braille_smoke -p bobtop-daemon
 cargo run --example collectors_smoke -p bobtop-daemon
-cargo run --example ebpf_smoke -p bobtop-daemon --features ebpf   # needs CAP_BPF
+cargo run --example ebpf_smoke -p bobtop-daemon --features ebpf
 ```
 
 ## License

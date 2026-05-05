@@ -100,17 +100,11 @@ impl HistoryRing {
     }
 
     /// Choose the smallest tier that covers `window`, returning its host
-    /// entries. Older entries are ordered first.
+    /// entries filtered to the requested time range. Older entries are
+    /// ordered first.
     pub fn host_window(&self, window: Duration) -> Vec<HostMetrics> {
-        let secs = window.as_secs();
-        let ring = if secs <= 60 {
-            &self.host_1s
-        } else if secs <= 300 {
-            &self.host_5s
-        } else {
-            &self.host_30s
-        };
-        ring.iter().copied().collect()
+        let (host_ring, _) = ring_for_window(self, window);
+        windowed_host_entries(host_ring, window)
     }
 
     /// Top-N for a metric at a point in the past, expressed as an offset
@@ -118,27 +112,8 @@ impl HistoryRing {
     /// the offset. Returns `None` when the offset is older than the longest
     /// tier or no data has been captured yet.
     pub fn procs_at(&self, offset: Duration, by: Metric) -> Option<Vec<ProcRef>> {
-        let secs = offset.as_secs();
-        let ring = if secs <= 60 {
-            &self.procs_1s
-        } else if secs <= 300 {
-            &self.procs_5s
-        } else if secs <= 1800 {
-            &self.procs_30s
-        } else {
-            return None;
-        };
-        // Most recent at the back; offset 0 == latest.
-        let idx_from_back = match secs {
-            0..=60 => secs as usize,
-            61..=300 => (secs / 5) as usize,
-            301..=1800 => (secs / 30) as usize,
-            _ => return None,
-        };
-        if idx_from_back >= ring.len() {
-            return None;
-        }
-        let entry = &ring[ring.len() - 1 - idx_from_back];
+        let (_, ring) = ring_for_window(self, offset);
+        let entry = closest_entry_before(ring, offset)?;
         Some(match by {
             Metric::Cpu => entry.by_cpu.clone(),
             Metric::Mem => entry.by_mem.clone(),
@@ -188,7 +163,10 @@ impl History {
     /// Window stats for a host-level metric. Picks the smallest tier that
     /// covers `window` (matches `host_window`'s behavior).
     pub fn host_stats(&self, window: Duration, by: Metric) -> Option<WindowStats> {
-        let entries = self.read(|r| r.host_window(window));
+        let entries = self.read(|r| {
+            let (host_ring, _) = ring_for_window(r, window);
+            windowed_host_entries(host_ring, window)
+        });
         if entries.is_empty() {
             return None;
         }
@@ -221,26 +199,8 @@ impl History {
     /// from the 1-second ring (high-fidelity) rather than the 30-second one.
     pub fn responsible_at(&self, offset: Duration, by: Metric) -> Option<Vec<ProcRef>> {
         self.read(|r| {
-            let secs = offset.as_secs();
-            let (procs_ring, step_secs) = if secs <= 60 {
-                (&r.procs_1s, 1u64)
-            } else if secs <= 300 {
-                (&r.procs_5s, 5u64)
-            } else if secs <= 1800 {
-                (&r.procs_30s, 30u64)
-            } else {
-                return None;
-            };
-            if procs_ring.is_empty() {
-                return None;
-            }
-            // Snap the requested offset to the nearest tier slot. Most
-            // recent slot is at the back of the deque (offset 0).
-            let idx_from_back = (secs / step_secs) as usize;
-            if idx_from_back >= procs_ring.len() {
-                return None;
-            }
-            let entry = &procs_ring[procs_ring.len() - 1 - idx_from_back];
+            let (_, procs_ring) = ring_for_window(r, offset);
+            let entry = closest_entry_before(procs_ring, offset)?;
             Some(match by {
                 Metric::Cpu => entry.by_cpu.clone(),
                 Metric::Mem => entry.by_mem.clone(),
@@ -255,32 +215,35 @@ impl History {
     /// have been recorded yet.
     pub fn peak(&self, window: Duration, by: Metric) -> Option<PeakResult> {
         self.read(|r| {
-            let (host_ring, procs_ring, step_secs) = ring_for_window(r, window);
-            if host_ring.is_empty() {
+            let (host_ring, procs_ring) = ring_for_window(r, window);
+            let entries = windowed_entries(host_ring, procs_ring, window);
+            if entries.is_empty() {
                 return None;
             }
+            let synthetic_ts = host_ring.iter().all(|h| h.ts_unix_ms == 0);
             let mut peak_v = f64::MIN;
             let mut peak_idx = 0usize;
-            for (i, h) in host_ring.iter().enumerate() {
+            for (i, (h, _)) in entries.iter().enumerate() {
                 let v = host_metric(h, by);
                 if v > peak_v {
                     peak_v = v;
                     peak_idx = i;
                 }
             }
-            let offset_idx = host_ring.len() - 1 - peak_idx;
-            let offset_secs = (offset_idx as u64) * step_secs;
-            // Pull the matching `TopProcs` entry from the same tier — same
-            // index, since both rings advance together.
-            let responsible = procs_ring
-                .get(peak_idx)
-                .map(|tp| match by {
-                    Metric::Cpu => tp.by_cpu.clone(),
-                    Metric::Mem => tp.by_mem.clone(),
-                    Metric::NetTx => tp.by_net_tx.clone(),
-                    Metric::NetRx => tp.by_net_rx.clone(),
-                })
-                .unwrap_or_default();
+            let (peak_host, peak_procs) = entries[peak_idx];
+            let offset_secs = if synthetic_ts {
+                (entries.len() - 1 - peak_idx) as u64
+            } else {
+                let latest_ts =
+                    entries.last().map(|(h, _)| h.ts_unix_ms).unwrap_or(peak_host.ts_unix_ms);
+                latest_ts.saturating_sub(peak_host.ts_unix_ms) / 1000
+            };
+            let responsible = match by {
+                Metric::Cpu => peak_procs.by_cpu.clone(),
+                Metric::Mem => peak_procs.by_mem.clone(),
+                Metric::NetTx => peak_procs.by_net_tx.clone(),
+                Metric::NetRx => peak_procs.by_net_rx.clone(),
+            };
             Some(PeakResult {
                 value: peak_v,
                 offset_secs,
@@ -320,19 +283,92 @@ impl History {
     }
 }
 
-/// Pick the smallest tier that covers `window`, returning its host ring,
-/// matching procs ring, and the per-step duration in seconds.
+/// Pick the smallest tier that covers `window`, returning its host ring and
+/// matching procs ring.
 fn ring_for_window(
     r: &HistoryRing,
     window: Duration,
-) -> (&VecDeque<HostMetrics>, &VecDeque<TopProcs>, u64) {
+) -> (&VecDeque<HostMetrics>, &VecDeque<TopProcs>) {
     let secs = window.as_secs();
     if secs <= 60 {
-        (&r.host_1s, &r.procs_1s, 1)
+        (&r.host_1s, &r.procs_1s)
     } else if secs <= 300 {
-        (&r.host_5s, &r.procs_5s, 5)
+        (&r.host_5s, &r.procs_5s)
     } else {
-        (&r.host_30s, &r.procs_30s, 30)
+        (&r.host_30s, &r.procs_30s)
+    }
+}
+
+fn windowed_host_entries(ring: &VecDeque<HostMetrics>, window: Duration) -> Vec<HostMetrics> {
+    if ring.iter().all(|h| h.ts_unix_ms == 0) {
+        return ring.iter().copied().collect();
+    }
+    let Some(latest_ts) = ring.back().map(|h| h.ts_unix_ms) else {
+        return Vec::new();
+    };
+    let cutoff = latest_ts.saturating_sub(window.as_millis().min(u64::MAX as u128) as u64);
+    ring.iter()
+        .copied()
+        .filter(|h| h.ts_unix_ms > cutoff)
+        .collect()
+}
+
+fn windowed_entries<'a>(
+    host_ring: &'a VecDeque<HostMetrics>,
+    procs_ring: &'a VecDeque<TopProcs>,
+    window: Duration,
+) -> Vec<(HostMetrics, &'a TopProcs)> {
+    if host_ring.iter().all(|h| h.ts_unix_ms == 0) {
+        return host_ring
+            .iter()
+            .copied()
+            .zip(procs_ring.iter())
+            .collect();
+    }
+    let Some(latest_ts) = host_ring.back().map(|h| h.ts_unix_ms) else {
+        return Vec::new();
+    };
+    let cutoff = latest_ts.saturating_sub(window.as_millis().min(u64::MAX as u128) as u64);
+    host_ring
+        .iter()
+        .copied()
+        .zip(procs_ring.iter())
+        .filter(|(h, _)| h.ts_unix_ms > cutoff)
+        .collect()
+}
+
+fn closest_entry_before<'a, T>(
+    ring: &'a VecDeque<T>,
+    offset: Duration,
+) -> Option<&'a T>
+where
+    T: SampleTimestamp,
+{
+    if ring.iter().all(|entry| entry.ts_unix_ms() == 0) {
+        let idx_from_back = offset.as_secs() as usize;
+        if idx_from_back >= ring.len() {
+            return None;
+        }
+        return ring.get(ring.len() - 1 - idx_from_back);
+    }
+    let latest_ts = ring.back()?.ts_unix_ms();
+    let target = latest_ts.saturating_sub(offset.as_millis().min(u64::MAX as u128) as u64);
+    ring.iter().rev().find(|entry| entry.ts_unix_ms() <= target)
+}
+
+trait SampleTimestamp {
+    fn ts_unix_ms(&self) -> u64;
+}
+
+impl SampleTimestamp for HostMetrics {
+    fn ts_unix_ms(&self) -> u64 {
+        self.ts_unix_ms
+    }
+}
+
+impl SampleTimestamp for TopProcs {
+    fn ts_unix_ms(&self) -> u64 {
+        self.ts_unix_ms
     }
 }
 

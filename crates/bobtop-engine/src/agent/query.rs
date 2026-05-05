@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use bobtop_core::sample::ProcessInfo;
 use bobtop_core::HostSample;
+use globset::{GlobBuilder, GlobMatcher};
+use regex::Regex;
 
 use super::schema::{rfc3339_now_pub, Row, TopResponse, SCHEMA_VERSION};
 
@@ -89,73 +91,89 @@ impl Group {
 }
 
 /// Compiled match predicate. Cheap to evaluate per pid (case-insensitive
-/// glob or substring), cheap to construct per request.
+/// glob, regex, or substring), cheap to construct per request.
 #[derive(Debug, Clone)]
 pub struct MatchPattern {
-    raw_lower: String,
-    is_glob: bool,
+    kind: MatchKind,
+}
+
+#[derive(Debug, Clone)]
+enum MatchKind {
+    Contains(String),
+    Glob(GlobMatcher),
+    Regex(Regex),
 }
 
 impl MatchPattern {
-    pub fn new(raw: &str) -> Self {
-        let is_glob = raw.contains('*') || raw.contains('?');
-        Self {
-            raw_lower: raw.to_ascii_lowercase(),
-            is_glob,
+    pub fn new(raw: &str) -> Result<Self, String> {
+        if let Some(pattern) = raw.strip_prefix("re:") {
+            let regex = Regex::new(&format!("(?i:{pattern})"))
+                .map_err(|e| format!("invalid regex pattern '{pattern}': {e}"))?;
+            return Ok(Self {
+                kind: MatchKind::Regex(regex),
+            });
         }
+
+        if raw.contains('*') || raw.contains('?') {
+            let glob = GlobBuilder::new(raw)
+                .case_insensitive(true)
+                .build()
+                .map_err(|e| format!("invalid glob pattern '{raw}': {e}"))?
+                .compile_matcher();
+            return Ok(Self {
+                kind: MatchKind::Glob(glob),
+            });
+        }
+
+        Ok(Self {
+            kind: MatchKind::Contains(raw.to_ascii_lowercase()),
+        })
     }
 
     /// Returns `Some(field)` when the pattern matches name or cmdline,
     /// where `field` is `"name"` or `"cmdline"`. `None` on miss.
     pub fn check(&self, p: &ProcessInfo) -> Option<&'static str> {
-        let name_lower = p.name.to_ascii_lowercase();
-        if self.is_glob {
-            if glob_match(&self.raw_lower, &name_lower) {
-                return Some("name");
+        match &self.kind {
+            MatchKind::Contains(raw_lower) => {
+                let name_lower = p.name.to_ascii_lowercase();
+                if name_lower.contains(raw_lower) {
+                    return Some("name");
+                }
+                let cmd_lower = p.cmdline.to_ascii_lowercase();
+                if cmd_lower.contains(raw_lower) {
+                    return Some("cmdline");
+                }
             }
-            let cmd_lower = p.cmdline.to_ascii_lowercase();
-            if glob_match(&self.raw_lower, &cmd_lower) {
-                return Some("cmdline");
+            MatchKind::Glob(glob) => {
+                if glob.is_match(&p.name) {
+                    return Some("name");
+                }
+                if glob.is_match(&p.cmdline) {
+                    return Some("cmdline");
+                }
             }
-        } else {
-            if name_lower.contains(&self.raw_lower) {
-                return Some("name");
-            }
-            let cmd_lower = p.cmdline.to_ascii_lowercase();
-            if cmd_lower.contains(&self.raw_lower) {
-                return Some("cmdline");
+            MatchKind::Regex(regex) => {
+                if regex.is_match(&p.name) {
+                    return Some("name");
+                }
+                if regex.is_match(&p.cmdline) {
+                    return Some("cmdline");
+                }
             }
         }
         None
     }
 }
 
-/// Iterative glob match supporting `*` (zero or more) and `?` (any one).
-/// Linear in `pattern.len() + s.len()` amortized.
-pub fn glob_match(pattern: &str, s: &str) -> bool {
-    let p = pattern.as_bytes();
-    let t = s.as_bytes();
-    let (mut pi, mut si) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while si < t.len() {
-        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[si]) {
-            pi += 1;
-            si += 1;
-        } else if pi < p.len() && p[pi] == b'*' {
-            star = Some((pi, si));
-            pi += 1;
-        } else if let Some((sp, ss)) = star {
-            pi = sp + 1;
-            si = ss + 1;
-            star = Some((sp, si));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == b'*' {
-        pi += 1;
-    }
-    pi == p.len()
+pub fn compile_matchers(raws: &[String]) -> Result<Vec<MatchPattern>, String> {
+    raws.iter().map(|raw| MatchPattern::new(raw)).collect()
+}
+
+pub fn check_any<'a>(
+    pats: &'a [MatchPattern],
+    p: &ProcessInfo,
+) -> Option<&'static str> {
+    pats.iter().find_map(|pat| pat.check(p))
 }
 
 /// Parse a window string like `30s`, `1m`, `5m`, `30m`. Returns the duration
@@ -204,7 +222,7 @@ pub fn history_metric_for(m: Metric) -> Result<bobtop_core::Metric, String> {
 /// when scope is `match` or `pid`. Returns `None` when no pids match.
 pub fn match_summary(
     snap: &HostSample,
-    match_pat: Option<&MatchPattern>,
+    match_pat: Option<&[MatchPattern]>,
 ) -> Option<MatchAggregate> {
     let procs = snap.processes.as_ref()?;
     let mut count = 0u32;
@@ -216,7 +234,7 @@ pub fn match_summary(
     let mut disk_w = 0.0f64;
     for p in &procs.processes {
         if let Some(m) = match_pat {
-            if m.check(p).is_none() {
+            if check_any(m, p).is_none() {
                 continue;
             }
         }
@@ -266,7 +284,7 @@ pub fn find_pid(snap: &HostSample, pid: u32) -> Option<&ProcessInfo> {
 /// matches, `Err(matched_count)` when multiple pids match.
 pub fn resolve_pid_by_match(
     snap: &HostSample,
-    pat: &MatchPattern,
+    pats: &[MatchPattern],
 ) -> std::result::Result<Option<u32>, usize> {
     let procs = match snap.processes.as_ref() {
         Some(s) => &s.processes,
@@ -275,7 +293,7 @@ pub fn resolve_pid_by_match(
     let mut found: Option<u32> = None;
     let mut count = 0usize;
     for p in procs {
-        if pat.check(p).is_some() {
+        if check_any(pats, p).is_some() {
             count += 1;
             if count == 1 {
                 found = Some(p.pid);
@@ -309,7 +327,7 @@ pub fn run_top(
     metric: Metric,
     n: usize,
     group: Group,
-    match_pat: Option<&MatchPattern>,
+    match_pat: Option<&[MatchPattern]>,
 ) -> TopResponse {
     let n = n.clamp(1, MAX_N);
     let empty = Vec::new();
@@ -351,7 +369,7 @@ fn top_flat(
     procs: &[ProcessInfo],
     metric: Metric,
     n: usize,
-    match_pat: Option<&MatchPattern>,
+    match_pat: Option<&[MatchPattern]>,
 ) -> Vec<Row> {
     // Bounded min-heap keyed on the metric so we never sort the full list.
     use std::cmp::Ordering;
@@ -379,7 +397,7 @@ fn top_flat(
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(n + 1);
     for (idx, p) in procs.iter().enumerate() {
         let matched_on = match match_pat {
-            Some(m) => match m.check(p) {
+            Some(m) => match check_any(m, p) {
                 Some(field) => Some(field),
                 None => continue,
             },
@@ -439,7 +457,7 @@ fn top_keyed<F>(
     procs: &[ProcessInfo],
     metric: Metric,
     n: usize,
-    match_pat: Option<&MatchPattern>,
+    match_pat: Option<&[MatchPattern]>,
     kind: &'static str,
     key_fn: F,
 ) -> Vec<Row>
@@ -462,7 +480,7 @@ where
     let mut groups: HashMap<String, Agg> = HashMap::new();
     for p in procs {
         let matched_on = match match_pat {
-            Some(m) => match m.check(p) {
+            Some(m) => match check_any(m, p) {
                 Some(field) => Some(field),
                 None => continue,
             },
@@ -537,7 +555,7 @@ fn top_tree(
     procs: &[ProcessInfo],
     metric: Metric,
     n: usize,
-    match_pat: Option<&MatchPattern>,
+    match_pat: Option<&[MatchPattern]>,
 ) -> Vec<Row> {
     if procs.is_empty() {
         return Vec::new();
@@ -600,7 +618,7 @@ fn top_tree(
     let mut any_match_seen: bool = match_pat.is_none();
     for p in procs {
         let matched_on = match match_pat {
-            Some(m) => m.check(p),
+            Some(m) => check_any(m, p),
             None => None,
         };
         if match_pat.is_some() && matched_on.is_none() {
@@ -707,19 +725,19 @@ mod tests {
     }
 
     #[test]
-    fn glob_matches_prefix_suffix_contains() {
-        assert!(glob_match("node*", "node"));
-        assert!(glob_match("node*", "node-foo"));
-        assert!(!glob_match("node*", "myfoo"));
-        assert!(glob_match("*chrome*", "google-chrome-helper"));
-        assert!(glob_match("c?ome", "chome"));
+    fn substring_match_is_case_insensitive() {
+        let p = MatchPattern::new("Node").unwrap();
+        let proc = pi(1, "node", "node next-server", 0.1, 0);
+        assert_eq!(p.check(&proc), Some("name"));
     }
 
     #[test]
-    fn substring_match_is_case_insensitive() {
-        let p = MatchPattern::new("Node");
-        let proc = pi(1, "node", "node next-server", 0.1, 0);
-        assert_eq!(p.check(&proc), Some("name"));
+    fn glob_and_regex_match() {
+        let glob = MatchPattern::new("*chrome*").unwrap();
+        let regex = MatchPattern::new("re:^pg_").unwrap();
+        let proc = pi(1, "google-chrome-helper", "pg_worker", 0.1, 0);
+        assert_eq!(glob.check(&proc), Some("name"));
+        assert_eq!(regex.check(&proc), Some("cmdline"));
     }
 
     #[test]
@@ -744,8 +762,8 @@ mod tests {
             pi(2, "redis", "redis", 0.9, 0),
             pi(3, "node", "node b", 0.5, 0),
         ]);
-        let m = MatchPattern::new("node*");
-        let r = run_top(&s, Metric::Cpu, 10, Group::Flat, Some(&m));
+        let m = MatchPattern::new("node*").unwrap();
+        let r = run_top(&s, Metric::Cpu, 10, Group::Flat, Some(std::slice::from_ref(&m)));
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0].id, "3");
         assert_eq!(r.rows[1].id, "1");
@@ -861,8 +879,8 @@ mod tests {
             pi_with(2, None, "node", "node b", 0.2, 200, None),
             pi_with(3, None, "redis", "redis", 0.5, 50, None),
         ]);
-        let pat = MatchPattern::new("node");
-        let agg = match_summary(&s, Some(&pat)).unwrap();
+        let pat = MatchPattern::new("node").unwrap();
+        let agg = match_summary(&s, Some(std::slice::from_ref(&pat))).unwrap();
         assert_eq!(agg.pid_count, 2);
         assert_eq!(agg.mem_bytes, 300);
         assert!((agg.cpu_pct - 30.0).abs() < 0.001);
@@ -876,14 +894,20 @@ mod tests {
             pi_with(3, None, "node", "node b", 0.0, 0, None),
         ]);
         // Unique: redis matches one pid.
-        let pat = MatchPattern::new("redis");
-        assert_eq!(resolve_pid_by_match(&s, &pat).unwrap(), Some(2));
+        let pat = MatchPattern::new("redis").unwrap();
+        assert_eq!(
+            resolve_pid_by_match(&s, std::slice::from_ref(&pat)).unwrap(),
+            Some(2)
+        );
         // Ambiguous: node matches two pids.
-        let pat = MatchPattern::new("node");
-        assert!(resolve_pid_by_match(&s, &pat).is_err());
+        let pat = MatchPattern::new("node").unwrap();
+        assert!(resolve_pid_by_match(&s, std::slice::from_ref(&pat)).is_err());
         // Miss.
-        let pat = MatchPattern::new("nothing");
-        assert_eq!(resolve_pid_by_match(&s, &pat).unwrap(), None);
+        let pat = MatchPattern::new("nothing").unwrap();
+        assert_eq!(
+            resolve_pid_by_match(&s, std::slice::from_ref(&pat)).unwrap(),
+            None
+        );
     }
 
     #[test]

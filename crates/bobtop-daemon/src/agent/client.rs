@@ -18,7 +18,7 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("  snapshot                       latest host-level summary");
         eprintln!("  top --by <metric> [opts]       ranked processes / groups");
         eprintln!();
-        eprintln!("see docs/agent-schema.md for the full wire schema");
+        eprintln!("see the README for the full agent surface");
         return 2;
     }
     let request: Result<serde_json::Value, String> = match args[0].as_str() {
@@ -54,11 +54,12 @@ fn print_help() {
     println!("subcommands:");
     println!("  snapshot                                   latest host-level summary");
     println!("  top --by <metric> [--n N] [--group G]       ranked processes");
-    println!("       [--match PATTERN]");
+    println!("       [--match PATTERN]...");
     println!("  window --metric <m> --window <w>            avg/peak/p95 over a window");
     println!("  peak --metric <m> --window <w>              peak value + responsible pids");
-    println!("  summary [--match PAT | --pid N]             host or scoped rollup");
-    println!("  pid_inspect (--pid N | --match PAT)         full detail for one pid");
+    println!("  summary [--scope host|pid|match] [--match PAT]... [--pid N]");
+    println!("                                              host or scoped rollup");
+    println!("  pid_inspect (--pid N | --match PAT)...      full detail for one pid");
     println!("  responsible_for --metric <m> --at <off>     who owned <m> at <off> ago");
     println!();
     println!("metrics: cpu | mem | net.tx | net.rx | disk.r | disk.w");
@@ -68,7 +69,7 @@ fn print_help() {
     println!("examples:");
     println!("  bobtop agent snapshot");
     println!("  bobtop agent top --by cpu --n 5");
-    println!("  bobtop agent top --by mem --group exec --match '*chrome*'");
+    println!("  bobtop agent top --by mem --group exec --match '*chrome*' --match 're:^pg_'");
     println!("  bobtop agent top --by cpu --group cgroup");
     println!("  bobtop agent top --by cpu --group tree --n 10");
     println!("  bobtop agent window --metric cpu --window 5m");
@@ -113,7 +114,7 @@ fn parse_top(args: &[String]) -> Result<serde_json::Value, String> {
     let mut by: Option<String> = None;
     let mut n: Option<usize> = None;
     let mut group: Option<String> = None;
-    let mut match_: Option<String> = None;
+    let mut match_: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -138,7 +139,7 @@ fn parse_top(args: &[String]) -> Result<serde_json::Value, String> {
                 i += 2;
             }
             "--match" => {
-                match_ = Some(take()?.clone());
+                match_.push(take()?.clone());
                 i += 2;
             }
             other => return Err(format!("unknown flag `{other}`")),
@@ -152,8 +153,8 @@ fn parse_top(args: &[String]) -> Result<serde_json::Value, String> {
     if let Some(g) = group {
         req["group"] = json!(g);
     }
-    if let Some(m) = match_ {
-        req["match"] = json!(m);
+    if !match_.is_empty() {
+        req["match"] = json!(match_query_json(match_));
     }
     Ok(req)
 }
@@ -185,8 +186,9 @@ fn parse_history(args: &[String], verb: &str) -> Result<serde_json::Value, Strin
 }
 
 fn parse_summary(args: &[String]) -> Result<serde_json::Value, String> {
-    let mut match_: Option<String> = None;
+    let mut match_: Vec<String> = Vec::new();
     let mut pid: Option<u32> = None;
+    let mut scope: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -194,8 +196,12 @@ fn parse_summary(args: &[String]) -> Result<serde_json::Value, String> {
             args.get(i + 1).ok_or_else(|| format!("`{a}` expects a value"))
         };
         match a.as_str() {
+            "--scope" => {
+                scope = Some(take()?.clone());
+                i += 2;
+            }
             "--match" => {
-                match_ = Some(take()?.clone());
+                match_.push(take()?.clone());
                 i += 2;
             }
             "--pid" => {
@@ -207,8 +213,11 @@ fn parse_summary(args: &[String]) -> Result<serde_json::Value, String> {
         }
     }
     let mut req = json!({ "q": "summary" });
-    if let Some(m) = match_ {
-        req["match"] = json!(m);
+    if let Some(s) = scope {
+        req["scope"] = json!(s);
+    }
+    if !match_.is_empty() {
+        req["match"] = json!(match_query_json(match_));
     }
     if let Some(p) = pid {
         req["pid"] = json!(p);
@@ -217,7 +226,7 @@ fn parse_summary(args: &[String]) -> Result<serde_json::Value, String> {
 }
 
 fn parse_pid_inspect(args: &[String]) -> Result<serde_json::Value, String> {
-    let mut match_: Option<String> = None;
+    let mut match_: Vec<String> = Vec::new();
     let mut pid: Option<u32> = None;
     let mut i = 0;
     while i < args.len() {
@@ -227,7 +236,7 @@ fn parse_pid_inspect(args: &[String]) -> Result<serde_json::Value, String> {
         };
         match a.as_str() {
             "--match" => {
-                match_ = Some(take()?.clone());
+                match_.push(take()?.clone());
                 i += 2;
             }
             "--pid" => {
@@ -238,12 +247,12 @@ fn parse_pid_inspect(args: &[String]) -> Result<serde_json::Value, String> {
             other => return Err(format!("unknown flag `{other}`")),
         }
     }
-    if pid.is_none() && match_.is_none() {
+    if pid.is_none() && match_.is_empty() {
         return Err("requires --pid <n> or --match <pattern>".into());
     }
     let mut req = json!({ "q": "pid_inspect" });
-    if let Some(m) = match_ {
-        req["match"] = json!(m);
+    if !match_.is_empty() {
+        req["match"] = json!(match_query_json(match_));
     }
     if let Some(p) = pid {
         req["pid"] = json!(p);
@@ -275,6 +284,68 @@ fn parse_responsible_for(args: &[String]) -> Result<serde_json::Value, String> {
     let metric = metric.ok_or_else(|| "`--metric <m>` is required".to_string())?;
     let at = at.ok_or_else(|| "`--at <offset>` is required (e.g. 30s, 5m)".to_string())?;
     Ok(json!({ "q": "responsible_for", "metric": metric, "at": at }))
+}
+
+fn match_query_json(mut patterns: Vec<String>) -> serde_json::Value {
+    match patterns.len() {
+        0 => serde_json::Value::Null,
+        1 => json!(patterns.remove(0)),
+        _ => json!(patterns),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_top_emits_string_for_one_match_and_array_for_many() {
+        let single = parse_top(&[
+            "--by".into(),
+            "cpu".into(),
+            "--match".into(),
+            "node".into(),
+        ])
+        .unwrap();
+        assert_eq!(single["match"], json!("node"));
+
+        let many = parse_top(&[
+            "--by".into(),
+            "cpu".into(),
+            "--match".into(),
+            "node".into(),
+            "--match".into(),
+            "redis".into(),
+        ])
+        .unwrap();
+        assert_eq!(many["match"], json!(["node", "redis"]));
+    }
+
+    #[test]
+    fn parse_summary_and_pid_inspect_accumulate_matches() {
+        let summary = parse_summary(&[
+            "--scope".into(),
+            "match".into(),
+            "--match".into(),
+            "node".into(),
+            "--match".into(),
+            "redis".into(),
+        ])
+        .unwrap();
+        assert_eq!(summary["match"], json!(["node", "redis"]));
+
+        let pid_inspect = parse_pid_inspect(&[
+            "--pid".into(),
+            "123".into(),
+            "--match".into(),
+            "node".into(),
+            "--match".into(),
+            "redis".into(),
+        ])
+        .unwrap();
+        assert_eq!(pid_inspect["match"], json!(["node", "redis"]));
+        assert_eq!(pid_inspect["pid"], json!(123));
+    }
 }
 
 // Suppress unused-import warning for Duration when nothing in the

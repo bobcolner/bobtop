@@ -23,13 +23,14 @@ pub struct Request {
     /// Top-N. Defaults to 10 when omitted; clamped server-side.
     #[serde(default)]
     pub n: Option<usize>,
-    /// Aggregation level: `flat` | `exec`. (`cgroup`/`tree` reserved.)
+    /// Aggregation level: `flat` | `exec` | `cgroup` | `tree`.
     #[serde(default)]
     pub group: Option<String>,
-    /// Process-name filter. `*` and `?` are treated as glob; otherwise
-    /// case-insensitive substring against the union of `comm` + `cmdline`.
+    /// Process-name filter. A single string or an array of strings is
+    /// accepted. Each item supports case-insensitive substring, glob, or
+    /// `re:` regex matching against the union of `comm` + `cmdline`.
     #[serde(default, rename = "match")]
-    pub match_: Option<String>,
+    pub match_: Option<MatchQuery>,
     /// Retrospective window (e.g. `1m`, `5m`, `30m`) for `peak` / `window`.
     #[serde(default)]
     pub window: Option<String>,
@@ -47,6 +48,29 @@ pub struct Request {
     /// Point-in-time offset for `responsible_for` (e.g. `30s`, `5m`).
     #[serde(default)]
     pub at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum MatchQuery {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl MatchQuery {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            MatchQuery::One(s) => vec![s],
+            MatchQuery::Many(v) => v,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            MatchQuery::One(s) => std::slice::from_ref(s),
+            MatchQuery::Many(v) => v.as_slice(),
+        }
+    }
 }
 
 /// Successful `snapshot` response — a single point-in-time aggregate of
