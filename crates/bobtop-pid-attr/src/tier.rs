@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AttributorTier {
     /// Tier 3 — Linux + `CAP_BPF`. Exact byte counts via sock_ops / kprobes.
     EbpfKernel,
@@ -11,6 +11,7 @@ pub enum AttributorTier {
     /// Tier 1 — macOS `proc_pidinfo(PROC_PIDLISTFDS)`. Connections only.
     ProcPidInfo,
     /// Tier 0 — no backend available. Net columns hidden in the TUI.
+    #[default]
     Unavailable,
 }
 

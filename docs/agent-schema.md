@@ -32,7 +32,7 @@ Every query is one JSON object with a `q` verb and a few common parameters:
 | `n`       | int                   | Top-N rows. Default 10.                              |
 | `window`  | duration              | `1s`, `30s`, `1m`, `5m`, `30m`. Default = current sample. |
 | `match`   | string \| string[]    | Process filter (see "Matching"). Default = all.      |
-| `group`   | string                | `flat` \| `exec` \| `cgroup` \| `tree`. Default `flat`. |
+| `group`   | string                | `flat` \| `exec` \| `cgroup` \| `tree`. Default `flat`. All four implemented. |
 | `metric`  | string                | For `peak` / `responsible_for`. Same vocab as `by`.  |
 | `at`      | duration              | "30s_ago" — relative offset for `responsible_for`.   |
 | `pid`     | int                   | For `summary` / `pid_inspect`.                       |

@@ -38,6 +38,12 @@ pub struct Request {
     /// later if we extend that direction).
     #[serde(default)]
     pub metric: Option<String>,
+    /// Explicit pid for `summary` / `pid_inspect`.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// `summary` scope: `host` (default) | `match` | `pid`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Successful `snapshot` response — a single point-in-time aggregate of
@@ -124,6 +130,44 @@ pub struct WindowResponse {
     pub avg: f64,
     pub peak: f64,
     pub p95: f64,
+}
+
+/// `summary` response. Either a host-wide `HostSummary` (the same shape
+/// used by `snapshot`) or a per-scope rollup over the matched pids.
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryResponse {
+    pub schema: &'static str,
+    pub ts: String,
+    pub scope: String,
+    pub host: HostSummary,
+    /// Number of pids included in the rollup. `0` for host scope.
+    pub pid_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched: Option<String>,
+}
+
+/// `pid_inspect` response — full detail for one process. Mirrors the
+/// internal `ProcessInfo` but with byte fields named like the rest of
+/// the agent surface (`*_bps` not `*_per_sec`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PidInspectResponse {
+    pub schema: &'static str,
+    pub ts: String,
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    pub cmdline: String,
+    pub user: String,
+    pub state: String,
+    pub cpu_pct: f32,
+    pub mem_rss_bytes: u64,
+    pub mem_vsz_bytes: u64,
+    pub threads: u32,
+    pub net_rx_bps: Option<f64>,
+    pub net_tx_bps: Option<f64>,
+    pub disk_r_bps: Option<f64>,
+    pub disk_w_bps: Option<f64>,
+    pub cgroup: Option<String>,
 }
 
 /// Successful `peak` response — the peak's value, when it occurred, and

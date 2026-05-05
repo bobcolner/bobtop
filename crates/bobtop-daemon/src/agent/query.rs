@@ -63,6 +63,8 @@ impl Metric {
 pub enum Group {
     Flat,
     Exec,
+    Cgroup,
+    Tree,
 }
 
 impl Group {
@@ -70,9 +72,8 @@ impl Group {
         Some(match s {
             "flat" => Group::Flat,
             "exec" => Group::Exec,
-            // `cgroup` and `tree` are documented in the schema but not yet
-            // implemented; reject explicitly so clients don't silently
-            // receive flat results when they asked for a different grouping.
+            "cgroup" => Group::Cgroup,
+            "tree" => Group::Tree,
             _ => return None,
         })
     }
@@ -81,6 +82,8 @@ impl Group {
         match self {
             Group::Flat => "flat",
             Group::Exec => "exec",
+            Group::Cgroup => "cgroup",
+            Group::Tree => "tree",
         }
     }
 }
@@ -197,6 +200,94 @@ pub fn history_metric_for(m: Metric) -> Result<bobtop_core::Metric, String> {
     })
 }
 
+/// Aggregate stats over a matched pid set, used by the `summary` verb
+/// when scope is `match` or `pid`. Returns `None` when no pids match.
+pub fn match_summary(
+    snap: &HostSample,
+    match_pat: Option<&MatchPattern>,
+) -> Option<MatchAggregate> {
+    let procs = snap.processes.as_ref()?;
+    let mut count = 0u32;
+    let mut cpu_pct = 0.0f32;
+    let mut mem = 0u64;
+    let mut net_rx = 0.0f64;
+    let mut net_tx = 0.0f64;
+    let mut disk_r = 0.0f64;
+    let mut disk_w = 0.0f64;
+    for p in &procs.processes {
+        if let Some(m) = match_pat {
+            if m.check(p).is_none() {
+                continue;
+            }
+        }
+        count += 1;
+        cpu_pct += p.cpu_fraction * 100.0;
+        mem = mem.saturating_add(p.mem_rss_bytes);
+        net_rx += p.net_rx_bytes_per_sec.unwrap_or(0.0);
+        net_tx += p.net_tx_bytes_per_sec.unwrap_or(0.0);
+        disk_r += p.disk_read_bytes_per_sec.unwrap_or(0.0);
+        disk_w += p.disk_write_bytes_per_sec.unwrap_or(0.0);
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(MatchAggregate {
+        pid_count: count,
+        cpu_pct,
+        mem_bytes: mem,
+        net_rx_bps: net_rx as u64,
+        net_tx_bps: net_tx as u64,
+        disk_r_bps: disk_r as u64,
+        disk_w_bps: disk_w as u64,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MatchAggregate {
+    pub pid_count: u32,
+    pub cpu_pct: f32,
+    pub mem_bytes: u64,
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
+    pub disk_r_bps: u64,
+    pub disk_w_bps: u64,
+}
+
+/// Locate a single `ProcessInfo` by pid. Cheap linear scan — typical
+/// snapshots are <2k pids.
+pub fn find_pid(snap: &HostSample, pid: u32) -> Option<&ProcessInfo> {
+    snap.processes
+        .as_ref()
+        .and_then(|s| s.processes.iter().find(|p| p.pid == pid))
+}
+
+/// Resolve a `match` pattern to a single pid, or report ambiguity.
+/// Returns `Ok(Some(pid))` on a unique match, `Ok(None)` when no pid
+/// matches, `Err(matched_count)` when multiple pids match.
+pub fn resolve_pid_by_match(
+    snap: &HostSample,
+    pat: &MatchPattern,
+) -> std::result::Result<Option<u32>, usize> {
+    let procs = match snap.processes.as_ref() {
+        Some(s) => &s.processes,
+        None => return Ok(None),
+    };
+    let mut found: Option<u32> = None;
+    let mut count = 0usize;
+    for p in procs {
+        if pat.check(p).is_some() {
+            count += 1;
+            if count == 1 {
+                found = Some(p.pid);
+            }
+            if count > 1 {
+                return Err(count);
+            }
+        }
+    }
+    Ok(if count == 0 { None } else { found })
+}
+
 /// Per-pid metric extractor. Returns 0.0 when the source is unavailable so
 /// downstream sort/aggregation logic doesn't have to branch.
 pub fn metric_value(p: &ProcessInfo, m: Metric) -> f64 {
@@ -229,7 +320,23 @@ pub fn run_top(
         .unwrap_or(&empty);
     let rows = match group {
         Group::Flat => top_flat(procs, metric, n, match_pat),
-        Group::Exec => top_exec(procs, metric, n, match_pat),
+        Group::Exec => top_keyed(
+            procs,
+            metric,
+            n,
+            match_pat,
+            "exec",
+            |p| p.name.clone(),
+        ),
+        Group::Cgroup => top_keyed(
+            procs,
+            metric,
+            n,
+            match_pat,
+            "cgroup",
+            |p| p.cgroup.clone().unwrap_or_else(|| "(no cgroup)".into()),
+        ),
+        Group::Tree => top_tree(procs, metric, n, match_pat),
     };
     TopResponse {
         schema: SCHEMA_VERSION,
@@ -324,12 +431,21 @@ fn top_flat(
         .collect()
 }
 
-fn top_exec(
+/// Bucket processes by an arbitrary string key (executable name, cgroup
+/// path, etc.), aggregate metrics within each bucket, and return the
+/// top-N buckets by the requested metric. Shared by `exec` and `cgroup`
+/// groupings.
+fn top_keyed<F>(
     procs: &[ProcessInfo],
     metric: Metric,
     n: usize,
     match_pat: Option<&MatchPattern>,
-) -> Vec<Row> {
+    kind: &'static str,
+    key_fn: F,
+) -> Vec<Row>
+where
+    F: Fn(&ProcessInfo) -> String,
+{
     #[derive(Default)]
     struct Agg {
         cpu_pct: f32,
@@ -352,13 +468,8 @@ fn top_exec(
             },
             None => None,
         };
-        let g = groups.entry(p.name.clone()).or_default();
-        g.cpu_pct += p.cpu_fraction * 100.0;
-        g.mem_bytes = g.mem_bytes.saturating_add(p.mem_rss_bytes);
-        g.net_rx += p.net_rx_bytes_per_sec.unwrap_or(0.0);
-        g.net_tx += p.net_tx_bytes_per_sec.unwrap_or(0.0);
-        g.disk_r += p.disk_read_bytes_per_sec.unwrap_or(0.0);
-        g.disk_w += p.disk_write_bytes_per_sec.unwrap_or(0.0);
+        let g = groups.entry(key_fn(p)).or_default();
+        agg_acc(g, p);
         if g.pids.len() < PIDS_PER_ROW {
             g.pids.push(p.pid);
         } else {
@@ -371,42 +482,36 @@ fn top_exec(
             g.matched_on = matched_on;
         }
     }
+    fn key_value(a: &Agg, m: Metric) -> f64 {
+        match m {
+            Metric::Cpu => a.cpu_pct as f64,
+            Metric::Mem => a.mem_bytes as f64,
+            Metric::NetTx => a.net_tx,
+            Metric::NetRx => a.net_rx,
+            Metric::DiskR => a.disk_r,
+            Metric::DiskW => a.disk_w,
+        }
+    }
+    fn agg_acc(g: &mut Agg, p: &ProcessInfo) {
+        g.cpu_pct += p.cpu_fraction * 100.0;
+        g.mem_bytes = g.mem_bytes.saturating_add(p.mem_rss_bytes);
+        g.net_rx += p.net_rx_bytes_per_sec.unwrap_or(0.0);
+        g.net_tx += p.net_tx_bytes_per_sec.unwrap_or(0.0);
+        g.disk_r += p.disk_read_bytes_per_sec.unwrap_or(0.0);
+        g.disk_w += p.disk_write_bytes_per_sec.unwrap_or(0.0);
+    }
     let mut rows: Vec<(String, Agg)> = groups.into_iter().collect();
-    rows.retain(|(_, a)| {
-        let v = match metric {
-            Metric::Cpu => a.cpu_pct as f64,
-            Metric::Mem => a.mem_bytes as f64,
-            Metric::NetTx => a.net_tx,
-            Metric::NetRx => a.net_rx,
-            Metric::DiskR => a.disk_r,
-            Metric::DiskW => a.disk_w,
-        };
-        v > 0.0
-    });
+    rows.retain(|(_, a)| key_value(a, metric) > 0.0);
     rows.sort_by(|(_, a), (_, b)| {
-        let av = match metric {
-            Metric::Cpu => a.cpu_pct as f64,
-            Metric::Mem => a.mem_bytes as f64,
-            Metric::NetTx => a.net_tx,
-            Metric::NetRx => a.net_rx,
-            Metric::DiskR => a.disk_r,
-            Metric::DiskW => a.disk_w,
-        };
-        let bv = match metric {
-            Metric::Cpu => b.cpu_pct as f64,
-            Metric::Mem => b.mem_bytes as f64,
-            Metric::NetTx => b.net_tx,
-            Metric::NetRx => b.net_rx,
-            Metric::DiskR => b.disk_r,
-            Metric::DiskW => b.disk_w,
-        };
-        bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+        key_value(b, metric)
+            .partial_cmp(&key_value(a, metric))
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     rows.truncate(n);
     rows.into_iter()
         .map(|(name, a)| Row {
             id: name.clone(),
-            kind: "exec",
+            kind,
             name,
             cmdline: Some(a.sample_cmdline),
             pids: a.pids,
@@ -418,6 +523,149 @@ fn top_exec(
             disk_r_bps: a.disk_r as u64,
             disk_w_bps: a.disk_w as u64,
             matched_on: a.matched_on,
+        })
+        .collect()
+}
+
+/// Aggregate by parent-rooted subtree: each row is the set of processes
+/// reachable by walking `parent_pid` upward to a root (a pid whose parent
+/// is missing from the snapshot, has parent 0, or has parent_pid `None`).
+/// The row's `id` is the root pid, `name` is the root's executable name,
+/// and aggregates sum across the entire subtree. Most useful for
+/// "what did `cargo test` actually spawn?" queries.
+fn top_tree(
+    procs: &[ProcessInfo],
+    metric: Metric,
+    n: usize,
+    match_pat: Option<&MatchPattern>,
+) -> Vec<Row> {
+    if procs.is_empty() {
+        return Vec::new();
+    }
+    // Index by pid for O(1) parent lookups.
+    let by_pid: HashMap<u32, &ProcessInfo> = procs.iter().map(|p| (p.pid, p)).collect();
+    // Walk from each pid to its root, memoizing roots so a long chain
+    // doesn't re-traverse for every leaf.
+    let mut root_of: HashMap<u32, u32> = HashMap::with_capacity(procs.len());
+    for p in procs {
+        if root_of.contains_key(&p.pid) {
+            continue;
+        }
+        let mut cur = p.pid;
+        let mut chain: Vec<u32> = Vec::new();
+        loop {
+            chain.push(cur);
+            let info = match by_pid.get(&cur) {
+                Some(i) => *i,
+                None => break, // shouldn't happen; safe-guard
+            };
+            match info.parent_pid {
+                Some(pp) if pp != 0 && by_pid.contains_key(&pp) => {
+                    if let Some(&already) = root_of.get(&pp) {
+                        for c in &chain {
+                            root_of.insert(*c, already);
+                        }
+                        chain.clear();
+                        break;
+                    }
+                    cur = pp;
+                }
+                _ => {
+                    // `cur` is the root.
+                    let root = cur;
+                    for c in &chain {
+                        root_of.insert(*c, root);
+                    }
+                    chain.clear();
+                    break;
+                }
+            }
+        }
+    }
+    // Aggregate per root, applying the match filter at the leaf level so
+    // a tree containing any matched pid surfaces.
+    #[derive(Default)]
+    struct TreeAgg {
+        cpu_pct: f32,
+        mem_bytes: u64,
+        net_rx: f64,
+        net_tx: f64,
+        disk_r: f64,
+        disk_w: f64,
+        pids: Vec<u32>,
+        pids_truncated: bool,
+        matched_on: Option<&'static str>,
+    }
+    let mut roots: HashMap<u32, TreeAgg> = HashMap::new();
+    let mut any_match_seen: bool = match_pat.is_none();
+    for p in procs {
+        let matched_on = match match_pat {
+            Some(m) => m.check(p),
+            None => None,
+        };
+        if match_pat.is_some() && matched_on.is_none() {
+            continue;
+        }
+        any_match_seen = any_match_seen || matched_on.is_some();
+        let root_pid = match root_of.get(&p.pid).copied() {
+            Some(r) => r,
+            None => continue,
+        };
+        let g = roots.entry(root_pid).or_default();
+        g.cpu_pct += p.cpu_fraction * 100.0;
+        g.mem_bytes = g.mem_bytes.saturating_add(p.mem_rss_bytes);
+        g.net_rx += p.net_rx_bytes_per_sec.unwrap_or(0.0);
+        g.net_tx += p.net_tx_bytes_per_sec.unwrap_or(0.0);
+        g.disk_r += p.disk_read_bytes_per_sec.unwrap_or(0.0);
+        g.disk_w += p.disk_write_bytes_per_sec.unwrap_or(0.0);
+        if g.pids.len() < PIDS_PER_ROW {
+            g.pids.push(p.pid);
+        } else {
+            g.pids_truncated = true;
+        }
+        if g.matched_on.is_none() {
+            g.matched_on = matched_on;
+        }
+    }
+    if !any_match_seen {
+        return Vec::new();
+    }
+    fn val(a: &TreeAgg, m: Metric) -> f64 {
+        match m {
+            Metric::Cpu => a.cpu_pct as f64,
+            Metric::Mem => a.mem_bytes as f64,
+            Metric::NetTx => a.net_tx,
+            Metric::NetRx => a.net_rx,
+            Metric::DiskR => a.disk_r,
+            Metric::DiskW => a.disk_w,
+        }
+    }
+    let mut rows: Vec<(u32, TreeAgg)> = roots.into_iter().collect();
+    rows.retain(|(_, a)| val(a, metric) > 0.0);
+    rows.sort_by(|(_, a), (_, b)| {
+        val(b, metric)
+            .partial_cmp(&val(a, metric))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows.truncate(n);
+    rows.into_iter()
+        .map(|(root_pid, a)| {
+            let root_info = by_pid.get(&root_pid);
+            Row {
+                id: root_pid.to_string(),
+                kind: "tree",
+                name: root_info.map(|p| p.name.clone()).unwrap_or_default(),
+                cmdline: root_info.map(|p| p.cmdline.clone()),
+                pids: a.pids,
+                pids_truncated: a.pids_truncated,
+                cpu_pct: a.cpu_pct,
+                mem_bytes: a.mem_bytes,
+                net_rx_bps: a.net_rx as u64,
+                net_tx_bps: a.net_tx as u64,
+                disk_r_bps: a.disk_r as u64,
+                disk_w_bps: a.disk_w as u64,
+                matched_on: a.matched_on,
+            }
         })
         .collect()
 }
@@ -536,6 +784,106 @@ mod tests {
         assert!(parse_window("31m").is_err());
         assert!(parse_window("1h").is_err());
         assert!(parse_window("").is_err());
+    }
+
+    fn pi_with(
+        pid: u32,
+        parent: Option<u32>,
+        name: &str,
+        cmdline: &str,
+        cpu: f32,
+        mem: u64,
+        cgroup: Option<&str>,
+    ) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid: parent,
+            name: name.into(),
+            cmdline: cmdline.into(),
+            user: "u".into(),
+            state: ProcessState::Sleeping,
+            cpu_fraction: cpu,
+            mem_rss_bytes: mem,
+            mem_vsz_bytes: mem,
+            threads: 1,
+            net_rx_bytes_per_sec: None,
+            net_tx_bytes_per_sec: None,
+            disk_read_bytes_per_sec: None,
+            disk_write_bytes_per_sec: None,
+            cgroup: cgroup.map(String::from),
+        }
+    }
+
+    #[test]
+    fn cgroup_groups_by_cgroup_path_with_no_cgroup_bucket() {
+        let s = snap(vec![
+            pi_with(1, None, "a", "a", 0.1, 0, Some("docker.scope")),
+            pi_with(2, None, "b", "b", 0.2, 0, Some("docker.scope")),
+            pi_with(3, None, "c", "c", 0.5, 0, Some("user.slice")),
+            pi_with(4, None, "d", "d", 0.05, 0, None),
+        ]);
+        let r = run_top(&s, Metric::Cpu, 10, Group::Cgroup, None);
+        // user.slice (0.5) > docker.scope (0.3) > (no cgroup) (0.05)
+        assert_eq!(r.rows[0].id, "user.slice");
+        assert_eq!(r.rows[0].kind, "cgroup");
+        assert_eq!(r.rows[1].id, "docker.scope");
+        assert_eq!(r.rows[1].pids.len(), 2);
+        assert_eq!(r.rows[2].id, "(no cgroup)");
+    }
+
+    #[test]
+    fn tree_aggregates_subtree_under_root() {
+        // pid 1 (root) → pid 2, pid 3
+        // pid 4 (root, no parent in snapshot) → pid 5
+        let s = snap(vec![
+            pi_with(1, None, "cargo", "cargo build", 0.1, 100, None),
+            pi_with(2, Some(1), "rustc", "rustc", 0.5, 200, None),
+            pi_with(3, Some(1), "ld", "ld", 0.2, 50, None),
+            pi_with(4, None, "node", "node", 0.05, 1000, None),
+            pi_with(5, Some(4), "child", "child", 0.0, 500, None),
+        ]);
+        let r = run_top(&s, Metric::Cpu, 10, Group::Tree, None);
+        // cargo subtree cpu = 0.1 + 0.5 + 0.2 = 0.8 → 80%
+        // node subtree cpu = 0.05 + 0.0 = 0.05 → 5%
+        assert_eq!(r.rows[0].id, "1");
+        assert_eq!(r.rows[0].kind, "tree");
+        assert_eq!(r.rows[0].name, "cargo");
+        assert_eq!(r.rows[0].pids.len(), 3);
+        assert!((r.rows[0].cpu_pct - 80.0).abs() < 0.001);
+        assert_eq!(r.rows[1].id, "4");
+        assert_eq!(r.rows[1].pids.len(), 2);
+    }
+
+    #[test]
+    fn match_summary_aggregates_filtered_pids() {
+        let s = snap(vec![
+            pi_with(1, None, "node", "node a", 0.1, 100, None),
+            pi_with(2, None, "node", "node b", 0.2, 200, None),
+            pi_with(3, None, "redis", "redis", 0.5, 50, None),
+        ]);
+        let pat = MatchPattern::new("node");
+        let agg = match_summary(&s, Some(&pat)).unwrap();
+        assert_eq!(agg.pid_count, 2);
+        assert_eq!(agg.mem_bytes, 300);
+        assert!((agg.cpu_pct - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn resolve_pid_by_match_unique_vs_ambiguous() {
+        let s = snap(vec![
+            pi_with(1, None, "node", "node a", 0.0, 0, None),
+            pi_with(2, None, "redis", "redis", 0.0, 0, None),
+            pi_with(3, None, "node", "node b", 0.0, 0, None),
+        ]);
+        // Unique: redis matches one pid.
+        let pat = MatchPattern::new("redis");
+        assert_eq!(resolve_pid_by_match(&s, &pat).unwrap(), Some(2));
+        // Ambiguous: node matches two pids.
+        let pat = MatchPattern::new("node");
+        assert!(resolve_pid_by_match(&s, &pat).is_err());
+        // Miss.
+        let pat = MatchPattern::new("nothing");
+        assert_eq!(resolve_pid_by_match(&s, &pat).unwrap(), None);
     }
 
     #[test]

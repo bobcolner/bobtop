@@ -16,7 +16,8 @@ use tokio::sync::broadcast;
 use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
 use bobtop_pid_attr::{
-    select as select_attributor, select_disk, DiskAttributor, NetworkAttributor, SelectOptions,
+    select as select_attributor, select_disk, AttributionStore, DiskAttributor,
+    NetworkAttributor, SelectOptions,
 };
 use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
 
@@ -138,12 +139,19 @@ async fn main() -> Result<()> {
     let (tick_tx, _) = broadcast::channel::<()>(4);
     spawn_tick_driver(tick_tx.clone(), Arc::clone(&tick_ms));
 
+    // Single source of truth for per-pid net/disk attribution. The
+    // attributor sampler tasks write into it; the process collector reads
+    // from it and joins per-pid rates into each `ProcessInfo` before
+    // publishing on the bus. Replaces the prior path that mutated `App`
+    // directly via apply_net / apply_disk.
+    let attribution_store = AttributionStore::new();
+
     // Collectors consult `boxes` and skip the actual `collect()` call when
     // their panel is hidden, which keeps idle CPU low under narrow layouts
     // (matches btop's preset model).
     let cpu = Arc::new(CpuCollector::new());
     let mem = Arc::new(MemoryCollector::new());
-    let proc = Arc::new(ProcessCollector::new());
+    let proc = Arc::new(ProcessCollector::new().with_attribution(attribution_store.clone()));
     let net = Arc::new(NetworkGlobalCollector::new());
     let disk = Arc::new(DiskCollector::new());
     spawn_collector(cpu, Box::Cpu, bus.clone(), tick_tx.subscribe(), boxes.clone());
@@ -152,18 +160,24 @@ async fn main() -> Result<()> {
     spawn_collector(net, Box::Network, bus.clone(), tick_tx.subscribe(), boxes.clone());
     spawn_collector(disk, Box::Disk, bus.clone(), tick_tx.subscribe(), boxes.clone());
 
-    // Network attribution sampler — separate channel because ProcessNetSample
-    // doesn't fit into MetricEvent (cross-crate dep direction). Gated on the
-    // PROC box (per-pid net is rendered in the process table) — when PROC is
-    // hidden, the eBPF/pcap drain stays parked.
+    // Per-pid attribution samplers — separate cadence (≥250ms) because
+    // each tier has different cost. Gated on the PROC box: when the
+    // process panel is hidden the eBPF/pcap drain parks, just like
+    // before. The samplers now publish into `attribution_store`; the
+    // process collector picks the data up on its next tick.
     spawn_attributor_loop(
         Arc::clone(&attributor),
-        Arc::clone(&app),
+        attribution_store.clone(),
         Arc::clone(&tick_ms),
         boxes.clone(),
     );
     if let Some(da) = disk_attributor.as_ref().map(Arc::clone) {
-        spawn_disk_attributor_loop(da, Arc::clone(&app), Arc::clone(&tick_ms), boxes.clone());
+        spawn_disk_attributor_loop(
+            da,
+            attribution_store.clone(),
+            Arc::clone(&tick_ms),
+            boxes.clone(),
+        );
     }
 
     if cli.daemon {
@@ -384,7 +398,7 @@ fn spawn_collector<C>(
 
 fn spawn_attributor_loop(
     attr: Arc<dyn NetworkAttributor>,
-    app: Arc<Mutex<App>>,
+    store: AttributionStore,
     tick_ms: Arc<AtomicU64>,
     boxes: BoxesEnabled,
 ) {
@@ -402,10 +416,7 @@ fn spawn_attributor_loop(
                 continue;
             }
             match attr.sample().await {
-                Ok(samples) => {
-                    let mut g = app.lock().unwrap_or_else(|p| p.into_inner());
-                    g.apply_net(samples, tier);
-                }
+                Ok(samples) => store.set_net(samples, tier),
                 Err(e) => tracing::warn!(error = %e, "net attributor sample failed"),
             }
         }
@@ -417,7 +428,7 @@ fn spawn_attributor_loop(
 /// don't queue behind each other when one tier is slow.
 fn spawn_disk_attributor_loop(
     attr: Arc<dyn DiskAttributor>,
-    app: Arc<Mutex<App>>,
+    store: AttributionStore,
     tick_ms: Arc<AtomicU64>,
     boxes: BoxesEnabled,
 ) {
@@ -431,10 +442,7 @@ fn spawn_disk_attributor_loop(
                 continue;
             }
             match attr.sample().await {
-                Ok(samples) => {
-                    let mut g = app.lock().unwrap_or_else(|p| p.into_inner());
-                    g.apply_disk(samples, tier);
-                }
+                Ok(samples) => store.set_disk(samples, tier),
                 Err(e) => tracing::warn!(error = %e, "disk attributor sample failed"),
             }
         }

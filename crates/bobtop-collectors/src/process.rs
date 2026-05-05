@@ -31,6 +31,7 @@ struct StaticProcInfo {
 use async_trait::async_trait;
 use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
 use bobtop_core::{Collector, Result};
+use bobtop_pid_attr::AttributionStore;
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind, Users};
 
 const DEFAULT_INTERVAL_MS: u64 = 2000;
@@ -50,6 +51,13 @@ pub struct ProcessCollector {
     /// Avoids ~2 syscalls × N processes per tick — typically the heaviest
     /// per-tick cost after sysinfo's own /proc walk.
     static_cache: Mutex<HashMap<u32, StaticProcInfo>>,
+    /// Optional per-pid net/disk attribution. When present, `collect()`
+    /// joins the latest snapshot into each `ProcessInfo` before returning,
+    /// so `ProcessSample` published on the bus carries authoritative
+    /// rates instead of `None`. Lives outside the collector lifecycle —
+    /// callers create one `AttributionStore`, hand it to the collector
+    /// here and to the attributor sampling loops as the writer side.
+    attribution: Option<AttributionStore>,
 }
 
 impl std::fmt::Debug for ProcessCollector {
@@ -77,7 +85,17 @@ impl ProcessCollector {
             cpu_count,
             last_disk: Mutex::new(HashMap::new()),
             static_cache: Mutex::new(HashMap::new()),
+            attribution: None,
         }
+    }
+
+    /// Attach an `AttributionStore` so `collect()` joins per-pid net/disk
+    /// rates into each `ProcessInfo` before returning. Without this, the
+    /// `net_*` fields stay `None` and `disk_*` reflects sysinfo's
+    /// per-pid totals only.
+    pub fn with_attribution(mut self, store: AttributionStore) -> Self {
+        self.attribution = Some(store);
+        self
     }
 }
 
@@ -136,6 +154,20 @@ impl Collector for ProcessCollector {
         let mut next_static: HashMap<u32, StaticProcInfo> =
             HashMap::with_capacity(proc_iter.len());
         let mut processes: Vec<ProcessInfo> = Vec::with_capacity(proc_iter.len());
+
+        // Snapshot the attribution maps up-front so we hold the lock for a
+        // single short critical section instead of acquiring it per pid.
+        // Cloning two `HashMap<u32, _>` is cheap (~16 B per entry).
+        let (net_map, disk_map, net_has_bw) = match self.attribution.as_ref() {
+            Some(store) => store.read(|s| {
+                (
+                    s.net.clone(),
+                    s.disk.clone(),
+                    s.net_tier.has_bandwidth(),
+                )
+            }),
+            None => (Default::default(), Default::default(), false),
+        };
 
         for (pid, p) in proc_iter.iter() {
             let pid_u32 = pid.as_u32();
@@ -204,6 +236,26 @@ impl Collector for ProcessCollector {
                 },
             );
 
+            // Net join. Tier 1 backends (proc_inode / proc_pidinfo) can
+            // enumerate connections but not bytes — `rx`/`tx` stay `None`
+            // for those. When the active tier *does* report bandwidth,
+            // pids missing from the snapshot get `Some(0.0)` rather than
+            // `None` so the TUI's column visibility logic stays consistent
+            // with what `apply_net` did historically.
+            let (net_rx, net_tx) = match net_map.get(&pid_u32) {
+                Some(a) => (a.rx_bytes_per_sec, a.tx_bytes_per_sec),
+                None if net_has_bw => (Some(0.0), Some(0.0)),
+                None => (None, None),
+            };
+            // Disk join. The attributor's `Some` overrides the sysinfo
+            // value; `None` (warmup / pid missing from the snapshot)
+            // lets the sysinfo-derived rate stand. Matches the prior
+            // `App::rebuild_sorted` semantics.
+            let (disk_r, disk_w) = match disk_map.get(&pid_u32) {
+                Some(a) => (a.read_bytes_per_sec.or(dr), a.write_bytes_per_sec.or(dw)),
+                None => (dr, dw),
+            };
+
             processes.push(ProcessInfo {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
@@ -227,10 +279,10 @@ impl Collector for ProcessCollector {
                 mem_rss_bytes: p.memory(),
                 mem_vsz_bytes: p.virtual_memory(),
                 threads: thread_count(p),
-                net_rx_bytes_per_sec: None,
-                net_tx_bytes_per_sec: None,
-                disk_read_bytes_per_sec: dr,
-                disk_write_bytes_per_sec: dw,
+                net_rx_bytes_per_sec: net_rx,
+                net_tx_bytes_per_sec: net_tx,
+                disk_read_bytes_per_sec: disk_r,
+                disk_write_bytes_per_sec: disk_w,
                 cgroup: static_info.cgroup.clone(),
             });
 

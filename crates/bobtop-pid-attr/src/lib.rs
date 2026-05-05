@@ -24,6 +24,7 @@ pub mod attributor;
 pub mod disk_attributor;
 pub mod error;
 pub mod sample;
+pub mod store;
 pub mod tier;
 pub mod unavailable;
 
@@ -51,6 +52,7 @@ pub use error::{NetError, Result};
 pub use sample::{
     AddrEndpoint, ConnectionInfo, ProcessNetSample, Protocol, SocketState,
 };
+pub use store::{AttributionState, AttributionStore, DiskAttribution, NetAttribution};
 pub use tier::AttributorTier;
 pub use unavailable::UnavailableAttributor;
 

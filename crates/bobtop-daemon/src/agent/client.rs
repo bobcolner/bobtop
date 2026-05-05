@@ -50,6 +50,20 @@ pub fn run(args: &[String]) -> i32 {
                 2
             }
         },
+        "summary" => match parse_summary(&args[1..]) {
+            Ok(req) => send(req),
+            Err(msg) => {
+                eprintln!("bobtop agent summary: {msg}");
+                2
+            }
+        },
+        "pid_inspect" | "inspect" => match parse_pid_inspect(&args[1..]) {
+            Ok(req) => send(req),
+            Err(msg) => {
+                eprintln!("bobtop agent pid_inspect: {msg}");
+                2
+            }
+        },
         "help" | "-h" | "--help" => {
             println!("bobtop agent — query the running daemon over its Unix socket");
             println!();
@@ -59,17 +73,23 @@ pub fn run(args: &[String]) -> i32 {
             println!("       [--match PATTERN]");
             println!("  window --metric <m> --window <w>            avg/peak/p95 over a window");
             println!("  peak --metric <m> --window <w>              peak value + responsible pids");
+            println!("  summary [--match PAT | --pid N]             host or scoped rollup");
+            println!("  pid_inspect (--pid N | --match PAT)         full detail for one pid");
             println!();
             println!("metrics: cpu | mem | net.tx | net.rx | disk.r | disk.w");
-            println!("groups:  flat (default) | exec");
+            println!("groups:  flat (default) | exec | cgroup | tree");
             println!("windows: 1s..30m (e.g. 30s, 1m, 5m, 30m)");
             println!();
             println!("examples:");
             println!("  bobtop agent snapshot");
             println!("  bobtop agent top --by cpu --n 5");
             println!("  bobtop agent top --by mem --group exec --match '*chrome*'");
+            println!("  bobtop agent top --by cpu --group cgroup");
+            println!("  bobtop agent top --by cpu --group tree --n 10");
             println!("  bobtop agent window --metric cpu --window 5m");
             println!("  bobtop agent peak --metric net.tx --window 1m");
+            println!("  bobtop agent summary --match 'python*'");
+            println!("  bobtop agent pid_inspect --pid 1234");
             0
         }
         other => {
@@ -77,6 +97,73 @@ pub fn run(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+fn parse_summary(args: &[String]) -> Result<serde_json::Value, String> {
+    let mut match_: Option<String> = None;
+    let mut pid: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let take = || -> Result<&String, String> {
+            args.get(i + 1).ok_or_else(|| format!("`{a}` expects a value"))
+        };
+        match a.as_str() {
+            "--match" => {
+                match_ = Some(take()?.clone());
+                i += 2;
+            }
+            "--pid" => {
+                let v = take()?;
+                pid = Some(v.parse().map_err(|_| format!("--pid expects integer, got '{v}'"))?);
+                i += 2;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    let mut req = json!({ "q": "summary" });
+    if let Some(m) = match_ {
+        req["match"] = json!(m);
+    }
+    if let Some(p) = pid {
+        req["pid"] = json!(p);
+    }
+    Ok(req)
+}
+
+fn parse_pid_inspect(args: &[String]) -> Result<serde_json::Value, String> {
+    let mut match_: Option<String> = None;
+    let mut pid: Option<u32> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let take = || -> Result<&String, String> {
+            args.get(i + 1).ok_or_else(|| format!("`{a}` expects a value"))
+        };
+        match a.as_str() {
+            "--match" => {
+                match_ = Some(take()?.clone());
+                i += 2;
+            }
+            "--pid" => {
+                let v = take()?;
+                pid = Some(v.parse().map_err(|_| format!("--pid expects integer, got '{v}'"))?);
+                i += 2;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    if pid.is_none() && match_.is_none() {
+        return Err("requires --pid <n> or --match <pattern>".into());
+    }
+    let mut req = json!({ "q": "pid_inspect" });
+    if let Some(m) = match_ {
+        req["match"] = json!(m);
+    }
+    if let Some(p) = pid {
+        req["pid"] = json!(p);
+    }
+    Ok(req)
 }
 
 /// Parse arg list for `window` / `peak`. Both take the same `--metric`

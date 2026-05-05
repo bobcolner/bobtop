@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::collections::HashMap;
 
 use bobtop_core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
@@ -661,43 +660,20 @@ impl App {
         self.ui.dirty = true;
     }
 
-    /// Rebuild `processes_sorted` from `latest_processes`, joining in
-    /// per-pid net samples (so sorting by NetRx/NetTx works against real
-    /// values rather than `None`s). Always called when either a Process
-    /// sample, a net attributor sample, or the active sort changes.
+    /// Apply the user's text filter + sort to `latest_processes`, then
+    /// publish into `processes_sorted` for the TUI table.
+    ///
+    /// Per-pid net/disk attribution is *already merged* into each
+    /// `ProcessInfo` by the process collector (which reads from the
+    /// shared `AttributionStore`), so this function no longer joins —
+    /// it's a presentation-side filter+sort over data that's already
+    /// authoritative on the bus.
     fn rebuild_sorted(&mut self) {
         let mut joined: Vec<ProcessInfo> = self
             .latest_processes
             .as_ref()
             .map(|s| s.processes.clone())
             .unwrap_or_default();
-        let net_idx: HashMap<u32, &ProcessNetSample> =
-            self.net_samples.iter().map(|s| (s.pid, s)).collect();
-        let has_bw = self.net_tier.has_bandwidth();
-        // Per-pid disk attribution overrides the sysinfo-derived rates the
-        // process collector populated. We only override when the attributor
-        // has a *real* rate for the pid (Some, not None) — otherwise the
-        // sysinfo value stands (graceful fallback for first-sample warmup
-        // and pids the attributor hasn't seen yet).
-        let disk_idx: HashMap<u32, &ProcessDiskSample> =
-            self.disk_samples.iter().map(|s| (s.pid, s)).collect();
-        for p in joined.iter_mut() {
-            if let Some(n) = net_idx.get(&p.pid) {
-                p.net_rx_bytes_per_sec = n.rx_bytes_per_sec;
-                p.net_tx_bytes_per_sec = n.tx_bytes_per_sec;
-            } else if has_bw {
-                p.net_rx_bytes_per_sec = Some(0.0);
-                p.net_tx_bytes_per_sec = Some(0.0);
-            }
-            if let Some(d) = disk_idx.get(&p.pid) {
-                if let Some(r) = d.read_bytes_per_sec {
-                    p.disk_read_bytes_per_sec = Some(r);
-                }
-                if let Some(w) = d.write_bytes_per_sec {
-                    p.disk_write_bytes_per_sec = Some(w);
-                }
-            }
-        }
         // Apply text filter (B3b) if any. Match name OR cmdline,
         // case-insensitive. Empty filter passes everything.
         if !self.ui.filter_text.is_empty() {

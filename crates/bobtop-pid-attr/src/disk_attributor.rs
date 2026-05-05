@@ -32,7 +32,7 @@ pub struct ProcessDiskSample {
     pub tier: DiskAttributorTier,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DiskAttributorTier {
     /// Tier 2 — Linux + `CAP_BPF`. Kretprobes on `vfs_read` / `vfs_write`.
     /// Accurate attribution, captures bytes the process actually issued.
@@ -43,6 +43,7 @@ pub enum DiskAttributorTier {
     ProcIo,
     /// Tier 0 — no disk attribution. Disk columns fall back to whatever the
     /// process collector itself derived (today: sysinfo).
+    #[default]
     Unavailable,
 }
 
