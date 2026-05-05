@@ -39,11 +39,17 @@ pcap = "2.0"
 nvml-wrapper = "0.10"
 libc = "0.2"
 
-# eBPF userspace loader (Linux only, gated by `ebpf` feature on bobtop-net).
-# NOTE: the kernel-side `aya-ebpf` crate is intentionally NOT listed here —
-# it must live in a separate crate compiled to the bpfel-unknown-none target,
-# and will be added when Tier 3 is implemented.
-aya = "0.13"
+# eBPF userspace loader. We use libbpf-rs (a safe Rust wrapper around the
+# canonical libbpf C library) instead of pure-Rust loaders like aya:
+# libbpf is the reference implementation maintained alongside the kernel,
+# so it tracks ELF/BTF format changes correctly across LLVM versions.
+# Migrated from aya 0.13.1 after persistent "error parsing ELF data"
+# failures on hosts where the BPF object was perfectly valid (the issue
+# was aya's from-scratch ELF parser, not the object).
+libbpf-rs = "0.26"
+# Build-time codegen: SkeletonBuilder compiles bpf .c → .o and emits
+# typed Rust accessors for programs and maps.
+libbpf-cargo = "0.26"
 
 # Errors & logging
 thiserror = "1"

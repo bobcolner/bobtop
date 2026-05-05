@@ -11,33 +11,46 @@
 //! Both kernel symbols are stable across recent kernel versions.
 //!
 //! Privileges: `CAP_BPF` + `CAP_PERFMON` (preferred), or root. Kernel ≥ 5.8.
+//!
+//! ## Loader
+//!
+//! Uses libbpf-rs. The build script generates a typed skeleton at
+//! `$OUT_DIR/net.skel.rs` exposing `BobtopNetSkelBuilder` and accessors
+//! for each map and program. Migrated from aya 0.13 after persistent
+//! "error parsing ELF data" failures on hosts where the BPF object was
+//! valid (aya's from-scratch ELF parser disagreed with newer LLVM
+//! output). libbpf is the canonical loader maintained alongside the
+//! kernel and tracks ELF/BTF format changes correctly.
 
 #![cfg(all(target_os = "linux", feature = "ebpf"))]
-#![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{MapCore as _, MapFlags};
 
 use super::common::{
-    attach_kprobe, has_bpf_capability, has_kernel_min_version, is_cgroup_v2_unified_mounted,
-    load_with_memlock_fallback, read_proc_comm,
+    has_bpf_capability, has_kernel_min_version, is_cgroup_v2_unified_mounted, read_proc_comm,
 };
 use crate::{AttributorTier, NetError, NetworkAttributor, ProcessNetSample, Result};
 
 #[cfg(bobtop_bpf_built)]
-const BPF_OBJECT: &[u8] = include_bytes!(env!("BOBTOP_BPF_OBJ"));
+mod skel {
+    include!(concat!(env!("OUT_DIR"), "/net.skel.rs"));
+}
 #[cfg(not(bobtop_bpf_built))]
-const BPF_OBJECT: &[u8] = &[];
+mod skel {
+    /// Stub when build.rs couldn't compile the BPF object (no clang or
+    /// libbpf-cargo failed). `available()` reports false in that case so
+    /// the runtime tier-selector falls through cleanly.
+    pub const STUB: () = ();
+}
 
-const MAP_NAME: &str = "pid_bytes_map";
-const SEND_PROG: &str = "probe_tcp_sendmsg";
-const RECV_PROG: &str = "probe_tcp_cleanup_rbuf";
-
-/// Mirror of `struct pid_bytes` in the BPF C source. Field order and
-/// alignment must match exactly.
+/// Mirror of `struct pid_bytes` in the BPF C source.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct PidBytes {
@@ -45,26 +58,39 @@ struct PidBytes {
     tx: u64,
 }
 
-// SAFETY: PidBytes has no padding (two u64 fields), no pointers, and any bit
-// pattern is a valid value. That satisfies aya's Pod contract.
-unsafe impl aya::Pod for PidBytes {}
+// SAFETY: PidBytes is two u64s with no padding/pointers; any bit pattern is
+// valid. Required by libbpf-rs's plain-bytes round-trip when looking up map
+// entries.
+unsafe fn pid_bytes_from_slice(s: &[u8]) -> Option<PidBytes> {
+    if s.len() < std::mem::size_of::<PidBytes>() {
+        return None;
+    }
+    let mut out = PidBytes::default();
+    let p = &mut out as *mut PidBytes as *mut u8;
+    std::ptr::copy_nonoverlapping(s.as_ptr(), p, std::mem::size_of::<PidBytes>());
+    Some(out)
+}
+
+const IDLE_EVICTION_THRESHOLD: u32 = 30;
 
 pub struct EbpfAttributor {
     inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
-    ebpf: aya::Ebpf,
+    /// The loaded skeleton owns the kernel-side BPF object + attached
+    /// kprobes. Drop = unload + detach.
+    #[cfg(bobtop_bpf_built)]
+    skel: skel::BobtopNetSkel<'static>,
+    #[cfg(bobtop_bpf_built)]
+    _open_object: Box<MaybeUninit<libbpf_rs::OpenObject>>,
     /// Last absolute (rx, tx, observed_at) per pid, for delta computation.
     last_seen: HashMap<u32, (u64, u64, Instant)>,
-    /// How many consecutive zero-delta samples each pid has produced. Used
-    /// to evict idle pids from the BPF hash map so `iter()` in `sample()`
-    /// stays bounded by *currently active* TCP-senders rather than every
-    /// pid that has ever sent traffic since boot.
+    /// How many consecutive zero-delta samples each pid has produced; used
+    /// to evict idle pids from the BPF map so the iter cost stays bounded
+    /// by *currently active* TCP-senders.
     idle_streak: HashMap<u32, u32>,
 }
-
-const IDLE_EVICTION_THRESHOLD: u32 = 30;
 
 impl std::fmt::Debug for EbpfAttributor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,12 +99,8 @@ impl std::fmt::Debug for EbpfAttributor {
 }
 
 impl EbpfAttributor {
+    #[cfg(bobtop_bpf_built)]
     pub fn new() -> Result<Self> {
-        if BPF_OBJECT.is_empty() {
-            return Err(NetError::other(
-                "BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
-            ));
-        }
         if !is_cgroup_v2_unified_mounted() {
             return Err(NetError::MissingCapability("cgroup v2 unified mount"));
         }
@@ -89,22 +111,44 @@ impl EbpfAttributor {
             return Err(NetError::MissingCapability("CAP_BPF or root"));
         }
 
-        let mut ebpf = load_with_memlock_fallback(BPF_OBJECT)?;
+        // The OpenObject must outlive the skel — it owns the kernel-side
+        // BPF object's memory. We Box it so its address is stable while
+        // the skel borrows it.
+        let mut open_object: Box<MaybeUninit<libbpf_rs::OpenObject>> =
+            Box::new(MaybeUninit::uninit());
+        // SAFETY: extending the lifetime to 'static is sound because we
+        // store both `open_object` and `skel` in the same `Inner`, so they
+        // drop together. Skel never escapes Inner.
+        let open_object_ref: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+            unsafe { std::mem::transmute(&mut *open_object) };
 
-        // Attach kprobes. If the second attach fails, returning Err drops
-        // `ebpf` here — aya's Drop walks all programs and detaches them.
-        attach_kprobe(&mut ebpf, SEND_PROG, "tcp_sendmsg")?;
-        attach_kprobe(&mut ebpf, RECV_PROG, "tcp_cleanup_rbuf")?;
+        let builder = skel::BobtopNetSkelBuilder::default();
+        let open = builder
+            .open(open_object_ref)
+            .map_err(|e| NetError::Backend { backend: "libbpf-open", source: Box::new(e) })?;
+        let mut skel = open
+            .load()
+            .map_err(|e| NetError::Backend { backend: "libbpf-load", source: Box::new(e) })?;
+        skel.attach()
+            .map_err(|e| NetError::Backend { backend: "libbpf-attach", source: Box::new(e) })?;
 
         tracing::info!("ebpf net attributor: kprobes attached (tcp_sendmsg, tcp_cleanup_rbuf)");
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                ebpf,
+                skel,
+                _open_object: open_object,
                 last_seen: HashMap::new(),
                 idle_streak: HashMap::new(),
             })),
         })
+    }
+
+    #[cfg(not(bobtop_bpf_built))]
+    pub fn new() -> Result<Self> {
+        Err(NetError::other(
+            "BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
+        ))
     }
 }
 
@@ -122,27 +166,42 @@ impl NetworkAttributor for EbpfAttributor {
     }
 
     fn available() -> bool {
-        !BPF_OBJECT.is_empty()
+        cfg!(bobtop_bpf_built)
             && is_cgroup_v2_unified_mounted()
             && has_kernel_min_version(5, 8)
             && has_bpf_capability()
     }
 }
 
+#[cfg(bobtop_bpf_built)]
 fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
 
-    // Pull the entire BPF hash map into a local Vec, then drop the borrow on
-    // `g.ebpf` so we can mutate `g.last_seen` below.
+    // Snapshot the BPF map into a Vec<(pid, PidBytes)> so we can drop the
+    // map borrow before mutating last_seen / idle_streak below. libbpf-rs
+    // exposes typed iteration via the generated `maps` accessor.
     let current: Vec<(u32, PidBytes)> = {
-        let map_data = g
-            .ebpf
-            .map_mut(MAP_NAME)
-            .ok_or_else(|| NetError::other(format!("map `{MAP_NAME}` not found")))?;
-        let map: aya::maps::HashMap<_, u32, PidBytes> = aya::maps::HashMap::try_from(map_data)
-            .map_err(|e| NetError::Backend { backend: "aya-map", source: Box::new(e) })?;
-        map.iter().filter_map(|r| r.ok()).collect()
+        let map = &g.skel.maps.pid_bytes_map;
+        let mut out = Vec::new();
+        for key_bytes in map.keys() {
+            if key_bytes.len() < std::mem::size_of::<u32>() {
+                continue;
+            }
+            let mut pid_bytes = [0u8; 4];
+            pid_bytes.copy_from_slice(&key_bytes[..4]);
+            let pid = u32::from_ne_bytes(pid_bytes);
+            let Ok(Some(val)) = map.lookup(&key_bytes, MapFlags::ANY) else {
+                continue;
+            };
+            // SAFETY: PidBytes is `#[repr(C)]` of two u64s with no pointers;
+            // any bit pattern is valid (matches the kernel-side struct).
+            let Some(v) = (unsafe { pid_bytes_from_slice(&val) }) else {
+                continue;
+            };
+            out.push((pid, v));
+        }
+        out
     };
 
     let mut out = Vec::with_capacity(current.len());
@@ -178,7 +237,7 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
         });
     }
 
-    // Update last_seen and evict pids that have disappeared from the map.
+    // Evict pids that disappeared from the BPF map (process exited).
     let live: HashSet<u32> = current.iter().map(|(p, _)| *p).collect();
     g.last_seen.retain(|pid, _| live.contains(pid));
     g.idle_streak.retain(|pid, _| live.contains(pid));
@@ -186,13 +245,13 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
         g.last_seen.insert(pid, (bytes.rx, bytes.tx, now));
     }
 
+    // Prune long-idle pids from the BPF map so iter() stays bounded by
+    // active senders. Errors are non-fatal — kernel may have already
+    // evicted via map pressure or a concurrent kprobe re-inserted.
     if !to_evict.is_empty() {
-        if let Some(map_data) = g.ebpf.map_mut(MAP_NAME) {
-            if let Ok(mut map) = aya::maps::HashMap::<_, u32, PidBytes>::try_from(map_data) {
-                for pid in &to_evict {
-                    let _ = map.remove(pid);
-                }
-            }
+        let map = &g.skel.maps.pid_bytes_map;
+        for pid in &to_evict {
+            let _ = map.delete(&pid.to_ne_bytes());
         }
         for pid in &to_evict {
             g.last_seen.remove(pid);
@@ -201,4 +260,9 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     }
 
     Ok(out)
+}
+
+#[cfg(not(bobtop_bpf_built))]
+fn sample_blocking(_inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
+    Ok(Vec::new())
 }

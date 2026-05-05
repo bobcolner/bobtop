@@ -10,33 +10,28 @@
 //! writes. That's the primary reason this tier exists.
 //!
 //! Privileges: same as the net tier — `CAP_BPF` (or root) + kernel ≥ 5.8.
+//! Loader: libbpf-rs (see [`super::net`] for migration rationale).
 
 #![cfg(all(target_os = "linux", feature = "ebpf"))]
-#![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{MapCore as _, MapFlags};
 
-use super::common::{
-    attach_kprobe, has_bpf_capability, has_kernel_min_version, is_cgroup_v2_unified_mounted,
-    load_with_memlock_fallback,
-};
+use super::common::{has_bpf_capability, has_kernel_min_version, is_cgroup_v2_unified_mounted};
 use crate::disk_attributor::{DiskAttributor, DiskAttributorTier, ProcessDiskSample};
 use crate::{NetError, Result};
 
 #[cfg(bobtop_bpf_built)]
-const BPF_OBJECT: &[u8] = include_bytes!(env!("BOBTOP_BPF_DISK_OBJ"));
-#[cfg(not(bobtop_bpf_built))]
-const BPF_OBJECT: &[u8] = &[];
+mod skel {
+    include!(concat!(env!("OUT_DIR"), "/disk.skel.rs"));
+}
 
-const MAP_NAME: &str = "pid_disk_bytes_map";
-const READ_PROG: &str = "probe_vfs_read_ret";
-const WRITE_PROG: &str = "probe_vfs_write_ret";
-
-/// Mirror of `struct pid_disk_bytes` in the BPF C source.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 struct PidDiskBytes {
@@ -44,24 +39,30 @@ struct PidDiskBytes {
     w: u64,
 }
 
-// SAFETY: PidDiskBytes is two u64s with no padding/pointers; any bit pattern
-// is a valid value, satisfying aya's Pod contract.
-unsafe impl aya::Pod for PidDiskBytes {}
+unsafe fn pid_disk_bytes_from_slice(s: &[u8]) -> Option<PidDiskBytes> {
+    if s.len() < std::mem::size_of::<PidDiskBytes>() {
+        return None;
+    }
+    let mut out = PidDiskBytes::default();
+    let p = &mut out as *mut PidDiskBytes as *mut u8;
+    std::ptr::copy_nonoverlapping(s.as_ptr(), p, std::mem::size_of::<PidDiskBytes>());
+    Some(out)
+}
+
+const IDLE_EVICTION_THRESHOLD: u32 = 30;
 
 pub struct EbpfDiskAttributor {
     inner: Arc<Mutex<Inner>>,
 }
 
 struct Inner {
-    ebpf: aya::Ebpf,
-    /// Last absolute (read_bytes, write_bytes, observed_at) per pid.
+    #[cfg(bobtop_bpf_built)]
+    skel: skel::BobtopDiskSkel<'static>,
+    #[cfg(bobtop_bpf_built)]
+    _open_object: Box<MaybeUninit<libbpf_rs::OpenObject>>,
     last_seen: HashMap<u32, (u64, u64, Instant)>,
-    /// Idle-streak counter for evicting long-quiet pids from the BPF map,
-    /// matching the bounding behavior of the net tier.
     idle_streak: HashMap<u32, u32>,
 }
-
-const IDLE_EVICTION_THRESHOLD: u32 = 30;
 
 impl std::fmt::Debug for EbpfDiskAttributor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -70,12 +71,8 @@ impl std::fmt::Debug for EbpfDiskAttributor {
 }
 
 impl EbpfDiskAttributor {
+    #[cfg(bobtop_bpf_built)]
     pub fn new() -> Result<Self> {
-        if BPF_OBJECT.is_empty() {
-            return Err(NetError::other(
-                "Disk BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
-            ));
-        }
         if !is_cgroup_v2_unified_mounted() {
             return Err(NetError::MissingCapability("cgroup v2 unified mount"));
         }
@@ -86,23 +83,38 @@ impl EbpfDiskAttributor {
             return Err(NetError::MissingCapability("CAP_BPF or root"));
         }
 
-        let mut ebpf = load_with_memlock_fallback(BPF_OBJECT)?;
+        let mut open_object: Box<MaybeUninit<libbpf_rs::OpenObject>> =
+            Box::new(MaybeUninit::uninit());
+        let open_object_ref: &'static mut MaybeUninit<libbpf_rs::OpenObject> =
+            unsafe { std::mem::transmute(&mut *open_object) };
 
-        // aya treats kretprobes through the same KProbe program type — the
-        // kernel-side SEC("kretprobe/...") declaration is what makes it a
-        // return-probe. attach() targets the entry symbol; kernel routes.
-        attach_kprobe(&mut ebpf, READ_PROG, "vfs_read")?;
-        attach_kprobe(&mut ebpf, WRITE_PROG, "vfs_write")?;
+        let builder = skel::BobtopDiskSkelBuilder::default();
+        let open = builder
+            .open(open_object_ref)
+            .map_err(|e| NetError::Backend { backend: "libbpf-open", source: Box::new(e) })?;
+        let mut skel = open
+            .load()
+            .map_err(|e| NetError::Backend { backend: "libbpf-load", source: Box::new(e) })?;
+        skel.attach()
+            .map_err(|e| NetError::Backend { backend: "libbpf-attach", source: Box::new(e) })?;
 
         tracing::info!("ebpf disk attributor: kretprobes attached (vfs_read, vfs_write)");
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
-                ebpf,
+                skel,
+                _open_object: open_object,
                 last_seen: HashMap::new(),
                 idle_streak: HashMap::new(),
             })),
         })
+    }
+
+    #[cfg(not(bobtop_bpf_built))]
+    pub fn new() -> Result<Self> {
+        Err(NetError::other(
+            "Disk BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
+        ))
     }
 }
 
@@ -120,26 +132,39 @@ impl DiskAttributor for EbpfDiskAttributor {
     }
 
     fn available() -> bool {
-        !BPF_OBJECT.is_empty()
+        cfg!(bobtop_bpf_built)
             && is_cgroup_v2_unified_mounted()
             && has_kernel_min_version(5, 8)
             && has_bpf_capability()
     }
 }
 
+#[cfg(bobtop_bpf_built)]
 fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
 
     let current: Vec<(u32, PidDiskBytes)> = {
-        let map_data = g
-            .ebpf
-            .map_mut(MAP_NAME)
-            .ok_or_else(|| NetError::other(format!("map `{MAP_NAME}` not found")))?;
-        let map: aya::maps::HashMap<_, u32, PidDiskBytes> =
-            aya::maps::HashMap::try_from(map_data)
-                .map_err(|e| NetError::Backend { backend: "aya-map", source: Box::new(e) })?;
-        map.iter().filter_map(|r| r.ok()).collect()
+        let map = &g.skel.maps.pid_disk_bytes_map;
+        let mut out = Vec::new();
+        for key_bytes in map.keys() {
+            if key_bytes.len() < std::mem::size_of::<u32>() {
+                continue;
+            }
+            let mut pid_bytes = [0u8; 4];
+            pid_bytes.copy_from_slice(&key_bytes[..4]);
+            let pid = u32::from_ne_bytes(pid_bytes);
+            let Ok(Some(val)) = map.lookup(&key_bytes, MapFlags::ANY) else {
+                continue;
+            };
+            // SAFETY: PidDiskBytes is `#[repr(C)]` of two u64s, no
+            // pointers; any bit pattern is a valid value.
+            let Some(v) = (unsafe { pid_disk_bytes_from_slice(&val) }) else {
+                continue;
+            };
+            out.push((pid, v));
+        }
+        out
     };
 
     let mut out = Vec::with_capacity(current.len());
@@ -181,12 +206,9 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     }
 
     if !to_evict.is_empty() {
-        if let Some(map_data) = g.ebpf.map_mut(MAP_NAME) {
-            if let Ok(mut map) = aya::maps::HashMap::<_, u32, PidDiskBytes>::try_from(map_data) {
-                for pid in &to_evict {
-                    let _ = map.remove(pid);
-                }
-            }
+        let map = &g.skel.maps.pid_disk_bytes_map;
+        for pid in &to_evict {
+            let _ = map.delete(&pid.to_ne_bytes());
         }
         for pid in &to_evict {
             g.last_seen.remove(pid);
@@ -195,4 +217,9 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     }
 
     Ok(out)
+}
+
+#[cfg(not(bobtop_bpf_built))]
+fn sample_blocking(_inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
+    Ok(Vec::new())
 }
