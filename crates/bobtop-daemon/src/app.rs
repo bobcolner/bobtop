@@ -940,15 +940,28 @@ impl App {
     }
 
     pub fn handle_input(&mut self, ev: Event) -> ControlFlow {
-        // Non-key events: terminal lifecycle. Resize and FocusGained both
-        // mean "the actual terminal cells may not match what ratatui's
-        // internal `prev` buffer thinks they are" — the latter happens
-        // after SSH/et reconnect and sleep/wake. Force a full repaint so
-        // the diff-based renderer doesn't leave stale chrome on screen.
+        // Non-key events: terminal lifecycle.
+        //
+        // Resize: genuine signal that cells may not match — force a full
+        // clear+repaint to resync ratatui's diff buffer with reality.
+        //
+        // FocusGained: NOT used to trigger clear. Many terminals (kitty,
+        // alacritty, et) emit FocusGained spuriously on keypresses or
+        // mouse movement; a clear on each was the leftover flicker.
+        // Sleep-detection in tui::run already handles the case where the
+        // host was paused (long heartbeat gap → force_full_repaint), and
+        // genuine SSH/et reconnects trigger Resize because the size
+        // renegotiation always fires on session resume.
         match &ev {
-            Event::Resize(_, _) | Event::FocusGained => {
+            Event::Resize(_, _) => {
                 self.ui.dirty = true;
                 self.ui.force_full_repaint = true;
+                return ControlFlow::Continue;
+            }
+            Event::FocusGained => {
+                // Mark dirty so any time-derived UI repaints, but don't
+                // force a clear.
+                self.ui.dirty = true;
                 return ControlFlow::Continue;
             }
             _ => {}
