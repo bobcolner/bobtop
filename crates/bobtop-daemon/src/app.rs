@@ -1173,8 +1173,34 @@ impl App {
                 ControlFlow::Continue
             }
             KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
+            // btop-style box toggles: 1=CPU, 2=Memory, 3=Network, 4=Process.
+            // The remaining boxes auto-resize to fill since the layout is
+            // computed from `boxes.is_enabled(...)` each frame. (Disk has
+            // no number key — toggle via the `B` overlay; presets via the
+            // Options menu `O` or the `~/.config/bobtop/bobtop.toml` file.)
             KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => {
-                let idx = (c as u8 - b'1') as usize;
+                let target = match c {
+                    '1' => bobtop_core::Box::Cpu,
+                    '2' => bobtop_core::Box::Memory,
+                    '3' => bobtop_core::Box::Network,
+                    '4' => bobtop_core::Box::Process,
+                    _ => unreachable!(),
+                };
+                let now_enabled = !self.boxes.is_enabled(target);
+                self.boxes.set(target, now_enabled);
+                ControlFlow::Continue
+            }
+            // Presets reachable via Shift+1-4 (US: ! @ # $) so users who
+            // were relying on the old 1-4 preset bindings still have a
+            // direct shortcut. Same indices as DEFAULT_PRESETS.
+            KeyCode::Char(c @ ('!' | '@' | '#' | '$')) => {
+                let idx = match c {
+                    '!' => 0,
+                    '@' => 1,
+                    '#' => 2,
+                    '$' => 3,
+                    _ => unreachable!(),
+                };
                 if let Some(preset) = DEFAULT_PRESETS.get(idx) {
                     self.apply_preset(preset);
                 }
@@ -1455,10 +1481,38 @@ mod tests {
     }
 
     #[test]
-    fn preset_keys_swap_layout_and_sort() {
+    fn box_toggle_keys_show_hide_panels() {
         use bobtop_core::Box as BoxKind;
+        // btop convention: 1=CPU, 2=Mem, 3=Net, 4=Proc — toggles the
+        // individual panel. Layout adapts because the renderer derives
+        // the active rects from `boxes.is_enabled(...)` each frame.
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
-        // Seed with a Process sample so apply_preset has something to sort.
+        assert!(app.boxes.is_enabled(BoxKind::Cpu));
+        assert!(app.boxes.is_enabled(BoxKind::Memory));
+        assert!(app.boxes.is_enabled(BoxKind::Network));
+        assert!(app.boxes.is_enabled(BoxKind::Process));
+
+        for (key, target) in [
+            ('1', BoxKind::Cpu),
+            ('2', BoxKind::Memory),
+            ('3', BoxKind::Network),
+            ('4', BoxKind::Process),
+        ] {
+            let evt = Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            app.handle_input(evt.clone());
+            assert!(!app.boxes.is_enabled(target), "{key} should hide {target:?}");
+            app.handle_input(evt);
+            assert!(app.boxes.is_enabled(target), "{key} again should re-show {target:?}");
+        }
+    }
+
+    #[test]
+    fn shifted_number_keys_swap_layout_and_sort() {
+        use bobtop_core::Box as BoxKind;
+        // Shift+1-4 ('!', '@', '#', '$' on US layout) apply the named
+        // presets. Direct number keys are reserved for box toggles per
+        // btop convention.
+        let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         let sample = ProcessSample {
             timestamp: Instant::now(),
             processes: vec![
@@ -1468,31 +1522,21 @@ mod tests {
         };
         app.apply_event(MetricEvent::Process(sample));
 
-        // Preset 2 (key '2') = Full + sort by Mem.
-        let two = Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        app.handle_input(two);
+        // '@' = Shift+2 = preset 2 = Full + sort by Mem.
+        let at = Event::Key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::SHIFT));
+        app.handle_input(at);
         assert_eq!(app.layout_preset, LayoutPreset::Full);
         assert_eq!(app.proc_sort, TableSort::Mem);
 
-        // Preset 4 (key '4') = Minimal — should disable MEM/DISK/NET boxes.
-        let four = Event::Key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
-        app.handle_input(four);
+        // '$' = Shift+4 = preset 4 = Minimal (CPU + processes only).
+        let dollar = Event::Key(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::SHIFT));
+        app.handle_input(dollar);
         assert_eq!(app.layout_preset, LayoutPreset::Minimal);
         assert_eq!(app.proc_sort, TableSort::Cpu);
         assert!(!app.boxes.is_enabled(BoxKind::Memory));
         assert!(!app.boxes.is_enabled(BoxKind::Network));
         assert!(app.boxes.is_enabled(BoxKind::Cpu));
         assert!(app.boxes.is_enabled(BoxKind::Process));
-
-        // After B3a, `m` is the direct sort-by-mem shortcut, not the
-        // preset-4 alias. Verify it sorts (and does NOT change layout).
-        app.apply_preset(&DEFAULT_PRESETS[0]); // back to slot 1 (sort: Cpu)
-        assert_eq!(app.layout_preset, LayoutPreset::Full);
-        assert_eq!(app.proc_sort, TableSort::Cpu);
-        let m = Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        app.handle_input(m);
-        assert_eq!(app.proc_sort, TableSort::Mem);
-        assert_eq!(app.layout_preset, LayoutPreset::Full); // not changed
     }
 
     #[test]
