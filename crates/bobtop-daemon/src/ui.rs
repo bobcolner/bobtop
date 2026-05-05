@@ -42,12 +42,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         }
     }
-    // Layout is now computed from `app.boxes` directly — disabled panels
-    // get None (no rect) and their space is reabsorbed by neighbors. The
-    // old "render placeholder in the disabled slot" pattern is gone since
-    // there's no slot to render in. Users toggle via 1-4 (CPU/Mem/Net/Proc)
-    // or `B` (any of the 5 including disks).
-    let layout = compute_layout(area, &app.boxes);
+    // Layout is computed from `app.panel_sizes` — disabled panels get None
+    // (no rect) and their space is reabsorbed; sized panels claim their
+    // share of the row/column they live in. Users cycle sizes via 1-5
+    // (CPU/Mem/Net/Proc/Disk) or toggle on/off via `B`.
+    let layout = compute_layout(area, &app.panel_sizes);
 
     if let Some(cpu_area) = layout.cpu {
         cpu::draw(frame, cpu_area, app);

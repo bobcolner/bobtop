@@ -311,6 +311,11 @@ pub const DEFAULT_PRESETS: [Preset; 4] = [
 pub struct App {
     pub theme: Theme,
     pub layout_preset: LayoutPreset,
+    /// Per-panel size selection. Drives layout proportions AND the
+    /// `boxes` bitmask the collectors read for skip-when-disabled. Pressing
+    /// `1`-`5` cycles the corresponding panel through Off → Default →
+    /// Large → Off. Initialized from `layout_preset.enabled_boxes()`.
+    pub panel_sizes: bobtop_tui::PanelSizes,
     pub tty_graphs: bool,
     pub show_virtual_net: bool,
     /// Interface focused by the network panel. `None` = aggregate view
@@ -428,9 +433,11 @@ impl App {
         show_virtual_net: bool,
     ) -> Self {
         let boxes = BoxesEnabled::with(layout_preset.enabled_boxes());
+        let panel_sizes = bobtop_tui::PanelSizes::from_preset(layout_preset);
         Self {
             theme,
             layout_preset,
+            panel_sizes,
             tty_graphs,
             show_virtual_net,
             selected_iface: None,
@@ -742,11 +749,29 @@ impl App {
     }
 
     /// Switch the layout preset and mirror the new visible-box set into
-    /// the shared `BoxesEnabled` so collectors for hidden boxes stop
-    /// doing work on their next wake.
+    /// `panel_sizes` (and through it, the shared `BoxesEnabled` bitmask).
+    /// Sets every enabled box back to `Default` size — preset apply is
+    /// the "reset to a known shape" path, distinct from per-key cycling.
     pub fn set_layout(&mut self, preset: LayoutPreset) {
         self.layout_preset = preset;
-        self.boxes.replace(preset.enabled_boxes());
+        self.panel_sizes = bobtop_tui::PanelSizes::from_preset(preset);
+        self.sync_boxes_from_sizes();
+    }
+
+    /// Mirror the current `panel_sizes` into the `BoxesEnabled` bitmask.
+    /// Collectors read the bitmask in their tick loop to decide whether
+    /// to skip work; the bitmask is the on-the-wire interface, while
+    /// `panel_sizes` is the layout-side source of truth.
+    fn sync_boxes_from_sizes(&mut self) {
+        for b in [
+            bobtop_core::Box::Cpu,
+            bobtop_core::Box::Memory,
+            bobtop_core::Box::Disk,
+            bobtop_core::Box::Network,
+            bobtop_core::Box::Process,
+        ] {
+            self.boxes.set(b, self.panel_sizes.enabled(b));
+        }
     }
 
     /// Apply a full preset (layout + sort + direction) in one shot.
@@ -1113,8 +1138,19 @@ impl App {
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => {
                     let b = BoxKind::ALL[self.ui.boxes_overlay_cursor];
-                    let cur = self.boxes.is_enabled(b);
-                    self.boxes.set(b, !cur);
+                    // Toggle on/off via panel_sizes so the layout source
+                    // of truth stays consistent. On = Default size;
+                    // pressing 1-5 lets users grow it to Large after.
+                    let cur = self.panel_sizes.enabled(b);
+                    self.panel_sizes.set(
+                        b,
+                        if cur {
+                            bobtop_tui::PanelSize::Off
+                        } else {
+                            bobtop_tui::PanelSize::Default
+                        },
+                    );
+                    self.sync_boxes_from_sizes();
                     return ControlFlow::Continue;
                 }
                 _ => {} // fall through to normal handling
@@ -1186,21 +1222,24 @@ impl App {
                 ControlFlow::Continue
             }
             KeyCode::Char('q') | KeyCode::Esc => ControlFlow::Quit,
-            // btop-style box toggles: 1=CPU, 2=Memory, 3=Network, 4=Process.
-            // The remaining boxes auto-resize to fill since the layout is
-            // computed from `boxes.is_enabled(...)` each frame. (Disk has
-            // no number key — toggle via the `B` overlay; presets via the
-            // Options menu `O` or the `~/.config/bobtop/bobtop.toml` file.)
-            KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => {
+            // Btop-style panel cycle: 1=CPU, 2=Memory, 3=Network,
+            // 4=Process, 5=Disk. Each press cycles the panel size:
+            // Default → Large → Off → Default. Repeated taps unlock more
+            // layout variations (e.g. press 4 once for a Large process
+            // column at 75 % bottom width; press 4 again to hide it).
+            // The boxes bitmask (read by collectors for skip-when-disabled)
+            // is kept in sync via sync_boxes_from_sizes().
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4' | '5')) => {
                 let target = match c {
                     '1' => bobtop_core::Box::Cpu,
                     '2' => bobtop_core::Box::Memory,
                     '3' => bobtop_core::Box::Network,
                     '4' => bobtop_core::Box::Process,
+                    '5' => bobtop_core::Box::Disk,
                     _ => unreachable!(),
                 };
-                let now_enabled = !self.boxes.is_enabled(target);
-                self.boxes.set(target, now_enabled);
+                self.panel_sizes.cycle(target);
+                self.sync_boxes_from_sizes();
                 ControlFlow::Continue
             }
             // Presets reachable via Shift+1-4 (US: ! @ # $) so users who
@@ -1494,28 +1533,30 @@ mod tests {
     }
 
     #[test]
-    fn box_toggle_keys_show_hide_panels() {
+    fn box_size_keys_cycle_through_states() {
         use bobtop_core::Box as BoxKind;
-        // btop convention: 1=CPU, 2=Mem, 3=Net, 4=Proc — toggles the
-        // individual panel. Layout adapts because the renderer derives
-        // the active rects from `boxes.is_enabled(...)` each frame.
+        use bobtop_tui::PanelSize;
+        // Each panel cycles Default → Large → Off → Default per keypress.
+        // 1=CPU, 2=Mem, 3=Net, 4=Proc, 5=Disk.
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
-        assert!(app.boxes.is_enabled(BoxKind::Cpu));
-        assert!(app.boxes.is_enabled(BoxKind::Memory));
-        assert!(app.boxes.is_enabled(BoxKind::Network));
-        assert!(app.boxes.is_enabled(BoxKind::Process));
-
         for (key, target) in [
             ('1', BoxKind::Cpu),
             ('2', BoxKind::Memory),
             ('3', BoxKind::Network),
             ('4', BoxKind::Process),
+            ('5', BoxKind::Disk),
         ] {
+            assert_eq!(app.panel_sizes.get(target), PanelSize::Default);
             let evt = Event::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
             app.handle_input(evt.clone());
-            assert!(!app.boxes.is_enabled(target), "{key} should hide {target:?}");
+            assert_eq!(app.panel_sizes.get(target), PanelSize::Large, "{key} → Large");
+            assert!(app.boxes.is_enabled(target), "Large means still enabled");
+            app.handle_input(evt.clone());
+            assert_eq!(app.panel_sizes.get(target), PanelSize::Off, "{key} → Off");
+            assert!(!app.boxes.is_enabled(target), "Off means disabled");
             app.handle_input(evt);
-            assert!(app.boxes.is_enabled(target), "{key} again should re-show {target:?}");
+            assert_eq!(app.panel_sizes.get(target), PanelSize::Default, "{key} → Default");
+            assert!(app.boxes.is_enabled(target), "Default means enabled again");
         }
     }
 

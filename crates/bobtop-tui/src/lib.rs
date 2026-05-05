@@ -16,7 +16,10 @@ pub mod text;
 pub mod widgets;
 
 pub use color::{dim, lerp_color, parse_btop_color, Gradient};
-pub use layout::{compute as compute_layout, LayoutAreas, LayoutPreset};
+pub use layout::{
+    compute as compute_layout, compute_from_enabled, LayoutAreas, LayoutPreset, PanelSize,
+    PanelSizes,
+};
 pub use theme::{
     builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, Theme,
     DEFAULT_THEME_NAME,

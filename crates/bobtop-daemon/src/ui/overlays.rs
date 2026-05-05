@@ -254,7 +254,7 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("← / →", "cycle sort column"),
     ("r", "reverse sort direction"),
     ("+ / -", "adjust global tick"),
-    ("1 / 2 / 3 / 4", "toggle CPU / Memory / Network / Process panel (btop-style)"),
+    ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk panel size (off → default → large)"),
     ("! / @ / # / $", "apply preset 1-4 (Shift+1-4: full+CPU / full+MEM / full+NET / minimal)"),
     ("p / n / m / c", "sort by Pid / Name / Mem / Cpu"),
     ("B", "boxes — show/hide individual panels"),
