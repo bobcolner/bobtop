@@ -1,17 +1,10 @@
-//! Agent query layer — a tiny Unix-socket JSON-RPC interface that exposes
-//! the running daemon's [`SampleStore`] (and, in later phases, [`History`])
-//! to read-only consumers.
+//! Daemon-side glue around the agent layer.
 //!
-//! The wire format is documented in `docs/agent-schema.md`. Every response
-//! carries `"schema": "bobtop/v1"` so clients can detect a version skew.
-//!
-//! Phase 2 (this commit) ships only the `snapshot` verb. Subsequent phases
-//! add `top`, `peak`, `responsible_for`, etc., behind the same socket and
-//! response envelope.
+//! The wire format, query handlers, and Unix-socket server now live in
+//! `bobtop_engine::agent`. This module is just the daemon-binary
+//! pieces: the `bobtop agent <subcommand>` CLI and a re-export of the
+//! engine's `spawn` so `main.rs` can keep its existing call shape.
 
 pub mod client;
-pub mod query;
-pub mod schema;
-pub mod server;
 
-pub use server::spawn;
+pub use bobtop_engine::agent::server::spawn;

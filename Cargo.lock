@@ -175,6 +175,9 @@ dependencies = [
  "bobtop-collectors",
  "bobtop-core",
  "bobtop-pid-attr",
+ "libc",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
