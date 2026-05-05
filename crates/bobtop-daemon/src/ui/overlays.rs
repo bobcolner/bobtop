@@ -271,15 +271,18 @@ pub const HELP_LINES: &[(&str, &str)] = &[
 ];
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    // Help is the largest dialog in the app — perfect place for a
-    // braille-art "BOBTOP" banner at the top of the body. The banner is
-    // 2 cells tall + 1 cell of padding above and below = 4 reserved
-    // rows. Skipped on tight terminals where the modal can't afford it.
+    // Help banner: braille-art "BOBTOP" with horizontal rule lines
+    // flanking the text on both rows. The CPU theme gradient sweeps
+    // across the full banner width so the rules shade left-to-right.
     let banner_text = "BOBTOP";
     let banner = BrailleText::new(banner_text)
-        .with_style(Style::default().fg(app.theme.cpu.end));
-    let banner_w = banner.width();
+        .with_style(Style::default().fg(app.theme.hi_fg))
+        .with_gradient(app.theme.cpu)
+        .with_rule('━', '─');
     let banner_h = banner.height();
+    // Banner reserves: banner_h + 1 row gap below.
+    let banner_block_h: u16 = banner_h + 1;
+    let banner_intrinsic_w = banner.intrinsic_width();
 
     let key_w = HELP_LINES
         .iter()
@@ -291,13 +294,15 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(k, d)| (k.chars().count() + d.chars().count() + 4) as u16)
         .max()
         .unwrap_or(40);
-    let natural_w: u16 = longest_line.max(banner_w + 4) + 4;
+    let natural_w: u16 = longest_line.max(banner_intrinsic_w + 4) + 4;
     let max_w = area.width.saturating_sub(4).max(20);
     let want_w = natural_w.min(max_w);
-    // 4 extra rows: banner (2) + padding (1 above, 1 below) + 1 footer.
+
     let max_h = area.height.saturating_sub(2).max(8);
-    let banner_rows = banner_h + 2;
-    let want_h = ((HELP_LINES.len() as u16) + banner_rows + 3).min(max_h);
+    // Body needs: banner_block + N help lines + footer + (top+bot border = 2).
+    // We always *try* to fit the banner; if not all help lines fit they
+    // just truncate at the visible row count.
+    let want_h = ((HELP_LINES.len() as u16) + banner_block_h + 3).min(max_h);
 
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
@@ -309,17 +314,23 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    // Banner: render only when the modal has room to spare. Centered.
-    let show_banner = body.height >= (HELP_LINES.len() as u16) + banner_rows + 3
-        && body.width >= banner_w + 2;
+    // Show the banner whenever the modal has at least 5 rows of body
+    // and enough width for the letter run plus rule space on each side.
+    // The banner stretches across the full body width — letters center,
+    // rules fill the gap between letters and modal edges.
+    let show_banner =
+        body.height >= banner_block_h + 3 && body.width >= banner_intrinsic_w + 4;
     let key_rows_y = if show_banner {
-        let banner_x = body.x + (body.width.saturating_sub(banner_w)) / 2;
-        let banner_y = body.y + 1;
+        // Inset the banner by 2 cells from each side of the body so the
+        // rule chars don't kiss the modal border.
+        let banner_x = body.x + 2;
+        let banner_w = body.width.saturating_sub(4);
+        let banner_y = body.y;
         frame.render_widget(
             &banner,
             Rect::new(banner_x, banner_y, banner_w, banner_h),
         );
-        body.y + banner_rows + 1
+        body.y + banner_block_h
     } else {
         body.y + 1
     };
