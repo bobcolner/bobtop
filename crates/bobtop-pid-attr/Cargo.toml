@@ -25,9 +25,16 @@ pcap = { workspace = true, optional = true }
 # `cfg(target_os = "linux")` keeps macOS builds clean even when the `ebpf`
 # feature is requested by mistake.
 [target.'cfg(target_os = "linux")'.dependencies]
-aya = { workspace = true, optional = true }
+libbpf-rs = { workspace = true, optional = true }
+
+# libbpf-cargo runs at build time to compile BPF C → ELF object and
+# generate typed Rust skeletons. Build-deps run on the *host*, so this
+# is fine to leave un-target-gated; the feature flag still controls
+# whether it gets compiled at all.
+[build-dependencies]
+libbpf-cargo = { workspace = true, optional = true }
 
 [features]
 default = []
 pcap = ["dep:pcap"]
-ebpf = ["dep:aya"]
+ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
