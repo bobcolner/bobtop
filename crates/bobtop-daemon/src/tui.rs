@@ -133,13 +133,14 @@ pub async fn run(
     let mut bus_rx = bus.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Periodic full-repaint backstop. Some terminals don't deliver
-    // FocusGained on session resume (GNU screen, some et configurations,
-    // tmux without focus-events on), so we proactively wipe-and-repaint
-    // every N heartbeats to recover from any silent cell desync.
-    // 30 × 1s = 30s — invisible at this cadence (one frame's flicker max).
-    let mut heartbeats_since_full_repaint: u32 = 0;
-    const FULL_REPAINT_EVERY_N_HEARTBEATS: u32 = 30;
+    // Used to detect a sleep / suspend gap: when consecutive heartbeats
+    // arrive >2× the configured interval apart, the host was paused (lid
+    // closed, system sleep, et's SSH connection paused). On resume the
+    // terminal cells may have been wiped while ratatui's diff buffer
+    // thinks they still match, so we trigger one full clear+repaint to
+    // resync. Cheaper than a periodic backstop because it only fires
+    // when an actual disruption is detected — no idle-time flicker.
+    let mut last_heartbeat_at = std::time::Instant::now();
 
     // Paint the initial frame so users see the layout immediately rather
     // than a blank alt-screen until the first sample arrives.
@@ -188,14 +189,19 @@ pub async fn run(
                 }
             }
             _ = heartbeat.tick() => {
+                // Sleep/suspend detection: a heartbeat that's much later
+                // than expected means the host was paused. On resume,
+                // request a full clear+repaint to resync ratatui's diff
+                // buffer with whatever the terminal actually shows now.
+                let now = std::time::Instant::now();
+                let gap = now.duration_since(last_heartbeat_at);
+                last_heartbeat_at = now;
                 let mut g = lock(&app);
                 if g.boxes.is_enabled(BoxKind::Cpu) {
                     g.mark_dirty();
                 }
-                heartbeats_since_full_repaint += 1;
-                if heartbeats_since_full_repaint >= FULL_REPAINT_EVERY_N_HEARTBEATS {
+                if gap > HEARTBEAT_INTERVAL.saturating_mul(3) {
                     g.request_full_repaint();
-                    heartbeats_since_full_repaint = 0;
                 }
             }
         }
