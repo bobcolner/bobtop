@@ -78,19 +78,27 @@ fn build_table_model(
     rows: &[crate::group::TableRow],
     layout: bobtop_tui::widgets::TableLayout,
 ) -> (Vec<GridColumn<'static>>, Vec<GridRow<'static>>, Option<usize>) {
-    let columns = build_columns(layout);
+    // Drop RX/s and TX/s when the active net tier doesn't expose per-pid
+    // bandwidth (proc_inode shows only connections). Cleaner than
+    // displaying "-" in every cell, and frees the gutter for wider
+    // process names. eBPF and pcap tiers both populate, so they show.
+    let show_net = app.net_tier.has_bandwidth();
+    let columns = build_columns(layout, show_net);
     let sort_col = sort_column_index(app, layout, &columns);
     let grid_rows = rows
         .iter()
         .map(|row| match row {
-            crate::group::TableRow::Header(h) => build_header_row(app, h, layout, &columns),
-            crate::group::TableRow::Item(p) => build_process_row(app, p, layout, &columns),
+            crate::group::TableRow::Header(h) => build_header_row(app, h, layout, show_net, &columns),
+            crate::group::TableRow::Item(p) => build_process_row(app, p, layout, show_net, &columns),
         })
         .collect();
     (columns, grid_rows, sort_col)
 }
 
-fn build_columns(layout: bobtop_tui::widgets::TableLayout) -> Vec<GridColumn<'static>> {
+fn build_columns(
+    layout: bobtop_tui::widgets::TableLayout,
+    show_net: bool,
+) -> Vec<GridColumn<'static>> {
     let mut cols = Vec::with_capacity(11);
     if layout.includes_pid() {
         cols.push(GridColumn::new("Pid", 6).right_aligned(true));
@@ -105,8 +113,10 @@ fn build_columns(layout: bobtop_tui::widgets::TableLayout) -> Vec<GridColumn<'st
     cols.push(GridColumn::new("Th", 3).right_aligned(true));
     cols.push(GridColumn::new("MEM", 6).right_aligned(true));
     cols.push(GridColumn::new("CPU%", 5).right_aligned(true));
-    cols.push(GridColumn::new("RX/s", 6).right_aligned(true));
-    cols.push(GridColumn::new("TX/s", 6).right_aligned(true));
+    if show_net {
+        cols.push(GridColumn::new("RX/s", 6).right_aligned(true));
+        cols.push(GridColumn::new("TX/s", 6).right_aligned(true));
+    }
     cols.push(GridColumn::new("DR/s", 6).right_aligned(true));
     cols.push(GridColumn::new("DW/s", 6).right_aligned(true));
     cols
@@ -137,6 +147,7 @@ fn build_header_row(
     app: &App,
     h: &crate::group::TableGroupHeader,
     layout: bobtop_tui::widgets::TableLayout,
+    show_net: bool,
     columns: &[GridColumn<'static>],
 ) -> GridRow<'static> {
     let mut cells = blank_cells(columns.len());
@@ -155,10 +166,14 @@ fn build_header_row(
     cells[idx] = GridCell::new(h.threads_total.to_string());
     cells[idx + 1] = GridCell::bytes(h.mem_rss_total);
     cells[idx + 2] = GridCell::new(format!("{:.1}", h.cpu_fraction_total * 100.0));
-    cells[idx + 3] = GridCell::rate(h.net_rx_total);
-    cells[idx + 4] = GridCell::rate(h.net_tx_total);
-    cells[idx + 5] = GridCell::rate(h.disk_read_total);
-    cells[idx + 6] = GridCell::rate(h.disk_write_total);
+    let mut k = idx + 3;
+    if show_net {
+        cells[k] = GridCell::rate(h.net_rx_total);
+        cells[k + 1] = GridCell::rate(h.net_tx_total);
+        k += 2;
+    }
+    cells[k] = GridCell::rate(h.disk_read_total);
+    cells[k + 1] = GridCell::rate(h.disk_write_total);
 
     let row = GridRow::header(format!("▼ {}", h.label), label_col, cells);
     let style = if h.expanded {
@@ -173,6 +188,7 @@ fn build_process_row(
     app: &App,
     meta: &crate::group::TableRowMeta,
     layout: bobtop_tui::widgets::TableLayout,
+    show_net: bool,
     columns: &[GridColumn<'static>],
 ) -> GridRow<'static> {
     let p = &meta.info;
@@ -237,10 +253,14 @@ fn build_process_row(
         GridCell::new(format!("{:.1}", p.cpu_fraction * 100.0)).with_style(cpu_style);
 
     let net_style = Style::default().fg(fade_fg);
-    cells[col + 3] = GridCell::rate(p.net_rx_bytes_per_sec).with_style(net_style);
-    cells[col + 4] = GridCell::rate(p.net_tx_bytes_per_sec).with_style(net_style);
-    cells[col + 5] = GridCell::rate(p.disk_read_bytes_per_sec).with_style(net_style);
-    cells[col + 6] = GridCell::rate(p.disk_write_bytes_per_sec).with_style(net_style);
+    let mut k = col + 3;
+    if show_net {
+        cells[k] = GridCell::rate(p.net_rx_bytes_per_sec).with_style(net_style);
+        cells[k + 1] = GridCell::rate(p.net_tx_bytes_per_sec).with_style(net_style);
+        k += 2;
+    }
+    cells[k] = GridCell::rate(p.disk_read_bytes_per_sec).with_style(net_style);
+    cells[k + 1] = GridCell::rate(p.disk_write_bytes_per_sec).with_style(net_style);
 
     let row_style = if meta.depth == 0 {
         base_style

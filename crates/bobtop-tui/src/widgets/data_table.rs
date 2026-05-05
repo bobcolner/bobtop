@@ -263,8 +263,7 @@ impl<'a> Widget for &DataTable<'a> {
         // TableLayout dictate which appear). Cells emitted per row by
         // build_row_cells / header-row cells MUST follow the same
         // include order — they share the include predicates.
-        let cols: Vec<ColSpec> = build_cols(self.layout);
-        let _ = self.show_net_columns; // kept for API back-compat; columns now always shown
+        let cols: Vec<ColSpec> = build_cols(self.layout, self.show_net_columns);
 
         // Header row. Active sort column gets bracketed + arrow indicator.
         let header_style = Style::default().fg(self.theme.title).add_modifier(Modifier::BOLD);
@@ -431,7 +430,7 @@ impl<'a> DataTable<'a> {
             "  ".repeat(meta.depth as usize)
         };
 
-        let mut cells = build_row_cells(p, self.layout);
+        let mut cells = build_row_cells(p, self.layout, self.show_net_columns);
         // Replace the Program cell with prefix + name. Program's index
         // depends on layout (Pid is dropped in Grouped) — look it up.
         // Use resolved width so flex Program (u16::MAX) doesn't truncate
@@ -518,9 +517,11 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 }
 
 /// Build the column descriptors for the given layout. Order:
-///   [Pid] · Program · [Command] · [User] · Th · MEM · CPU% · RX · TX · DR · DW
-/// Bracketed columns are filtered by layout.includes_* predicates.
-fn build_cols(layout: TableLayout) -> Vec<ColSpec> {
+///   [Pid] · Program · [Command] · [User] · Th · MEM · CPU% · [RX · TX] · DR · DW
+/// Bracketed columns are filtered by layout.includes_* predicates;
+/// RX/TX additionally drop when `show_net` is false (active net tier
+/// doesn't provide bandwidth — proc_inode shows only connections).
+fn build_cols(layout: TableLayout, show_net: bool) -> Vec<ColSpec> {
     let mut cols = Vec::with_capacity(11);
     if layout.includes_pid() {
         cols.push(ColSpec { title: "Pid", sort: Some(TableSort::Pid), width: 6, right_align: true });
@@ -535,15 +536,17 @@ fn build_cols(layout: TableLayout) -> Vec<ColSpec> {
     cols.push(ColSpec { title: "Th",   sort: Some(TableSort::Threads),   width: 3, right_align: true });
     cols.push(ColSpec { title: "MEM",  sort: Some(TableSort::Mem),       width: 6, right_align: true });
     cols.push(ColSpec { title: "CPU%", sort: Some(TableSort::Cpu),       width: 5, right_align: true });
-    cols.push(ColSpec { title: "RX/s", sort: Some(TableSort::NetRx),     width: 6, right_align: true });
-    cols.push(ColSpec { title: "TX/s", sort: Some(TableSort::NetTx),     width: 6, right_align: true });
+    if show_net {
+        cols.push(ColSpec { title: "RX/s", sort: Some(TableSort::NetRx), width: 6, right_align: true });
+        cols.push(ColSpec { title: "TX/s", sort: Some(TableSort::NetTx), width: 6, right_align: true });
+    }
     cols.push(ColSpec { title: "DR/s", sort: Some(TableSort::DiskRead),  width: 6, right_align: true });
     cols.push(ColSpec { title: "DW/s", sort: Some(TableSort::DiskWrite), width: 6, right_align: true });
     cols
 }
 
-fn build_row_cells(p: &ProcessInfo, layout: TableLayout) -> Vec<String> {
-    // Order MUST match build_cols(layout). Same conditional includes.
+fn build_row_cells(p: &ProcessInfo, layout: TableLayout, show_net: bool) -> Vec<String> {
+    // Order MUST match build_cols(layout, show_net). Same conditional includes.
     let mut out = Vec::with_capacity(11);
     if layout.includes_pid() {
         out.push(p.pid.to_string());
@@ -563,8 +566,10 @@ fn build_row_cells(p: &ProcessInfo, layout: TableLayout) -> Vec<String> {
     out.push(p.threads.to_string());
     out.push(format_bytes(p.mem_rss_bytes));
     out.push(format!("{:.1}", p.cpu_fraction * 100.0));
-    out.push(opt_rate(p.net_rx_bytes_per_sec));
-    out.push(opt_rate(p.net_tx_bytes_per_sec));
+    if show_net {
+        out.push(opt_rate(p.net_rx_bytes_per_sec));
+        out.push(opt_rate(p.net_tx_bytes_per_sec));
+    }
     out.push(opt_rate(p.disk_read_bytes_per_sec));
     out.push(opt_rate(p.disk_write_bytes_per_sec));
     out
@@ -808,8 +813,8 @@ mod tests {
     fn table_layout_drops_columns_per_mode() {
         let total = 120u16;
 
-        // Flat: all 11 columns. Program fixed 12, Command flex.
-        let flat = build_cols(TableLayout::Flat);
+        // Flat with net: all 11 columns. Program fixed 12, Command flex.
+        let flat = build_cols(TableLayout::Flat, true);
         assert_eq!(flat.len(), 11);
         let prog = flat.iter().position(|c| c.title == "Program").unwrap();
         let cmd = flat.iter().position(|c| c.title == "Command").unwrap();
@@ -819,7 +824,7 @@ mod tests {
         assert!(flat.iter().any(|c| c.title == "User"));
 
         // Grouped: Pid + Command + User dropped. 8 columns. Program flexes.
-        let grouped = build_cols(TableLayout::Grouped);
+        let grouped = build_cols(TableLayout::Grouped, true);
         assert_eq!(grouped.len(), 8);
         assert!(!grouped.iter().any(|c| c.title == "Pid"));
         assert!(!grouped.iter().any(|c| c.title == "Command"));
@@ -828,13 +833,26 @@ mod tests {
         assert!(col_actual_width(&grouped, total, prog) > 20, "Grouped Program should flex");
 
         // Tree: Command dropped. 10 columns. Program flexes.
-        let tree = build_cols(TableLayout::Tree);
+        let tree = build_cols(TableLayout::Tree, true);
         assert_eq!(tree.len(), 10);
         assert!(!tree.iter().any(|c| c.title == "Command"));
         assert!(tree.iter().any(|c| c.title == "Pid"));
         assert!(tree.iter().any(|c| c.title == "User"));
         let prog = tree.iter().position(|c| c.title == "Program").unwrap();
         assert!(col_actual_width(&tree, total, prog) > 20, "Tree Program should flex");
+    }
+
+    #[test]
+    fn show_net_false_drops_rx_and_tx_columns() {
+        // Flat with net=false drops 2 columns (RX/s + TX/s).
+        let flat_with = build_cols(TableLayout::Flat, true);
+        let flat_without = build_cols(TableLayout::Flat, false);
+        assert_eq!(flat_with.len() - flat_without.len(), 2);
+        assert!(!flat_without.iter().any(|c| c.title == "RX/s"));
+        assert!(!flat_without.iter().any(|c| c.title == "TX/s"));
+        // DR/s + DW/s still present — only the net-bandwidth columns drop.
+        assert!(flat_without.iter().any(|c| c.title == "DR/s"));
+        assert!(flat_without.iter().any(|c| c.title == "DW/s"));
     }
 
     #[test]
