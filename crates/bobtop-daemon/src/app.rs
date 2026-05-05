@@ -476,6 +476,20 @@ impl App {
         std::mem::replace(&mut self.ui.dirty, false)
     }
 
+    /// Atomically read-and-clear the force-full-repaint flag. When this
+    /// returns true the render loop calls `Terminal::clear()` before
+    /// `draw()` to wipe any stale cells (post-reconnect, post-resize).
+    pub fn take_force_full_repaint(&mut self) -> bool {
+        std::mem::replace(&mut self.ui.force_full_repaint, false)
+    }
+
+    /// External signal (e.g. periodic heartbeat backstop) to schedule a
+    /// full clear+repaint on the next frame.
+    pub fn request_full_repaint(&mut self) {
+        self.ui.force_full_repaint = true;
+        self.ui.dirty = true;
+    }
+
     /// Mark state as observably changed. Anything that mutates a field
     /// `ui::draw` reads should call this (apply_event, handle_input
     /// branches that change selection/sort/layout/tick).
@@ -926,6 +940,19 @@ impl App {
     }
 
     pub fn handle_input(&mut self, ev: Event) -> ControlFlow {
+        // Non-key events: terminal lifecycle. Resize and FocusGained both
+        // mean "the actual terminal cells may not match what ratatui's
+        // internal `prev` buffer thinks they are" — the latter happens
+        // after SSH/et reconnect and sleep/wake. Force a full repaint so
+        // the diff-based renderer doesn't leave stale chrome on screen.
+        match &ev {
+            Event::Resize(_, _) | Event::FocusGained => {
+                self.ui.dirty = true;
+                self.ui.force_full_repaint = true;
+                return ControlFlow::Continue;
+            }
+            _ => {}
+        }
         let Event::Key(k) = ev else { return ControlFlow::Continue };
         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
             return ControlFlow::Quit;

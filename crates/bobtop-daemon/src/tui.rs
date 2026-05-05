@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bobtop_core::{Box as BoxKind, DataBus};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -45,7 +45,11 @@ pub fn init_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let guard = RawModeGuard { armed: true };
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, Hide)?;
+    // EnableFocusChange so terminal multiplexers (tmux with focus-events
+    // on, kitty, alacritty, et) deliver Event::FocusGained on session
+    // resume — that's our cue to force-clear the screen and repaint
+    // because ratatui's diff buffer no longer matches reality.
+    execute!(stdout, EnterAlternateScreen, EnableFocusChange, Hide)?;
     install_panic_hook();
     let term = Terminal::new(CrosstermBackend::new(stdout))?;
     guard.disarm();
@@ -69,14 +73,14 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if self.armed {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
         }
     }
 }
 
 pub fn restore_terminal(term: &mut Term) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen, Show)?;
+    execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen, Show)?;
     term.show_cursor().ok();
     Ok(())
 }
@@ -86,7 +90,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        let _ = execute!(stdout, DisableFocusChange, LeaveAlternateScreen, Show);
         let _ = stdout.flush();
         original(info);
     }));
@@ -129,6 +133,13 @@ pub async fn run(
     let mut bus_rx = bus.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Periodic full-repaint backstop. Some terminals don't deliver
+    // FocusGained on session resume (GNU screen, some et configurations,
+    // tmux without focus-events on), so we proactively wipe-and-repaint
+    // every N heartbeats to recover from any silent cell desync.
+    // 30 × 1s = 30s — invisible at this cadence (one frame's flicker max).
+    let mut heartbeats_since_full_repaint: u32 = 0;
+    const FULL_REPAINT_EVERY_N_HEARTBEATS: u32 = 30;
 
     // Paint the initial frame so users see the layout immediately rather
     // than a blank alt-screen until the first sample arrives.
@@ -181,12 +192,27 @@ pub async fn run(
                 if g.boxes.is_enabled(BoxKind::Cpu) {
                     g.mark_dirty();
                 }
+                heartbeats_since_full_repaint += 1;
+                if heartbeats_since_full_repaint >= FULL_REPAINT_EVERY_N_HEARTBEATS {
+                    g.request_full_repaint();
+                    heartbeats_since_full_repaint = 0;
+                }
             }
         }
 
         // One redraw per wake, gated on dirty so idle ticks are free.
         let mut g = lock(&app);
+        let force_full = g.take_force_full_repaint();
         if g.take_dirty() {
+            // Resize / FocusGained / periodic-backstop branches set
+            // force_full_repaint. `Terminal::clear` wipes the screen AND
+            // invalidates ratatui's internal `prev` buffer so the next
+            // draw paints every cell (otherwise a SSH/et reconnect leaves
+            // stale chrome — actual cells got wiped during the pause but
+            // ratatui still thinks they match `prev` and only diffs).
+            if force_full {
+                term.clear()?;
+            }
             term.draw(|f| ui::draw(f, &g))?;
         }
     }

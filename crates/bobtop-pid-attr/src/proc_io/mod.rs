@@ -153,21 +153,34 @@ fn read_start_time(pid: u32) -> Option<u64> {
     it.nth(19)?.parse().ok()
 }
 
-/// Parse `/proc/[pid]/io` and extract `read_bytes` and `write_bytes` (the
-/// kernel's "actual block I/O" counters). Returns None if the file is
-/// missing (kernel thread, no CONFIG_TASK_IO_ACCOUNTING) or unreadable.
+/// Parse `/proc/[pid]/io` and extract `rchar` / `wchar` — the bytes the
+/// process *requested* via read/write syscalls. This includes cache hits
+/// and buffered I/O, which is what users mean by "what is process X doing
+/// on disk." It's what iotop's default column shows.
+///
+/// We deliberately do NOT use `read_bytes`/`write_bytes` here:
+/// those are physical block-I/O counters. They miss page-cache hits
+/// entirely and credit buffered writes to the writeback kthread (kworker)
+/// instead of the originator. Net result on a typical system: most
+/// processes show 0 DR/s and 0 DW/s, which is the bug the user reported.
+///
+/// Returns None if the file is missing (kernel thread, no
+/// `CONFIG_TASK_IO_ACCOUNTING`) or unreadable.
 fn read_io(pid: u32) -> Option<(u64, u64)> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
-    let mut read_bytes: Option<u64> = None;
-    let mut write_bytes: Option<u64> = None;
+    let mut rchar: Option<u64> = None;
+    let mut wchar: Option<u64> = None;
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("read_bytes:") {
-            read_bytes = rest.trim().parse().ok();
-        } else if let Some(rest) = line.strip_prefix("write_bytes:") {
-            write_bytes = rest.trim().parse().ok();
+        if let Some(rest) = line.strip_prefix("rchar:") {
+            rchar = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("wchar:") {
+            wchar = rest.trim().parse().ok();
         }
     }
-    Some((read_bytes.unwrap_or(0), write_bytes.unwrap_or(0)))
+    // Both required — if /proc/[pid]/io exists but doesn't have these
+    // fields (extremely unusual; would indicate a broken kernel patch),
+    // skip the pid rather than emit a 0-pinned sample.
+    Some((rchar?, wchar?))
 }
 
 #[cfg(test)]

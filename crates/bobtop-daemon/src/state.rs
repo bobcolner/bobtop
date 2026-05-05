@@ -45,6 +45,16 @@ pub struct UiState {
     /// after the render loop calls `terminal.draw()`. Lets us render
     /// on change instead of on a 60Hz heartbeat — see `tui::run`.
     pub dirty: bool,
+
+    /// Set when the next frame must wipe the terminal first via
+    /// `Terminal::clear()` rather than relying on ratatui's diff-based
+    /// rendering against the previous buffer. Triggered by Resize and
+    /// FocusGained events plus a periodic backstop, so SSH/et reconnects
+    /// and sleep/wake transitions don't leave stale chrome on screen
+    /// (the actual terminal got wiped while we were paused, but ratatui's
+    /// internal `prev` buffer still thinks it matches and only paints
+    /// diffs). Consumed by `take_force_full_repaint()`.
+    pub force_full_repaint: bool,
 }
 
 impl Default for UiState {
@@ -61,6 +71,9 @@ impl Default for UiState {
             options: None,
             last_options_msg: None,
             dirty: true,
+            // First frame already wipes-via-clear in `tui::run`'s startup
+            // paint, so we don't need to ask for an extra one here.
+            force_full_repaint: false,
         }
     }
 }
