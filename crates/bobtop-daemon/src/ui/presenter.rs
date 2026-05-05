@@ -132,10 +132,6 @@ pub(super) fn process_title(app: &App) -> String {
     )
 }
 
-pub(super) fn hidden_panel_title(name: &str) -> String {
-    format!("{name} — hidden")
-}
-
 pub(super) fn boxes_overlay_title() -> &'static str {
     " boxes — show/hide panels "
 }

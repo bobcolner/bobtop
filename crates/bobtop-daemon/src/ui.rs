@@ -1,7 +1,6 @@
 //! Pure frame composition. `draw` is the single render function called by
 //! the TUI loop on every frame.
 
-use bobtop_core::Box as BoxKind;
 use bobtop_tui::compute_layout;
 use ratatui::style::Style;
 use ratatui::Frame;
@@ -43,43 +42,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
             }
         }
     }
-    let layout = compute_layout(area, app.layout_preset);
+    // Layout is now computed from `app.boxes` directly — disabled panels
+    // get None (no rect) and their space is reabsorbed by neighbors. The
+    // old "render placeholder in the disabled slot" pattern is gone since
+    // there's no slot to render in. Users toggle via 1-4 (CPU/Mem/Net/Proc)
+    // or `B` (any of the 5 including disks).
+    let layout = compute_layout(area, &app.boxes);
 
-    // Each panel checks its bit in `app.boxes`; a hidden panel renders a
-    // small "[hidden — press B to show]" placeholder so the layout shape
-    // stays stable and the user has a hint about how to reveal it. The
-    // collector for that box is also paused via A3, so the hidden state
-    // really is free.
-    if app.boxes.is_enabled(BoxKind::Cpu) {
-        cpu::draw(frame, layout.cpu, app);
-    } else {
-        overlays::draw_hidden_panel(frame, layout.cpu, app, "cpu");
+    if let Some(cpu_area) = layout.cpu {
+        cpu::draw(frame, cpu_area, app);
     }
     if let Some(mem_area) = layout.memory {
-        if app.boxes.is_enabled(BoxKind::Memory) {
-            memory::draw(frame, mem_area, app);
-        } else {
-            overlays::draw_hidden_panel(frame, mem_area, app, "mem");
-        }
+        memory::draw(frame, mem_area, app);
     }
     if let Some(disks_area) = layout.disks {
-        if app.boxes.is_enabled(BoxKind::Disk) {
-            disk::draw(frame, disks_area, app);
-        } else {
-            overlays::draw_hidden_panel(frame, disks_area, app, "disks");
-        }
+        disk::draw(frame, disks_area, app);
     }
     if let Some(net_area) = layout.network {
-        if app.boxes.is_enabled(BoxKind::Network) {
-            network::draw(frame, net_area, app);
-        } else {
-            overlays::draw_hidden_panel(frame, net_area, app, "net");
-        }
+        network::draw(frame, net_area, app);
     }
-    if app.boxes.is_enabled(BoxKind::Process) {
-        processes::draw(frame, layout.processes, app);
-    } else {
-        overlays::draw_hidden_panel(frame, layout.processes, app, "proc");
+    if let Some(proc_area) = layout.processes {
+        processes::draw(frame, proc_area, app);
     }
 
     if app.ui.show_boxes_overlay {

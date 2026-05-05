@@ -12,13 +12,6 @@ use crate::app::App;
 
 use super::presenter;
 
-pub(super) fn draw_hidden_panel(frame: &mut Frame, area: Rect, app: &App, name: &str) {
-    let panel = boxed_panel(app.theme.div_line, app.theme.inactive_fg, app.corner_style)
-        .with_title(presenter::hidden_panel_title(name))
-        .with_controls("press B to toggle");
-    frame.render_widget(&panel, area);
-}
-
 pub(super) fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let want_w: u16 = 38;
     let want_h: u16 = (BoxKind::ALL.len() as u16) + 5;
