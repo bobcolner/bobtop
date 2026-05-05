@@ -23,7 +23,7 @@ pub use theme::{
 };
 pub use text::{
     bool_label, display_width, format_bytes, format_bytes_compact, format_rate, truncate_chars,
-    write_str_at,
+    write_str_at, write_str_clipped,
 };
 pub use widgets::{
     ActionBar, BrailleGraph, BoxedPanel, CornerStyle, DataTable, DualMode, GraphStyle,

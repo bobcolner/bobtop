@@ -163,12 +163,17 @@ impl OptionsEditor {
     }
 
     pub fn general_form(&self) -> SettingsForm {
-        Self::section_form(
-            &self.form,
-            0,
-            Self::GENERAL_FIELD_COUNT,
-            self.form.cursor.min(Self::GENERAL_FIELD_COUNT.saturating_sub(1)),
-        )
+        // usize::MAX means "no row highlighted" — render() compares `i ==
+        // cursor` and that's never true for any valid index. Without this,
+        // pressing Down past the last general field would still leave the
+        // last general row highlighted (since cursor.min(3) = 3) even
+        // though the actual cursor moved to the behavior section.
+        let cursor = if self.form.cursor < Self::GENERAL_FIELD_COUNT {
+            self.form.cursor
+        } else {
+            usize::MAX
+        };
+        Self::section_form(&self.form, 0, Self::GENERAL_FIELD_COUNT, cursor)
     }
 
     pub fn behavior_form(&self) -> SettingsForm {

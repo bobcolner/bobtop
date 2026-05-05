@@ -3,7 +3,7 @@ use crate::options_editor::OptionsEditor;
 use bobtop_tui::widgets::{
     panel as boxed_panel, ActionBar, ModalShell, SectionHeader, ToggleRow,
 };
-use bobtop_tui::{truncate_chars, write_str_at};
+use bobtop_tui::write_str_clipped;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::Frame;
@@ -27,11 +27,12 @@ pub(super) fn draw_boxes_overlay(frame: &mut Frame, area: Rect, app: &App) {
     };
     let buf = frame.buffer_mut();
 
-    write_str_at(
+    write_str_clipped(
         buf,
         body.x + 2,
         body.y + 1,
         "(panel changes are live — collectors pause too)",
+        body.width.saturating_sub(4),
         Style::default().bg(bg).fg(app.theme.inactive_fg),
     );
 
@@ -80,11 +81,12 @@ pub(super) fn draw_options_overlay(frame: &mut Frame, area: Rect, app: &App) {
     };
     let buf = frame.buffer_mut();
 
-    write_str_at(
+    write_str_clipped(
         buf,
         body.x + 2,
         body.y + 1,
         "(saved to ~/.config/bobtop/bobtop.toml on Enter)",
+        body.width.saturating_sub(4),
         Style::default().bg(bg).fg(app.theme.inactive_fg),
     );
     let footer = ActionBar::new(vec![
@@ -149,25 +151,24 @@ pub(super) fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
     let mut row = body.y;
     let max_row = body.y + body.height;
     let write_section = |buf: &mut ratatui::buffer::Buffer, row: u16, name: &str| {
-        write_str_at(
+        write_str_clipped(
             buf,
             body.x + 1,
             row,
             &format!("── {name} "),
+            body.width.saturating_sub(2),
             Style::default().bg(bg).fg(app.theme.hi_fg),
         );
     };
     let write_line = |buf: &mut ratatui::buffer::Buffer, row: u16, s: &str| {
-        let s = if s.chars().count() > body.width as usize - 4 {
-            format!("{}…", truncate_chars(s, body.width as usize - 5))
-        } else {
-            s.to_string()
-        };
-        write_str_at(
+        // write_str_clipped trims at modal width; no need to pre-truncate.
+        // Long fields just elide their tail visually.
+        write_str_clipped(
             buf,
             body.x + 2,
             row,
-            &s,
+            s,
+            body.width.saturating_sub(4),
             Style::default().bg(bg).fg(app.theme.main_fg),
         );
     };
@@ -234,8 +235,9 @@ pub(super) fn draw_kill_dialog(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let buf = frame.buffer_mut();
-    write_str_at(buf, body.x + 1, body.y + 1, &line1, Style::default().bg(bg).fg(app.theme.hi_fg));
-    write_str_at(buf, body.x + 1, body.y + 3, line2, Style::default().bg(bg).fg(app.theme.inactive_fg));
+    let inner_w = body.width.saturating_sub(2);
+    write_str_clipped(buf, body.x + 1, body.y + 1, &line1, inner_w, Style::default().bg(bg).fg(app.theme.hi_fg));
+    write_str_clipped(buf, body.x + 1, body.y + 3, line2, inner_w, Style::default().bg(bg).fg(app.theme.inactive_fg));
     if body.height > 4 {
         let footer = ActionBar::new(vec![("Enter / y".into(), "confirm".into()), ("Esc / n".into(), "cancel".into())])
             .with_colors(app.theme.div_line, app.theme.hi_fg, app.theme.main_fg, app.theme.selected_bg);
@@ -266,13 +268,27 @@ pub const HELP_LINES: &[(&str, &str)] = &[
 ];
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let inner_w: u16 = HELP_LINES
+    // Compute the natural width (longest "key  desc" line + chrome) but
+    // clamp to the viewport so the modal always fits. Description text
+    // gets truncated when it would overflow the modal's body width —
+    // better than silently disappearing on smaller terminals.
+    let key_w = HELP_LINES
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(8) as u16;
+    let natural_w: u16 = HELP_LINES
         .iter()
         .map(|(k, d)| (k.chars().count() + d.chars().count() + 4) as u16)
         .max()
-        .unwrap_or(40);
-    let want_w = inner_w + 4;
-    let want_h = (HELP_LINES.len() as u16) + 4;
+        .unwrap_or(40)
+        + 4;
+    // Reserve at least 4 cols for the modal frame; leave a 2-col margin
+    // on each side of the screen.
+    let max_w = area.width.saturating_sub(4).max(20);
+    let want_w = natural_w.min(max_w);
+    let max_h = area.height.saturating_sub(2).max(8);
+    let want_h = ((HELP_LINES.len() as u16) + 4).min(max_h);
     let panel = boxed_panel(app.theme.title, app.theme.title, app.corner_style)
         .flat()
         .with_title(presenter::help_title());
@@ -283,28 +299,31 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let buf = frame.buffer_mut();
-    let key_w = HELP_LINES
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(8) as u16;
-    for (i, (key, desc)) in HELP_LINES.iter().enumerate() {
+    // Reserve 2 cols left margin + key column + 2 cols gap; everything
+    // else is the desc area we clip into.
+    let desc_x = body.x + 2 + key_w + 2;
+    let desc_w = body
+        .x
+        .saturating_add(body.width)
+        .saturating_sub(desc_x)
+        .saturating_sub(2);
+    let max_lines = body.height.saturating_sub(3) as usize; // skip top, bottom border, footer row
+    for (i, (key, desc)) in HELP_LINES.iter().take(max_lines).enumerate() {
         let row_y = body.y + 1 + i as u16;
-        if row_y >= body.y + body.height {
-            break;
-        }
-        write_str_at(
+        write_str_clipped(
             buf,
             body.x + 2,
             row_y,
             key,
+            key_w,
             Style::default().bg(modal_bg).fg(app.theme.hi_fg),
         );
-        write_str_at(
+        write_str_clipped(
             buf,
-            body.x + 2 + key_w + 2,
+            desc_x,
             row_y,
             desc,
+            desc_w,
             Style::default().bg(modal_bg).fg(app.theme.main_fg),
         );
     }

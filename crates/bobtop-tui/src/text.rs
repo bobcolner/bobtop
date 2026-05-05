@@ -18,18 +18,31 @@ pub fn display_width(s: &str) -> usize {
 }
 
 pub fn write_str_at(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) {
+    write_str_clipped(buf, x, y, s, buf.area.right().saturating_sub(x), style);
+}
+
+/// Like [`write_str_at`] but clips at `x + max_cells` (in addition to the
+/// buffer right edge). Use this inside modal bodies and other bounded
+/// regions so long text doesn't overpaint the panel border or content
+/// outside the passed area. `max_cells` counts terminal cells, not chars.
+pub fn write_str_clipped(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    s: &str,
+    max_cells: u16,
+    style: Style,
+) {
     let mut col = x;
-    let right = buf.area.right();
+    let right = x.saturating_add(max_cells).min(buf.area.right());
     for ch in s.chars() {
-        if col >= right {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
+        if col.saturating_add(cw) > right {
             break;
         }
         let cell = &mut buf[(col, y)];
         cell.set_char(ch);
         cell.set_style(style);
-        // Advance by the glyph's display width so wide chars (CJK, emoji)
-        // claim two cells and the next char starts past them.
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
         col = col.saturating_add(cw);
     }
 }
