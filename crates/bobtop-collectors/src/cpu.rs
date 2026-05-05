@@ -133,12 +133,13 @@ fn build_core_samples(
         .iter()
         .enumerate()
         .map(|(i, &times)| {
-            let utilization = match prev {
-                Some(p) if p.cores.len() == cur.cores.len() => {
-                    utilization_fraction(p.cores[i], times)
-                }
-                _ => 0.0,
-            };
+            // Match by index up to min(prev, cur). The previous strict
+            // equality test made every core's fraction 0.0 for one tick
+            // after CPU hotplug or a kexec where the core count changes.
+            let utilization = prev
+                .and_then(|p| p.cores.get(i))
+                .map(|prev_times| utilization_fraction(*prev_times, times))
+                .unwrap_or(0.0);
             CoreSample {
                 id: i as u32,
                 utilization,
@@ -235,7 +236,7 @@ fn parse_proc_stat(text: &str) -> Option<Snapshot> {
     let mut cores: Vec<CpuTimes> = Vec::new();
     for line in text.lines() {
         let mut it = line.split_ascii_whitespace();
-        let label = it.next()?;
+        let Some(label) = it.next() else { continue };
         if !label.starts_with("cpu") {
             // /proc/stat continues with `intr`, `ctxt`, etc. — done with cpu rows.
             if aggregate.is_some() {
@@ -243,7 +244,16 @@ fn parse_proc_stat(text: &str) -> Option<Snapshot> {
             }
             continue;
         }
-        let times = parse_cpu_times(it)?;
+        // A malformed per-core line (rare — kernel format change in field
+        // count) used to abort the whole parse and freeze CPU forever.
+        // The aggregate `cpu` line is mandatory; per-core lines are skipped
+        // on parse failure so the aggregate still populates.
+        let Some(times) = parse_cpu_times(it) else {
+            if label == "cpu" {
+                return None;
+            }
+            continue;
+        };
         if label == "cpu" {
             aggregate = Some(times);
         } else {
@@ -329,6 +339,51 @@ mod tests {
         assert_eq!(snap.aggregate.user, 100);
         assert_eq!(snap.aggregate.idle, 800);
         assert_eq!(snap.cores[1].system, 25);
+    }
+
+    #[test]
+    fn malformed_per_core_line_is_skipped_not_fatal() {
+        // cpu1 has only 3 fields — too few for parse_cpu_times. Should not
+        // abort the snapshot; aggregate + cpu0 must still come through so
+        // CPU keeps reporting on systems with quirky kernel-format changes.
+        let sample = "cpu  100 5 50 800 10 0 5 0\ncpu0 50 2 25 400 5 0 2 0\ncpu1 50 3 25\nintr 1234\n";
+        let snap = parse_proc_stat(sample).expect("parse");
+        assert_eq!(snap.aggregate.user, 100);
+        assert_eq!(snap.cores.len(), 1, "malformed cpu1 must be skipped");
+        assert_eq!(snap.cores[0].user, 50);
+    }
+
+    #[test]
+    fn malformed_aggregate_line_returns_none() {
+        let sample = "cpu  100 5\ncpu0 50 2 25 400 5 0 2 0\n";
+        assert!(parse_proc_stat(sample).is_none());
+    }
+
+    #[test]
+    fn build_core_samples_handles_core_count_change() {
+        // Previous tick had 4 cores; this tick has 2 (CPU hotplug down).
+        // Old code returned utilization=0 for every core in this case.
+        // New code matches by index up to min(prev, cur).
+        let prev = Snapshot {
+            aggregate: CpuTimes::default(),
+            cores: vec![CpuTimes::default(); 4],
+        };
+        let cur = Snapshot {
+            aggregate: CpuTimes {
+                user: 30,
+                idle: 70,
+                ..Default::default()
+            },
+            cores: vec![
+                CpuTimes { user: 30, idle: 70, ..Default::default() },
+                CpuTimes { user: 30, idle: 70, ..Default::default() },
+            ],
+        };
+        let samples = build_core_samples(&cur, Some(&prev), &[]);
+        assert_eq!(samples.len(), 2);
+        for s in &samples {
+            assert!((s.utilization - 0.30).abs() < 1e-5, "got {}", s.utilization);
+        }
     }
 
     #[test]

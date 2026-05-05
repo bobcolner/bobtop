@@ -35,14 +35,6 @@ pub struct Sparkline<'a> {
     style: GraphStyle,
     show_fill: bool,
     dim_fill_factor: f32,
-    /// Auto-normalize values against their own peak before render. Default
-    /// true — without this a typical "1% CPU history" series rounds every
-    /// dot down to zero and the spark is invisible. With it, the busiest
-    /// recent sample fills the row and quieter samples scale proportionally.
-    /// `auto_scale_floor` is the minimum peak treated as "full" so tiny
-    /// idle noise doesn't get blown up to fill the chart.
-    auto_scale: bool,
-    auto_scale_floor: f64,
 }
 
 impl<'a> Sparkline<'a> {
@@ -53,27 +45,7 @@ impl<'a> Sparkline<'a> {
             style: GraphStyle::Braille,
             show_fill: true,
             dim_fill_factor: DEFAULT_DIM_FILL,
-            auto_scale: true,
-            // 5% — busy enough that variation is interesting, low enough that
-            // a "barely doing anything" series still shows movement.
-            auto_scale_floor: 0.05,
         }
-    }
-
-    /// Disable auto-normalization. Use when the caller has already scaled
-    /// values into 0..=1 against a meaningful absolute scale and wants
-    /// idle periods to read as flat-empty rather than auto-amplified noise.
-    pub fn without_auto_scale(mut self) -> Self {
-        self.auto_scale = false;
-        self
-    }
-
-    /// Override the auto-scale floor (peak below this clamps to this).
-    /// Default 0.05. Higher = quieter periods stay small. Lower = even
-    /// faint signals fill the chart.
-    pub fn with_auto_scale_floor(mut self, floor: f64) -> Self {
-        self.auto_scale_floor = floor.max(0.0);
-        self
     }
 
     /// TTY fallback (`▁▂▃▄▅▆▇█`). Use when braille glyphs aren't reliably

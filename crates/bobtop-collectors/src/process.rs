@@ -4,6 +4,7 @@
 //! on every supported platform. Per-process network attribution is *not*
 //! handled here — that comes from `bobtop-net` and is joined in the daemon.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -17,10 +18,20 @@ struct DiskRateState {
     last_at: Instant,
 }
 
+/// Cached /proc reads that almost never change after a process starts.
+/// Keyed by pid, validated by `start_time` — if a pid is reused (start_time
+/// differs), we re-read instead of inheriting the dead process's strings.
+#[derive(Debug, Clone)]
+struct StaticProcInfo {
+    start_time: u64,
+    cmdline: Option<String>,
+    cgroup: Option<String>,
+}
+
 use async_trait::async_trait;
 use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
 use bobtop_core::{Collector, Result};
-use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, Users};
+use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind, Users};
 
 const DEFAULT_INTERVAL_MS: u64 = 2000;
 
@@ -33,7 +44,12 @@ pub struct ProcessCollector {
     users: Mutex<Users>,
     cpu_count: usize,
     /// Previous absolute disk totals per pid for rate computation.
-    last_disk: Mutex<std::collections::HashMap<u32, DiskRateState>>,
+    last_disk: Mutex<HashMap<u32, DiskRateState>>,
+    /// Cache of /proc/[pid]/cmdline and /proc/[pid]/cgroup, validated by
+    /// the process's `start_time` so PID reuse invalidates automatically.
+    /// Avoids ~2 syscalls × N processes per tick — typically the heaviest
+    /// per-tick cost after sysinfo's own /proc walk.
+    static_cache: Mutex<HashMap<u32, StaticProcInfo>>,
 }
 
 impl std::fmt::Debug for ProcessCollector {
@@ -59,7 +75,8 @@ impl ProcessCollector {
             sys: Mutex::new(sys),
             users: Mutex::new(Users::new_with_refreshed_list()),
             cpu_count,
-            last_disk: Mutex::new(std::collections::HashMap::new()),
+            last_disk: Mutex::new(HashMap::new()),
+            static_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -80,15 +97,20 @@ impl Collector for ProcessCollector {
             .sys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // `refresh_processes` uses the *default* ProcessRefreshKind, which
-        // omits `user`. Without an explicit `with_user`, `p.user_id()`
-        // returns None for every process and the User column renders blank.
-        // Refresh everything — the per-tick cost is dominated by the syscalls
-        // we'd already pay for cpu/mem anyway.
+        // Scope the refresh to fields we actually render. `everything()`
+        // additionally pulls cwd/root/environ/exe — none of which we read,
+        // each costing a /proc syscall per pid per tick. `OnlyIfNotSet` for
+        // user/cmd means sysinfo populates them on first sight and reuses
+        // the cached value afterward (uid/argv don't change post-exec).
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::everything(),
+            ProcessRefreshKind::new()
+                .with_cpu()
+                .with_memory()
+                .with_disk_usage()
+                .with_user(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
         );
 
         let cpu_count = self.cpu_count.max(1);
@@ -97,92 +119,126 @@ impl Collector for ProcessCollector {
             .last_disk
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        let mut static_cache = self
+            .static_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let users = self
             .users
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let processes: Vec<_> = sys
-            .processes()
-            .iter()
-            .map(|(pid, p)| {
-                let pid_u32 = pid.as_u32();
-                // sysinfo's `cmd()` often returns just argv[0] (the
-                // executable name) — same string the Program column
-                // already shows. Read /proc/[pid]/cmdline directly so
-                // the full nul-separated argv comes through; users
-                // expect the Command column to show actual flags/paths.
-                let cmdline = read_full_cmdline(pid_u32).unwrap_or_else(|| {
-                    p.cmd()
-                        .iter()
-                        .map(|s| s.to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                });
-                let usage = p.disk_usage();
-                // Compute rate as Δ(absolute total) / Δt against the per-pid
-                // previous state. Falls back to None on the first sample.
-                let (dr, dw) = match last_disk.get(&pid_u32) {
-                    Some(prev) => {
-                        let dt = now.duration_since(prev.last_at).as_secs_f64().max(0.001);
-                        let r = usage
-                            .total_read_bytes
-                            .saturating_sub(prev.last_total_read) as f64
-                            / dt;
-                        let w = usage
-                            .total_written_bytes
-                            .saturating_sub(prev.last_total_written)
-                            as f64
-                            / dt;
-                        (Some(r), Some(w))
-                    }
-                    None => (None, None),
-                };
-                ProcessInfo {
-                    pid: pid_u32,
-                    parent_pid: p.parent().map(|pp| pp.as_u32()),
-                    name: p.name().to_string_lossy().into_owned(),
-                    cmdline,
-                    user: p
-                        .user_id()
-                        .and_then(|uid| {
-                            users
-                                .get_user_by_id(uid)
-                                .map(|u| u.name().to_string())
-                                // If the UID isn't in the user registry
-                                // (rare — container with stale passwd),
-                                // fall back to the numeric UID rather
-                                // than empty string.
-                                .or_else(|| Some(uid.to_string()))
-                        })
-                        .unwrap_or_default(),
-                    state: map_status(p.status()),
-                    cpu_fraction: p.cpu_usage() / 100.0,
-                    mem_rss_bytes: p.memory(),
-                    mem_vsz_bytes: p.virtual_memory(),
-                    threads: thread_count(p),
-                    net_rx_bytes_per_sec: None,
-                    net_tx_bytes_per_sec: None,
-                    disk_read_bytes_per_sec: dr,
-                    disk_write_bytes_per_sec: dw,
-                    cgroup: read_cgroup(pid_u32),
-                }
-            })
-            .collect();
+        let proc_iter = sys.processes();
+        // Build next-tick state in lockstep with the output rows so we walk
+        // sys.processes() exactly once. Old (pid, _) entries that aren't seen
+        // this tick fall out naturally because we replace the map below.
+        let mut next_disk: HashMap<u32, DiskRateState> = HashMap::with_capacity(proc_iter.len());
+        let mut next_static: HashMap<u32, StaticProcInfo> =
+            HashMap::with_capacity(proc_iter.len());
+        let mut processes: Vec<ProcessInfo> = Vec::with_capacity(proc_iter.len());
 
-        // Rebuild the per-pid disk-rate state from this sample's totals.
-        last_disk.clear();
-        for (pid, p) in sys.processes().iter() {
+        for (pid, p) in proc_iter.iter() {
+            let pid_u32 = pid.as_u32();
+            let start_time = p.start_time();
+
+            // Cache cmdline + cgroup keyed by (pid, start_time). Both come
+            // from /proc files that the kernel only updates at exec/cgroup
+            // change, so re-reading them every tick is pure waste. PID reuse
+            // bumps start_time, invalidating the entry. We `remove` (rather
+            // than `get().cloned()`) to transfer ownership of the cached
+            // strings into the next-tick map without an extra clone.
+            let static_info = match static_cache.remove(&pid_u32) {
+                Some(c) if c.start_time == start_time => c,
+                _ => {
+                    // sysinfo's `cmd()` often returns just argv[0] (the
+                    // executable name) — same string the Program column
+                    // already shows. Read /proc/[pid]/cmdline directly so
+                    // the full nul-separated argv comes through.
+                    let cmdline = read_full_cmdline(pid_u32).or_else(|| {
+                        let joined = p
+                            .cmd()
+                            .iter()
+                            .map(|s| s.to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if joined.is_empty() {
+                            None
+                        } else {
+                            Some(joined)
+                        }
+                    });
+                    StaticProcInfo {
+                        start_time,
+                        cmdline,
+                        cgroup: read_cgroup(pid_u32),
+                    }
+                }
+            };
+
             let usage = p.disk_usage();
-            last_disk.insert(
-                pid.as_u32(),
+            // Compute rate as Δ(absolute total) / Δt against the per-pid
+            // previous state. Falls back to None on the first sample.
+            let (dr, dw) = match last_disk.get(&pid_u32) {
+                Some(prev) => {
+                    let dt = now.duration_since(prev.last_at).as_secs_f64().max(0.001);
+                    let r = usage
+                        .total_read_bytes
+                        .saturating_sub(prev.last_total_read) as f64
+                        / dt;
+                    let w = usage
+                        .total_written_bytes
+                        .saturating_sub(prev.last_total_written)
+                        as f64
+                        / dt;
+                    (Some(r), Some(w))
+                }
+                None => (None, None),
+            };
+
+            next_disk.insert(
+                pid_u32,
                 DiskRateState {
                     last_total_read: usage.total_read_bytes,
                     last_total_written: usage.total_written_bytes,
                     last_at: now,
                 },
             );
+
+            processes.push(ProcessInfo {
+                pid: pid_u32,
+                parent_pid: p.parent().map(|pp| pp.as_u32()),
+                name: p.name().to_string_lossy().into_owned(),
+                cmdline: static_info.cmdline.clone().unwrap_or_default(),
+                user: p
+                    .user_id()
+                    .and_then(|uid| {
+                        users
+                            .get_user_by_id(uid)
+                            .map(|u| u.name().to_string())
+                            // If the UID isn't in the user registry
+                            // (rare — container with stale passwd),
+                            // fall back to the numeric UID rather
+                            // than empty string.
+                            .or_else(|| Some(uid.to_string()))
+                    })
+                    .unwrap_or_default(),
+                state: map_status(p.status()),
+                cpu_fraction: p.cpu_usage() / 100.0,
+                mem_rss_bytes: p.memory(),
+                mem_vsz_bytes: p.virtual_memory(),
+                threads: thread_count(p),
+                net_rx_bytes_per_sec: None,
+                net_tx_bytes_per_sec: None,
+                disk_read_bytes_per_sec: dr,
+                disk_write_bytes_per_sec: dw,
+                cgroup: static_info.cgroup.clone(),
+            });
+
+            next_static.insert(pid_u32, static_info);
         }
+
+        *last_disk = next_disk;
+        *static_cache = next_static;
 
         let _ = cpu_count; // kept for future per-core breakdowns
 
@@ -301,5 +357,36 @@ mod tests {
         // Spot-check fields are populated.
         let any_named = s.processes.iter().any(|p| !p.name.is_empty());
         assert!(any_named);
+    }
+
+    #[tokio::test]
+    async fn second_collect_reuses_static_cache_for_live_processes() {
+        // Two back-to-back collects should leave each live pid in
+        // static_cache exactly once, with the same start_time. This
+        // doesn't directly assert syscall count but verifies the cache
+        // is keyed/replaced correctly so PID reuse will invalidate.
+        let c = ProcessCollector::new();
+        let _ = c.collect().await.expect("first");
+        let snap1: HashMap<u32, u64> = c
+            .static_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, e)| (*p, e.start_time))
+            .collect();
+        let _ = c.collect().await.expect("second");
+        let snap2: HashMap<u32, u64> = c
+            .static_cache
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, e)| (*p, e.start_time))
+            .collect();
+        // Any pid present in both snapshots must have the same start_time.
+        for (pid, st1) in &snap1 {
+            if let Some(st2) = snap2.get(pid) {
+                assert_eq!(st1, st2, "start_time changed for live pid {pid}");
+            }
+        }
     }
 }

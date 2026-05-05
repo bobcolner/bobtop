@@ -43,6 +43,25 @@ pub fn format_bytes(b: u64) -> String {
     }
 }
 
+/// Compact byte formatter for narrow columns (≤ 6 chars): "256M", "1.5G", "1.0T".
+pub fn format_bytes_compact(b: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    if b >= TIB {
+        format!("{:.1}T", b as f64 / TIB as f64)
+    } else if b >= GIB {
+        format!("{:.1}G", b as f64 / GIB as f64)
+    } else if b >= MIB {
+        format!("{:.0}M", b as f64 / MIB as f64)
+    } else if b >= KIB {
+        format!("{:.0}K", b as f64 / KIB as f64)
+    } else {
+        format!("{}B", b)
+    }
+}
+
 pub fn format_rate(bps: f64) -> String {
     if bps >= 1024.0 * 1024.0 {
         format!("{:.1}M", bps / (1024.0 * 1024.0))

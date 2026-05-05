@@ -148,14 +148,27 @@ fn parse_proc_net_dev(text: &str) -> HashMap<String, RawCounters> {
         if name.is_empty() {
             continue;
         }
-        let fields: Vec<u64> = counters_part
-            .split_ascii_whitespace()
-            .filter_map(|s| s.parse().ok())
-            .collect();
         // Field layout (16 columns):
-        //   rx: bytes, packets, errs, drop, fifo, frame, compressed, multicast
-        //   tx: bytes, packets, errs, drop, fifo, colls, carrier, compressed
-        if fields.len() < 16 {
+        //   rx: bytes(0), packets(1), errs(2), drop, fifo, frame, compressed, multicast
+        //   tx: bytes(8), packets(9), errs(10), drop, fifo, colls, carrier, compressed
+        // Walk the iterator once into a fixed-size array — avoids the per-line
+        // Vec<u64> alloc the previous version did.
+        let mut fields = [0u64; 16];
+        let mut count = 0usize;
+        let mut malformed = false;
+        for (i, tok) in counters_part.split_ascii_whitespace().take(16).enumerate() {
+            match tok.parse() {
+                Ok(v) => {
+                    fields[i] = v;
+                    count = i + 1;
+                }
+                Err(_) => {
+                    malformed = true;
+                    break;
+                }
+            }
+        }
+        if malformed || count < 16 {
             continue;
         }
         out.insert(

@@ -21,7 +21,7 @@ pub use theme::{
     builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, Theme,
     DEFAULT_THEME_NAME,
 };
-pub use text::{bool_label, format_bytes, format_rate, truncate_chars, write_str_at};
+pub use text::{bool_label, format_bytes, format_bytes_compact, format_rate, truncate_chars, write_str_at};
 pub use widgets::{
     ActionBar, BrailleGraph, BoxedPanel, CornerStyle, DataTable, DualMode, GraphStyle,
     LegendStyle, Meter, MiniMeter, ModalShell, SectionHeader, SelectableList, SettingRow,

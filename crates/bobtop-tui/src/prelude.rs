@@ -5,7 +5,9 @@
 
 pub use crate::color::{dim, lerp_color, parse_btop_color, Gradient};
 pub use crate::layout::{compute as compute_layout, LayoutAreas, LayoutPreset};
-pub use crate::text::{bool_label, format_bytes, format_rate, truncate_chars, write_str_at};
+pub use crate::text::{
+    bool_label, format_bytes, format_bytes_compact, format_rate, truncate_chars, write_str_at,
+};
 pub use crate::theme::{
     builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, Theme,
     DEFAULT_THEME_NAME,

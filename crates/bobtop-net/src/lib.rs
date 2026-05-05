@@ -29,6 +29,9 @@ pub mod unavailable;
 #[cfg(target_os = "linux")]
 pub mod proc_inode;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod proc_walk;
+
 #[cfg(target_os = "macos")]
 pub mod macos;
 

@@ -37,11 +37,41 @@ pub type Term = Terminal<CrosstermBackend<Stdout>>;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 
 pub fn init_terminal() -> io::Result<Term> {
+    // Enable raw mode under a guard. If anything between here and the final
+    // `Terminal::new` returns Err, the guard's Drop disables raw mode so the
+    // user's terminal isn't left mangled (would otherwise need `reset` to
+    // recover). Once we successfully build the Terminal, we `disarm` the
+    // guard — restore_terminal() owns the cleanup from then on.
     enable_raw_mode()?;
+    let guard = RawModeGuard { armed: true };
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Hide)?;
     install_panic_hook();
-    Terminal::new(CrosstermBackend::new(stdout))
+    let term = Terminal::new(CrosstermBackend::new(stdout))?;
+    guard.disarm();
+    Ok(term)
+}
+
+/// Drop-guard that disables raw mode unless `disarm()` was called. Used by
+/// `init_terminal` to recover from partial-init failures without leaving
+/// the terminal in raw mode.
+struct RawModeGuard {
+    armed: bool,
+}
+
+impl RawModeGuard {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
+    }
 }
 
 pub fn restore_terminal(term: &mut Term) -> io::Result<()> {

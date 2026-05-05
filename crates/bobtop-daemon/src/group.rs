@@ -284,11 +284,16 @@ fn build_tree(
     let cmp_pid = |a: &u32, b: &u32| {
         let pa = by_pid.get(a).copied();
         let pb = by_pid.get(b).copied();
-        let ord = match (pa, pb) {
+        let primary = match (pa, pb) {
             (Some(x), Some(y)) => cmp_processes(x, y, sort),
-            _ => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
         };
-        if descending { ord.reverse() } else { ord }
+        // Match `sort_processes` in app.rs: reverse the primary key for
+        // descending mode but keep the PID tiebreaker ascending so equal
+        // siblings have a deterministic order across samples (HashMap
+        // iteration order is otherwise unstable).
+        let primary = if descending { primary.reverse() } else { primary };
+        primary.then_with(|| a.cmp(b))
     };
     for v in children_of.values_mut() {
         v.sort_by(cmp_pid);
@@ -591,5 +596,36 @@ mod tests {
             })
             .collect();
         assert_eq!(pids, vec![1, 200, 300, 100], "siblings should be heaviest-mem first");
+    }
+
+    /// Tree-mode tiebreaker: equal-keyed siblings must sort by ascending PID
+    /// regardless of descending direction, so HashMap iteration order in
+    /// the snapshot can't shuffle equal-CPU rows between samples.
+    #[test]
+    fn tree_breaks_equal_key_ties_by_ascending_pid() {
+        // All siblings have identical CPU and mem; only PID differs.
+        let ps = vec![
+            p(1, None, "init", 0.0, 0, None),
+            p(300, Some(1), "c", 0.0, 0, None),
+            p(100, Some(1), "a", 0.0, 0, None),
+            p(200, Some(1), "b", 0.0, 0, None),
+        ];
+
+        for desc in [true, false] {
+            let rows =
+                build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, desc);
+            let pids: Vec<u32> = rows
+                .iter()
+                .filter_map(|r| match r {
+                    TableRow::Item(p) => Some(p.info.pid),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                pids,
+                vec![1, 100, 200, 300],
+                "ties should ascend by pid; desc={desc}"
+            );
+        }
     }
 }

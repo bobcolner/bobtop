@@ -216,25 +216,41 @@ fn read_raw() -> Result<HashMap<String, RawDisk>> {
 fn parse_diskstats(text: &str) -> HashMap<String, RawDisk> {
     let mut out = HashMap::new();
     for line in text.lines() {
-        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-        if fields.len() < 14 {
-            continue;
-        }
         // 0:major 1:minor 2:name 3:reads 4:rmerged 5:sectors_read 6:ms_reading
         // 7:writes 8:wmerged 9:sectors_written 10:ms_writing 11:in_flight 12:ms_io
-        let name = fields[2].to_string();
-        if !is_top_level_block_device(&name) {
+        // Walk tokens once. Skip the line if any required field is missing or
+        // unparseable. Avoids the per-line Vec<&str> alloc the old code did.
+        let mut it = line.split_ascii_whitespace();
+        // Skip major + minor (positions 0, 1).
+        if it.by_ref().take(2).count() < 2 {
             continue;
         }
-        let parse = |i: usize| fields.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let Some(name) = it.next() else { continue };
+        if !is_top_level_block_device(name) {
+            continue;
+        }
+        let mut take_u64 = |skip: usize| -> Option<u64> {
+            for _ in 0..skip {
+                it.next()?;
+            }
+            it.next()?.parse().ok()
+        };
+        // From position 3: reads(3) sectors_read(5) writes(7) sectors_written(9) ms_io(12)
+        // Deltas from the current iterator position: 3->reads=0, then to 5 skip 1,
+        // then to 7 skip 1, then to 9 skip 1, then to 12 skip 2.
+        let reads = match take_u64(0) { Some(v) => v, None => continue };
+        let sectors_read = match take_u64(1) { Some(v) => v, None => continue };
+        let writes = match take_u64(1) { Some(v) => v, None => continue };
+        let sectors_written = match take_u64(1) { Some(v) => v, None => continue };
+        let ms_io = match take_u64(2) { Some(v) => v, None => continue };
         out.insert(
-            name,
+            name.to_string(),
             RawDisk {
-                reads_completed: parse(3),
-                sectors_read: parse(5),
-                writes_completed: parse(7),
-                sectors_written: parse(9),
-                ms_io: parse(12),
+                reads_completed: reads,
+                sectors_read,
+                writes_completed: writes,
+                sectors_written,
+                ms_io,
             },
         );
     }

@@ -218,35 +218,64 @@ fn is_up(d: &pcap::Device) -> bool {
     d.flags.is_up() && d.flags.is_running()
 }
 
+/// Per-iface capture loop with reopen-on-error. Previously we silently
+/// returned on any non-timeout error, leaving the per-iface thread dead
+/// for the lifetime of the daemon — interface flap, kernel buffer overflow,
+/// or descriptor close all permanently disabled bandwidth attribution
+/// for that interface with no user-visible signal. Now we log the error,
+/// back off, and try to reopen.
 fn capture_loop(name: String, shared: Arc<Shared>) {
-    let dev = match pcap::Device::list()
-        .ok()
-        .and_then(|list| list.into_iter().find(|d| d.name == name))
-    {
-        Some(d) => d,
-        None => {
-            tracing::warn!(iface = %name, "pcap device disappeared");
-            return;
-        }
-    };
-    let cap_result = pcap::Capture::from_device(dev)
-        .and_then(|c| c.snaplen(96).timeout(100).immediate_mode(true).open());
-    let mut cap = match cap_result {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(iface = %name, error = %e, "pcap open failed (need CAP_NET_RAW?)");
-            return;
-        }
-    };
+    /// How long to wait after a capture error before retrying. Doubles up
+    /// to MAX so a flapping interface doesn't busy-loop on errors.
+    const MIN_BACKOFF: Duration = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        let dev = match pcap::Device::list()
+            .ok()
+            .and_then(|list| list.into_iter().find(|d| d.name == name))
+        {
+            Some(d) => d,
+            None => {
+                tracing::warn!(iface = %name, "pcap device disappeared; will retry");
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+        let cap_result = pcap::Capture::from_device(dev)
+            .and_then(|c| c.snaplen(96).timeout(100).immediate_mode(true).open());
+        let mut cap = match cap_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(iface = %name, error = %e, "pcap open failed (need CAP_NET_RAW?); will retry");
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+        // Successful open — reset backoff so the next failure starts fresh.
+        backoff = MIN_BACKOFF;
+        let err = run_capture_session(&mut cap, &shared);
+        tracing::warn!(iface = %name, error = %err, "pcap capture errored; reopening");
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Pump packets from `cap` into `shared` until the first non-timeout error.
+/// Returns the error string so the caller can log it before reopening.
+fn run_capture_session(cap: &mut pcap::Capture<pcap::Active>, shared: &Shared) -> String {
     loop {
         match cap.next_packet() {
             Ok(packet) => {
                 if let Some((flow, len)) = parser::parse_l4(packet.data) {
-                    attribute_packet(&shared, flow, len);
+                    attribute_packet(shared, flow, len);
                 }
             }
             Err(pcap::Error::TimeoutExpired) => continue,
-            Err(_) => return,
+            Err(e) => return e.to_string(),
         }
     }
 }
@@ -354,36 +383,7 @@ fn read_flow_to_inode_cache() -> std::io::Result<HashMap<FlowKey, u64>> {
 }
 
 fn read_inode_to_pid() -> std::io::Result<HashMap<u64, u32>> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut out = HashMap::new();
-    let dir = std::fs::read_dir("/proc")?;
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
-            continue;
-        };
-        for fd in fds.flatten() {
-            let Ok(target) = std::fs::read_link(fd.path()) else {
-                continue;
-            };
-            let bytes = target.as_os_str().as_bytes();
-            let prefix = b"socket:[";
-            if !bytes.starts_with(prefix) || !bytes.ends_with(b"]") {
-                continue;
-            }
-            let inner = &bytes[prefix.len()..bytes.len() - 1];
-            let Some(inode) = std::str::from_utf8(inner).ok().and_then(|s| s.parse().ok()) else {
-                continue;
-            };
-            out.insert(inode, pid);
-        }
-    }
-    Ok(out)
+    Ok(crate::proc_walk::walk_socket_inodes())
 }
 
 // Re-export connection construction for tests / future use.

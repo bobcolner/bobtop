@@ -71,7 +71,18 @@ struct Inner {
     ebpf: aya::Ebpf,
     /// Last absolute (rx, tx, observed_at) per pid, for delta computation.
     last_seen: HashMap<u32, (u64, u64, Instant)>,
+    /// How many consecutive zero-delta samples each pid has produced. Used
+    /// to evict idle pids from the BPF hash map so `iter()` in `sample()`
+    /// stays bounded by *currently active* TCP-senders rather than every
+    /// pid that has ever sent traffic since boot.
+    idle_streak: HashMap<u32, u32>,
 }
+
+/// After this many consecutive zero-delta samples, evict the pid from the
+/// BPF map. Keeps the map size bounded on long-running daemons; the pid
+/// will reappear automatically the next time its kprobe fires. ~30 samples
+/// at the default 1Hz net tier interval = ~30s of idle before eviction.
+const IDLE_EVICTION_THRESHOLD: u32 = 30;
 
 impl std::fmt::Debug for EbpfAttributor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,7 +106,6 @@ impl EbpfAttributor {
         if !has_bpf_capability() {
             return Err(NetError::MissingCapability("CAP_BPF or root"));
         }
-        bump_memlock_rlimit()?;
 
         // IMPORTANT: use `EbpfLoader` rather than the convenience
         // `aya::Ebpf::load(...)`. Despite the docs claiming they're
@@ -107,10 +117,34 @@ impl EbpfAttributor {
         // identical bytes that this loader rejects, the standalone aya
         // example accepts. Don't switch back without retesting on a host
         // where this previously failed.
-        let mut ebpf = aya::EbpfLoader::new()
-            .load(BPF_OBJECT)
-            .map_err(|e| NetError::Backend { backend: "aya-load", source: Box::new(e) })?;
+        //
+        // Try to load WITHOUT bumping RLIMIT_MEMLOCK first. Modern kernels
+        // (5.11+) charge BPF allocations to memcg, not RLIMIT_MEMLOCK, so
+        // the bump is unnecessary. Hosts with hardened sysctls forbid the
+        // bump entirely; raising the limit eagerly would force this tier
+        // to fall back to pcap on those hosts even though loading would
+        // have succeeded. We only retry-with-bump on memory-pressure errors.
+        let mut ebpf = match aya::EbpfLoader::new().load(BPF_OBJECT) {
+            Ok(e) => e,
+            Err(e) if is_memlock_error(&e) => {
+                tracing::debug!("BPF load hit memlock limit, raising RLIMIT_MEMLOCK and retrying");
+                bump_memlock_rlimit()?;
+                aya::EbpfLoader::new()
+                    .load(BPF_OBJECT)
+                    .map_err(|e| NetError::Backend { backend: "aya-load", source: Box::new(e) })?
+            }
+            Err(e) => {
+                return Err(NetError::Backend {
+                    backend: "aya-load",
+                    source: Box::new(e),
+                })
+            }
+        };
 
+        // Attach kprobes. If the second attach fails, returning Err drops
+        // `ebpf` here — aya's Drop walks all programs and detaches them
+        // (kprobe links are owned by the program; program drop = detach).
+        // No userspace cleanup needed.
         attach_kprobe(&mut ebpf, SEND_PROG, "tcp_sendmsg")?;
         attach_kprobe(&mut ebpf, RECV_PROG, "tcp_cleanup_rbuf")?;
 
@@ -122,9 +156,24 @@ impl EbpfAttributor {
             inner: Arc::new(Mutex::new(Inner {
                 ebpf,
                 last_seen: HashMap::new(),
+                idle_streak: HashMap::new(),
             })),
         })
     }
+}
+
+/// Recognise the specific aya/kernel error that means "increase RLIMIT_MEMLOCK".
+/// On 5.11+ this is rare (memcg accounting); on older kernels or when memcg
+/// is disabled, BPF map allocations check the rlimit. The kernel returns
+/// EPERM with a message containing "memlock" or just `EAGAIN`/`ENOMEM` when
+/// the rlimit is exhausted. We check the error text since aya doesn't
+/// expose the underlying errno cleanly.
+fn is_memlock_error(err: &aya::EbpfError) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("memlock")
+        || s.contains("rlimit")
+        || s.contains("operation not permitted")
+        || s.contains("cannot allocate memory")
 }
 
 fn bump_memlock_rlimit() -> Result<()> {
@@ -204,6 +253,7 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     };
 
     let mut out = Vec::with_capacity(current.len());
+    let mut to_evict: Vec<u32> = Vec::new();
     for (pid, bytes) in &current {
         let (rx_rate, tx_rate) = match g.last_seen.get(pid) {
             Some((prev_rx, prev_tx, prev_t)) => {
@@ -215,11 +265,21 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
             }
             None => (0.0, 0.0),
         };
-        // Skip pids whose deltas are both zero AND we've already reported
-        // them once — keeps the table from filling with idle processes.
-        if rx_rate == 0.0 && tx_rate == 0.0 && g.last_seen.contains_key(pid) {
+        let is_zero_delta = rx_rate == 0.0 && tx_rate == 0.0;
+        // Track idle streak so we can evict long-idle pids from the BPF map.
+        // The kprobe never deletes entries, so without userspace pruning the
+        // map size grows monotonically with every pid that has ever sent
+        // TCP traffic — making `iter()` above linearly slower over time.
+        if is_zero_delta && g.last_seen.contains_key(pid) {
+            let streak = g.idle_streak.entry(*pid).or_insert(0);
+            *streak += 1;
+            if *streak >= IDLE_EVICTION_THRESHOLD {
+                to_evict.push(*pid);
+            }
             continue;
         }
+        // Active pid this tick — reset the idle streak.
+        g.idle_streak.remove(pid);
         out.push(ProcessNetSample {
             pid: *pid,
             name: read_proc_comm(*pid).unwrap_or_else(|| format!("pid:{pid}")),
@@ -233,8 +293,27 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     // Update last_seen and evict pids that have disappeared from the map.
     let live: HashSet<u32> = current.iter().map(|(p, _)| *p).collect();
     g.last_seen.retain(|pid, _| live.contains(pid));
+    g.idle_streak.retain(|pid, _| live.contains(pid));
     for (pid, bytes) in current {
         g.last_seen.insert(pid, (bytes.rx, bytes.tx, now));
+    }
+
+    // Prune long-idle pids from the BPF map so iter() stays bounded by
+    // the active set. Re-borrow `g.ebpf` separately from the iter borrow
+    // above. Errors are non-fatal — if a remove fails (concurrent kprobe
+    // re-insert, kernel race), we'll try again next sample.
+    if !to_evict.is_empty() {
+        if let Some(map_data) = g.ebpf.map_mut(MAP_NAME) {
+            if let Ok(mut map) = aya::maps::HashMap::<_, u32, PidBytes>::try_from(map_data) {
+                for pid in &to_evict {
+                    let _ = map.remove(pid);
+                }
+            }
+        }
+        for pid in &to_evict {
+            g.last_seen.remove(pid);
+            g.idle_streak.remove(pid);
+        }
     }
 
     Ok(out)

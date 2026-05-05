@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Widget;
 
-use crate::{format_bytes, format_rate, Theme};
+use crate::{format_bytes_compact, format_rate, Theme};
 
 #[derive(Debug, Clone)]
 pub struct Column<'a> {
@@ -128,44 +128,34 @@ impl<'a> Table<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ColSpec {
-    title: String,
-    width: u16,
-    right_align: bool,
-}
-
 impl<'a> Widget for &Table<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 || self.columns.is_empty() {
             return;
         }
 
-        let cols: Vec<ColSpec> = self
-            .columns
-            .iter()
-            .map(|c| ColSpec {
-                title: c.title.to_string(),
-                width: c.width,
-                right_align: c.right_align,
-            })
-            .collect();
-
         let header_style = Style::default().fg(self.theme.title).add_modifier(Modifier::BOLD);
         let active_style = Style::default()
             .fg(self.theme.hi_fg)
             .add_modifier(Modifier::BOLD | Modifier::REVERSED);
         let arrow = if self.sort_descending { '↓' } else { '↑' };
-        render_row(buf, area.x, area.y, area.width, &cols, |idx| {
-            let c = &cols[idx];
+        // Pre-build the decorated title for the active sort column (if any).
+        // Saves a per-row format!() inside the cell_fn callback below.
+        let active_title: Option<String> = self.sort_column.and_then(|idx| {
+            self.columns
+                .get(idx)
+                .map(|c| format!("{}{}", c.title, arrow))
+        });
+        render_row(buf, area.x, area.y, area.width, self.columns, |idx| {
+            let c = &self.columns[idx];
             let is_active = self.sort_column == Some(idx);
-            let title = if is_active {
-                format!("{}{}", c.title, arrow)
+            let text: &str = if is_active {
+                active_title.as_deref().unwrap_or(&c.title)
             } else {
-                c.title.clone()
+                &c.title
             };
             let style = if is_active { active_style } else { header_style };
-            (title, style, c.right_align)
+            (text, style, c.right_align)
         });
 
         let body_top = area.y + 1;
@@ -186,31 +176,42 @@ impl<'a> Widget for &Table<'a> {
             } else {
                 row.style
             };
-            let mut cells: Vec<String> = row.cells.iter().map(|c| c.text.to_string()).collect();
-            let cell_styles: Vec<Style> = if is_selected {
-                vec![style; row.cells.len()]
-            } else {
-                row.cells.iter().map(|c| style.patch(c.style)).collect()
+            // Header rows override one column's text with a label string.
+            // Pull it out once instead of building a Vec<String> shadow.
+            let header_label: Option<(usize, &str)> = match &row.kind {
+                RowKind::Header { label, label_col } => Some((*label_col, label.as_ref())),
+                RowKind::Data => None,
             };
 
-            if let RowKind::Header { label, label_col } = &row.kind {
-                if *label_col < cells.len() {
-                    cells[*label_col] = label.to_string();
-                }
-            }
-
-            render_row(buf, area.x, y, area.width, &cols, |idx| {
-                let s = cells.get(idx).cloned().unwrap_or_default();
-                let st = cell_styles.get(idx).cloned().unwrap_or(style);
-                (s, st, cols[idx].right_align)
+            render_row(buf, area.x, y, area.width, self.columns, |idx| {
+                let text: &str = header_label
+                    .filter(|(col, _)| *col == idx)
+                    .map(|(_, s)| s)
+                    .or_else(|| row.cells.get(idx).map(|c| c.text.as_ref()))
+                    .unwrap_or("");
+                let cell_style = if is_selected {
+                    style
+                } else {
+                    row.cells
+                        .get(idx)
+                        .map(|c| style.patch(c.style))
+                        .unwrap_or(style)
+                };
+                (text, cell_style, self.columns[idx].right_align)
             });
         }
     }
 }
 
-fn render_row<F>(buf: &mut Buffer, x0: u16, y: u16, total_width: u16, cols: &[ColSpec], mut cell_fn: F)
-where
-    F: FnMut(usize) -> (String, Style, bool),
+fn render_row<'a, F>(
+    buf: &mut Buffer,
+    x0: u16,
+    y: u16,
+    total_width: u16,
+    cols: &[Column<'a>],
+    mut cell_fn: F,
+) where
+    F: FnMut(usize) -> (&'a str, Style, bool),
 {
     if total_width == 0 || cols.is_empty() {
         return;
@@ -237,14 +238,19 @@ where
         }
         let (text, style, right_align) = cell_fn(i);
         let len = text.chars().count() as u16;
-        let (text_x, text) = if right_align && len < avail {
-            (cursor + (avail - len), text)
-        } else if len > avail {
-            (cursor, truncate(&text, avail as usize))
+        let text_x = if right_align && len < avail {
+            cursor + (avail - len)
         } else {
-            (cursor, text)
+            cursor
         };
-        write_str(buf, text_x, y, &text, avail as usize, style);
+        // truncate_to_chars returns &str when no truncation is needed —
+        // only allocates when we actually need to append the ellipsis.
+        let drawn: std::borrow::Cow<'_, str> = if len > avail {
+            std::borrow::Cow::Owned(truncate(text, avail as usize))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        };
+        write_str(buf, text_x, y, &drawn, avail as usize, style);
         cursor = cursor.saturating_add(col_width).saturating_add(1);
     }
 }
@@ -263,21 +269,21 @@ fn write_str(buf: &mut Buffer, x: u16, y: u16, s: &str, max_cols: usize, style: 
     }
 }
 
+/// Truncate `s` to at most `max_chars` characters, appending `…` when shortened.
+/// Caller has already verified `s.chars().count() > max_chars`, so this always
+/// allocates — the common no-truncation path stays borrowed at the call site.
 fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else if max_chars == 0 {
-        String::new()
-    } else {
-        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        out.push('…');
-        out
+    if max_chars == 0 {
+        return String::new();
     }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 impl<'a> Cell<'a> {
     pub fn bytes(b: u64) -> Self {
-        Self::new(format_bytes(b))
+        Self::new(format_bytes_compact(b))
     }
 
     pub fn rate(v: Option<f64>) -> Self {

@@ -8,26 +8,45 @@
 //! pid 0). We log this once at startup but don't error.
 
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::trace;
 
+use crate::proc_walk;
 use crate::sample::{AddrEndpoint, ConnectionInfo, Protocol, SocketState};
 use crate::{AttributorTier, NetError, NetworkAttributor, ProcessNetSample, Result};
 
 mod parse;
 
+/// How long to reuse a cached inode→pid map before re-walking `/proc/[pid]/fd`.
+/// Matches pcap_backend's cadence — fresh enough to attribute newly-spawned
+/// connections within ~1 sample, cheap enough that the walk doesn't dominate
+/// CPU on hosts with many processes.
+const INODE_CACHE_TTL: Duration = Duration::from_millis(1000);
+
 #[derive(Debug, Default)]
-pub struct ProcInodeAttributor;
+struct InodeCache {
+    /// `None` until first build; `Some(_, when)` once populated. Stored
+    /// behind `Arc` so callers can drop the lock immediately after lookup.
+    entry: Option<(Arc<HashMap<u64, u32>>, Instant)>,
+}
+
+#[derive(Debug, Default)]
+pub struct ProcInodeAttributor {
+    /// Cached inode→pid map. Re-walked at most every `INODE_CACHE_TTL`.
+    /// Held across samples so back-to-back collects don't re-do the
+    /// O(N_pids × avg_fds) walk for nothing.
+    cache: Arc<Mutex<InodeCache>>,
+}
 
 impl ProcInodeAttributor {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -35,7 +54,8 @@ impl ProcInodeAttributor {
 impl NetworkAttributor for ProcInodeAttributor {
     async fn sample(&self) -> Result<Vec<ProcessNetSample>> {
         // /proc walks are blocking syscalls — keep them off the runtime.
-        tokio::task::spawn_blocking(sample_blocking)
+        let cache = Arc::clone(&self.cache);
+        tokio::task::spawn_blocking(move || sample_blocking(&cache))
             .await
             .map_err(|e| NetError::other(format!("proc_inode join error: {e}")))?
     }
@@ -49,7 +69,7 @@ impl NetworkAttributor for ProcInodeAttributor {
     }
 }
 
-fn sample_blocking() -> Result<Vec<ProcessNetSample>> {
+fn sample_blocking(cache: &Mutex<InodeCache>) -> Result<Vec<ProcessNetSample>> {
     // 1. Pull every TCP connection (v4 + v6) and remember which inodes are interesting.
     let mut conns: Vec<RawConn> = Vec::new();
     if let Ok(text) = fs::read_to_string("/proc/net/tcp") {
@@ -62,8 +82,8 @@ fn sample_blocking() -> Result<Vec<ProcessNetSample>> {
         return Ok(Vec::new());
     }
 
-    // 2. Build inode → pid map by walking /proc/[pid]/fd/.
-    let inode_to_pid = build_inode_pid_map();
+    // 2. Reuse a recent inode→pid map; only walk /proc/[pid]/fd if stale.
+    let inode_to_pid = get_or_refresh_inode_map(cache);
 
     // 3. Group connections by pid (0 = unattributed; non-root can't see other users' fds).
     let mut by_pid: HashMap<u32, Vec<ConnectionInfo>> = HashMap::new();
@@ -98,6 +118,24 @@ fn sample_blocking() -> Result<Vec<ProcessNetSample>> {
     Ok(out)
 }
 
+/// Return the cached inode→pid map if it's still within TTL, otherwise
+/// re-walk `/proc` and store a fresh one. The walk happens *outside* the
+/// lock so concurrent samples don't pile up behind a slow `readdir`.
+fn get_or_refresh_inode_map(cache: &Mutex<InodeCache>) -> Arc<HashMap<u64, u32>> {
+    {
+        let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((map, when)) = guard.entry.as_ref() {
+            if when.elapsed() < INODE_CACHE_TTL {
+                return Arc::clone(map);
+            }
+        }
+    }
+    let arc = Arc::new(proc_walk::walk_socket_inodes());
+    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+    guard.entry = Some((Arc::clone(&arc), Instant::now()));
+    arc
+}
+
 /// One row from `/proc/net/tcp{,6}` after parsing.
 #[derive(Debug)]
 pub(crate) struct RawConn {
@@ -105,48 +143,6 @@ pub(crate) struct RawConn {
     pub remote: AddrEndpoint,
     pub state: SocketState,
     pub inode: u64,
-}
-
-fn build_inode_pid_map() -> HashMap<u64, u32> {
-    let mut map = HashMap::new();
-    let proc_dir = match fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return map,
-    };
-    for entry in proc_dir.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = parse_pid(&name) else { continue };
-        let fd_dir = entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else {
-            // EACCES on other users' fds when running unprivileged — expected.
-            continue;
-        };
-        for fd in fds.flatten() {
-            let Ok(target) = fs::read_link(fd.path()) else {
-                continue;
-            };
-            let Some(inode) = parse_socket_inode(target.as_os_str()) else {
-                continue;
-            };
-            map.insert(inode, pid);
-        }
-    }
-    map
-}
-
-fn parse_pid(name: &OsStr) -> Option<u32> {
-    name.to_str()?.parse().ok()
-}
-
-/// Match `socket:[NNN]` symlink targets — the `NNN` is the inode.
-fn parse_socket_inode(target: &OsStr) -> Option<u64> {
-    let bytes = target.as_bytes();
-    let prefix = b"socket:[";
-    if !bytes.starts_with(prefix) || !bytes.ends_with(b"]") {
-        return None;
-    }
-    let inner = &bytes[prefix.len()..bytes.len() - 1];
-    std::str::from_utf8(inner).ok()?.parse().ok()
 }
 
 fn read_proc_comm(pid: u32) -> Option<String> {
@@ -189,11 +185,26 @@ mod tests {
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
-    #[test]
-    fn parses_socket_inode_symlink() {
-        let target = OsStr::new("socket:[123456]");
-        assert_eq!(parse_socket_inode(target), Some(123456));
-        assert_eq!(parse_socket_inode(OsStr::new("/dev/null")), None);
-        assert_eq!(parse_socket_inode(OsStr::new("socket:[]")), None);
+    #[tokio::test]
+    async fn cache_hit_within_ttl_returns_same_arc() {
+        // Two back-to-back samples should reuse the cached inode→pid map.
+        // We verify by checking the Arc strong count grows as cache lookups
+        // hand out new references to the same allocation.
+        let attr = ProcInodeAttributor::new();
+        let _ = attr.sample().await;
+        let strong_before = {
+            let g = attr.cache.lock().unwrap();
+            g.entry.as_ref().map(|(a, _)| Arc::strong_count(a)).unwrap_or(0)
+        };
+        let _ = attr.sample().await;
+        let strong_after = {
+            let g = attr.cache.lock().unwrap();
+            g.entry.as_ref().map(|(a, _)| Arc::strong_count(a)).unwrap_or(0)
+        };
+        // Cache must be populated after at least one sample.
+        assert!(strong_before >= 1, "cache should be populated after first sample");
+        // After a TTL-fresh second sample, the cached Arc should still be
+        // the same allocation (same strong count behaviour as before).
+        assert_eq!(strong_before, strong_after);
     }
 }

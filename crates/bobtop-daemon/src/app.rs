@@ -388,7 +388,6 @@ pub struct App {
     pub processes_sorted: Vec<ProcessInfo>,
 
     pub selected_proc: usize,
-    pub scroll_offset: usize,
     /// Stable identity for the selected process row.
     selected_proc_pid: Option<u32>,
     /// Keep the highlighted process attached to the same pid as it moves.
@@ -451,7 +450,6 @@ impl App {
             net_tier: AttributorTier::Unavailable,
             processes_sorted: Vec::new(),
             selected_proc: 0,
-            scroll_offset: 0,
             selected_proc_pid: None,
             sticky_proc_selection: false,
             proc_sort: TableSort::Cpu,
@@ -476,9 +474,12 @@ impl App {
     }
 
     pub fn apply_event(&mut self, ev: MetricEvent) {
-        self.ui.dirty = true;
+        // Mark dirty per arm so events that produce no UI change (e.g. GPU,
+        // not yet wired) don't trigger a render. The render-on-change loop
+        // depends on `dirty` reflecting actual visible state changes.
         match ev {
             MetricEvent::Cpu(s) => {
+                self.ui.dirty = true;
                 if self.cpu_history.len() == CPU_HISTORY_CAP {
                     self.cpu_history.pop_front();
                 }
@@ -499,6 +500,7 @@ impl App {
                 self.latest_cpu = Some(s);
             }
             MetricEvent::Memory(s) => {
+                self.ui.dirty = true;
                 if s.total_bytes > 0 {
                     let used_frac = s.used_bytes as f64 / s.total_bytes as f64;
                     if self.mem_history.len() == HISTORY_CAP {
@@ -520,10 +522,12 @@ impl App {
                 self.latest_mem = Some(s);
             }
             MetricEvent::Process(s) => {
+                self.ui.dirty = true;
                 self.latest_processes = Some(s);
                 self.rebuild_sorted();
             }
             MetricEvent::Network(s) => {
+                self.ui.dirty = true;
                 let (rx, tx) = aggregate_net_rates(&s, self.show_virtual_net);
                 if self.net_history.len() == HISTORY_CAP {
                     self.net_history.pop_front();
@@ -545,6 +549,7 @@ impl App {
                 self.latest_network = Some(s);
             }
             MetricEvent::Disk(s) => {
+                self.ui.dirty = true;
                 // Per-mount sparkline history. Normalize each rate against a
                 // rolling per-mount peak at render time; the deque stores raw
                 // bytes/sec so the renderer can compute its own scale ceiling.
@@ -1161,9 +1166,6 @@ impl App {
                 // shortcuts. Use the actual arrow keys for cursor movement.
                 if self.selected_proc > 0 {
                     self.selected_proc -= 1;
-                    if self.selected_proc < self.scroll_offset {
-                        self.scroll_offset = self.selected_proc;
-                    }
                 }
                 self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
@@ -1177,9 +1179,6 @@ impl App {
             }
             KeyCode::PageUp => {
                 self.selected_proc = self.selected_proc.saturating_sub(10);
-                if self.selected_proc < self.scroll_offset {
-                    self.scroll_offset = self.selected_proc;
-                }
                 self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
@@ -1190,7 +1189,6 @@ impl App {
             }
             KeyCode::Home => {
                 self.selected_proc = 0;
-                self.scroll_offset = 0;
                 self.sync_selected_process_identity_from_rows(&rows);
                 ControlFlow::Continue
             }
@@ -1207,7 +1205,7 @@ impl App {
 fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {
     use std::cmp::Ordering;
     rows.sort_by(|a, b| {
-        let ord = match sort {
+        let primary = match sort {
             TableSort::Pid => a.pid.cmp(&b.pid),
             TableSort::Name => a.name.cmp(&b.name),
             TableSort::User => a.user.cmp(&b.user),
@@ -1238,7 +1236,12 @@ fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {
                 .partial_cmp(&b.disk_write_bytes_per_sec.unwrap_or(0.0))
                 .unwrap_or(Ordering::Equal),
         };
-        if descending { ord.reverse() } else { ord }
+        // Reverse the primary key for descending mode, but keep the PID
+        // tiebreaker ascending so equal-valued rows have a deterministic
+        // order across samples (process samples arrive in HashMap order,
+        // which varies).
+        let primary = if descending { primary.reverse() } else { primary };
+        primary.then_with(|| a.pid.cmp(&b.pid))
     });
 }
 

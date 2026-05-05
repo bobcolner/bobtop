@@ -301,6 +301,8 @@ mod tests {
     #[test]
     fn tiny_viewports_do_not_over_scroll() {
         assert_eq!(selection_scroll_offset(4, 10, 1), 4);
-        assert_eq!(selection_scroll_offset(4, 10, 2), 4);
+        // body_h=2: anchor=1, offset=3 shows rows [3,4] — selection visible at bottom.
+        // offset=4 would over-scroll (scroll further than needed to show selection).
+        assert_eq!(selection_scroll_offset(4, 10, 2), 3);
     }
 }

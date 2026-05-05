@@ -249,8 +249,23 @@ pub fn find_source(name: &str) -> Option<(String, String)> {
     }
     for dir in user_theme_dirs() {
         let path = dir.join(format!("{name}.theme"));
-        if let Ok(src) = std::fs::read_to_string(&path) {
-            return Some((src, path.display().to_string()));
+        match std::fs::read_to_string(&path) {
+            Ok(src) => return Some((src, path.display().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Expected — try the next search dir without noise.
+            }
+            Err(e) => {
+                // Permission denied / broken symlink / IO error on a file
+                // that exists. The user expected this theme to load and
+                // it didn't — surface the reason rather than silently
+                // falling back to built-in.
+                tracing::warn!(
+                    theme = name,
+                    path = %path.display(),
+                    error = %e,
+                    "theme file unreadable; trying next search path",
+                );
+            }
         }
     }
     None
