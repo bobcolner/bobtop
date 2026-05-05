@@ -69,6 +69,13 @@ fn compile_one(src: &std::path::Path, obj: &std::path::Path, env_var: &str) -> b
             "bpf",
             "-D__TARGET_ARCH_x86",
             "-mcpu=v3",
+            // Suppress the `.llvm_addrsig` section. aya 0.13's ELF parser
+            // is known to reject objects that contain LLVM-specific
+            // section types it doesn't recognize, returning the cryptic
+            // "error parsing ELF data". Newer clangs emit this section by
+            // default for link-time-optimization purposes; BPF objects
+            // don't go through a linker so we never need it.
+            "-fno-addrsig",
             "-c",
         ])
         .arg("-I")
