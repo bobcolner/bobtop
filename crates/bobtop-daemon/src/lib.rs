@@ -2,6 +2,7 @@
 //! call [`ui::draw`] without going through the binary's `tokio::main`. The
 //! binary `main.rs` re-uses the same modules.
 
+pub mod agent;
 pub mod app;
 pub mod cli;
 pub mod config;

@@ -1,7 +1,7 @@
 use bobtop_core::sample::CpuSample;
 use bobtop_tui::widgets::{BrailleGraph, GraphStyle, MiniMeter, StackedBar, StackedSegment};
 use bobtop_tui::widgets::panel as boxed_panel;
-use bobtop_tui::write_str_at;
+use bobtop_tui::{display_width, write_str_at};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::Widget;
@@ -21,7 +21,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let title = presenter::cpu_panel_title(app);
     let panel = boxed_panel(app.theme.cpu_box, app.theme.title, app.corner_style)
         .with_title(title)
-        .with_center_title(presenter::cpu_clock_label())
+        .with_center_title(presenter::cpu_clock_label(app.tick_ms()))
         .with_controls(format!("- {}ms +", app.tick_ms()));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -58,7 +58,7 @@ fn draw_cores_subpanel(
     app: &App,
     cpu_pct: f64,
 ) {
-    if area.width < 12 || area.height < 4 {
+    if area.width < 14 || area.height < 4 {
         draw_core_meters(frame, area, sample, app);
         return;
     }
@@ -78,6 +78,11 @@ fn draw_cores_subpanel(
         return;
     }
 
+    // 1-col horizontal breathing room inside the subpanel borders.
+    let pad_x: u16 = if inner.width >= 6 { 1 } else { 0 };
+    let content_x = inner.x + pad_x;
+    let content_w = inner.width.saturating_sub(pad_x * 2);
+
     let overall_segs = vec![StackedSegment::new(
         "CPU",
         (cpu_pct / 100.0).clamp(0.0, 1.0),
@@ -88,7 +93,7 @@ fn draw_cores_subpanel(
         .with_value_text(format!("{:>5.1}%", cpu_pct))
         .with_empty_bg(app.theme.meter_bg)
         .with_chrome_fg(app.theme.main_fg);
-    let overall_rect = Rect::new(inner.x, inner.y, inner.width, 1);
+    let overall_rect = Rect::new(content_x, inner.y, content_w, 1);
     (&overall).render(overall_rect, frame.buffer_mut());
 
     let load_label = sample
@@ -96,18 +101,30 @@ fn draw_cores_subpanel(
         .map(|l| format!("load  {:.2} · {:.2} · {:.2}  (1m / 5m / 15m)", l.one, l.five, l.fifteen))
         .unwrap_or_else(|| "load  — · — · —".to_string());
     let load_h: u16 = if inner.height >= 4 { 1 } else { 0 };
+    // Optional blank row between overall bar and core meters when tall enough.
+    let gap_h: u16 = if inner.height >= 6 { 1 } else { 0 };
 
-    let cores_h = inner.height.saturating_sub(1).saturating_sub(load_h);
+    let cores_h = inner
+        .height
+        .saturating_sub(1)
+        .saturating_sub(gap_h)
+        .saturating_sub(load_h);
     if cores_h > 0 {
-        let cores_rect = Rect::new(inner.x, inner.y + 1, inner.width, cores_h);
+        let cores_rect = Rect::new(content_x, inner.y + 1 + gap_h, content_w, cores_h);
         draw_core_meters(frame, cores_rect, sample, app);
     }
 
     if load_h > 0 {
         let y = inner.y + inner.height - 1;
+        let label_w = display_width(&load_label) as u16;
+        let x = if label_w >= content_w {
+            content_x
+        } else {
+            content_x + (content_w - label_w) / 2
+        };
         write_str_at(
             frame.buffer_mut(),
-            inner.x,
+            x,
             y,
             &load_label,
             Style::default().fg(app.theme.inactive_fg),
@@ -126,11 +143,41 @@ pub(super) fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &CpuSample
     }
     let rows = area.height as usize;
     const MIN_COL_W: u16 = 16;
-    let max_cols_by_width = ((area.width / MIN_COL_W).max(1)) as usize;
+    // 1-cell gap between columns, filled with a faint vertical rule.
+    const GAP_W: u16 = 1;
+    let max_cols_by_width = {
+        // each column needs MIN_COL_W, with GAP_W between adjacent columns:
+        // cols * MIN_COL_W + (cols - 1) * GAP_W <= area.width
+        let w = area.width;
+        let mut c = 1usize;
+        while ((c as u16 + 1) * MIN_COL_W + (c as u16) * GAP_W) <= w {
+            c += 1;
+        }
+        c
+    };
     let cols_by_count = n.div_ceil(rows.max(1));
     let cols = cols_by_count.min(max_cols_by_width).max(1);
-    let col_w = area.width / cols as u16;
+    let total_gap = GAP_W * (cols.saturating_sub(1) as u16);
+    let usable_w = area.width.saturating_sub(total_gap);
+    let col_w = usable_w / cols as u16;
+    let stride = col_w + GAP_W;
     let per_col_rows = n.div_ceil(cols);
+
+    if cols > 1 {
+        let rule_style = Style::default().fg(app.theme.div_line);
+        for col in 0..cols.saturating_sub(1) {
+            let x = area.x + (col as u16) * stride + col_w;
+            for r in 0..(area.height as usize).min(per_col_rows) {
+                write_str_at(
+                    frame.buffer_mut(),
+                    x,
+                    area.y + r as u16,
+                    "│",
+                    rule_style,
+                );
+            }
+        }
+    }
 
     for (i, core) in sample.cores.iter().enumerate() {
         let col = i / per_col_rows;
@@ -138,9 +185,9 @@ pub(super) fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &CpuSample
         if col >= cols || row >= rows {
             break;
         }
-        let x = area.x + col as u16 * col_w;
+        let x = area.x + col as u16 * stride;
         let w = if col + 1 == cols {
-            area.width.saturating_sub(col as u16 * col_w)
+            area.width.saturating_sub(col as u16 * stride)
         } else {
             col_w
         };

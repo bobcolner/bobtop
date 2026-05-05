@@ -82,6 +82,13 @@ pub struct Cli {
     /// table the in-app `?` overlay reads, so the two cannot drift.
     #[arg(long)]
     pub help_keys: bool,
+
+    /// Run in headless daemon mode: start the sampler engine + agent
+    /// socket, skip the TUI. Useful on servers / CI runners where you
+    /// want agents to query the host without a terminal attached. Exits
+    /// on SIGINT/SIGTERM.
+    #[arg(long)]
+    pub daemon: bool,
 }
 
 impl Cli {

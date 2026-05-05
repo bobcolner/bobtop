@@ -12,32 +12,49 @@ pub(super) fn cpu_panel_title(app: &App) -> String {
     format!("¹cpu  CPU {:.1}%", cpu_pct)
 }
 
-pub(super) fn cpu_clock_label() -> String {
+pub(super) fn cpu_clock_label(tick_ms: u64) -> String {
+    let show_seconds = tick_ms <= 1000;
+    let fallback = if show_seconds {
+        "1970-01-01 00:00:00 utc"
+    } else {
+        "1970-01-01 00:00 utc"
+    };
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d,
-        Err(_) => return "1970-01-01 00:00:00 utc".into(),
+        Err(_) => return fallback.into(),
     };
     let secs = now.as_secs().min(i64::MAX as u64) as libc::time_t;
     #[cfg(unix)]
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::gmtime_r(&secs, &mut tm).is_null() {
-            return "1970-01-01 00:00:00 utc".into();
+            return fallback.into();
         }
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} utc",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
+        if show_seconds {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} utc",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            )
+        } else {
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02} utc",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+            )
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = secs;
-        "1970-01-01 00:00:00 utc".into()
+        fallback.into()
     }
 }
 

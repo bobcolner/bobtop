@@ -20,13 +20,19 @@ pub mod bus;
 pub mod collector;
 pub mod error;
 pub mod event;
+pub mod history;
 pub mod sample;
+pub mod store;
 
 pub use boxes::{Box, BoxesEnabled};
 pub use bus::DataBus;
 pub use collector::Collector;
 pub use error::{CoreError, Result};
 pub use event::MetricEvent;
+pub use history::{
+    History, HistoryRing, HostMetrics, Metric, PeakResult, ProcRef, TopProcs, WindowStats,
+};
+pub use store::{HostSample, SampleStore};
 pub use sample::{
     ConnectionDirection, CoreSample, CpuSample, DiskDeviceSample, DiskSample, FilesystemSample,
     GpuDeviceSample, GpuSample, HugePages, InterfaceSample, LoadAverage, MemorySample,

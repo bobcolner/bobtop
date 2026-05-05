@@ -9,7 +9,7 @@ use anyhow::Result;
 use bobtop_collectors::{
     CpuCollector, DiskCollector, MemoryCollector, NetworkGlobalCollector, ProcessCollector,
 };
-use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, MetricEvent};
+use bobtop_core::{Box, BoxesEnabled, Collector, DataBus, History, MetricEvent, SampleStore};
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 use tokio::sync::broadcast;
 
@@ -26,6 +26,16 @@ use bobtop_daemon::tui;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Short-circuit: `bobtop agent <subcommand>` is a thin Unix-socket
+    // client that never starts collectors or the TUI. Detect it before
+    // clap parses so we don't have to graft the agent surface into the
+    // TUI's argument schema.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.first().map(|s| s.as_str()) == Some("agent") {
+        let code = bobtop_daemon::agent::client::run(&raw_args[1..]);
+        std::process::exit(code);
+    }
+
     // Parse CLI via get_matches() so we can ask clap which fields the user
     // actually set on the command line vs. left at the default. That lets
     // us implement strict CLI > config-file > default precedence below.
@@ -90,6 +100,19 @@ async fn main() -> Result<()> {
     );
 
     let bus = DataBus::default();
+    // Latest-value aggregator — parallel subscriber to the bus. The TUI
+    // continues to read its own subscription; this exists so the agent
+    // socket can answer ad-hoc queries without going through `App`.
+    let sample_store = SampleStore::spawn(&bus);
+    // Bounded retrospective ring (≈200 KB max). Tracks host-level metrics
+    // and per-pid top-N at three resolution tiers; powers future `peak` /
+    // `responsible_for` queries.
+    let history = History::spawn(sample_store.clone());
+    // Agent query socket. Listener failure (e.g. permission denied on
+    // /tmp) is non-fatal — the TUI keeps running without the agent surface.
+    let agent_socket_path =
+        bobtop_daemon::agent::spawn(sample_store.clone(), history.clone());
+    let _ = history;
     let tick_ms = Arc::new(AtomicU64::new(eff.tick_ms_clamped()));
     let mut app = App::new(
         theme,
@@ -143,6 +166,22 @@ async fn main() -> Result<()> {
         spawn_disk_attributor_loop(da, Arc::clone(&app), Arc::clone(&tick_ms), boxes.clone());
     }
 
+    if cli.daemon {
+        // Headless mode: the engine + agent socket are already running.
+        // Block until the operator signals shutdown, then explicitly unlink
+        // the socket — Tokio doesn't unwind the listener task's Drop on
+        // SIGTERM, so we can't rely on the listener-task cleanup path here.
+        tracing::warn!("running in --daemon mode; press Ctrl-C to exit");
+        wait_for_shutdown().await;
+        if let Some(p) = agent_socket_path.as_ref() {
+            let _ = std::fs::remove_file(p);
+        }
+        // Attributor loops still write into App at runtime even though it
+        // never renders; suppress the "unused" warning explicitly.
+        let _ = app;
+        return Ok(());
+    }
+
     // Input thread (blocking crossterm reads).
     let input_rx = tui::spawn_input_thread();
 
@@ -152,6 +191,31 @@ async fn main() -> Result<()> {
     tui::restore_terminal(&mut term)?;
 
     result.map_err(Into::into)
+}
+
+/// Block on Ctrl-C or SIGTERM, whichever arrives first. Used by `--daemon`
+/// mode where there's no TUI render loop to provide a natural exit point.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Resolved settings after merging CLI > config-file > clap defaults.
