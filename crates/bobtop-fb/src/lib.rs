@@ -9,11 +9,12 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod find;
 pub mod fs;
 pub mod keys;
 pub mod nav;
 pub mod preview;
 pub mod ui;
 
-pub use app::App;
+pub use app::{App, ImageBackend, ImageBackendChoice};
 pub use fs::entry::{EntryKind, FsEntry};

@@ -28,6 +28,17 @@ pub enum Action {
     Cancel,
     /// Open the `/` filter input prompt.
     StartFilter,
+    /// Send the selected entry to the system trash.
+    Trash,
+    /// Permanently delete the selected entry (after confirmation).
+    HardDelete,
+    /// Rename the selected entry — opens an input modal pre-filled
+    /// with the current name.
+    Rename,
+    /// Create a new empty file in the current directory.
+    Touch,
+    /// Open the recursive file finder.
+    StartFind,
     Noop,
 }
 
@@ -53,7 +64,14 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::Char('.') => Action::ToggleHidden,
-        KeyCode::Char('r') | KeyCode::F(5) => Action::Refresh,
+        // `r` is rename now; refresh moves to F5 (the notify watcher
+        // makes manual refresh rarely needed anyway).
+        KeyCode::Char('r') => Action::Rename,
+        KeyCode::F(5) => Action::Refresh,
+        KeyCode::Char('d') => Action::Trash,
+        KeyCode::Char('D') => Action::HardDelete,
+        KeyCode::Char('a') => Action::Touch,
+        KeyCode::Char('f') => Action::StartFind,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         _ => Action::Noop,

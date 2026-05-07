@@ -70,6 +70,261 @@ where
     Ok(())
 }
 
+/// Apply a keystroke to a single-line text buffer. Shared between
+/// the rename/touch modals and (eventually) any future input.
+/// Char keys append; Backspace pops; Ctrl-W deletes the trailing
+/// word (matches the filter input's convention); Ctrl-U clears.
+/// Unknown keys are ignored so the modal stays open and the user
+/// can correct course.
+fn edit_buffer(mut buf: String, modifiers: KeyModifiers, code: KeyCode) -> String {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        match code {
+            KeyCode::Char('u') => buf.clear(),
+            KeyCode::Char('w') => {
+                while buf.ends_with(' ') {
+                    buf.pop();
+                }
+                while !buf.is_empty() && !buf.ends_with(' ') {
+                    buf.pop();
+                }
+            }
+            _ => {}
+        }
+        return buf;
+    }
+    match code {
+        KeyCode::Backspace => {
+            buf.pop();
+        }
+        KeyCode::Char(c) => buf.push(c),
+        _ => {}
+    }
+    buf
+}
+
+/// Detect a true bitmap protocol once at startup. `Sextant` is the
+/// safe default — viuer's own block fallback is dimmer than our
+/// sextant rasterizer, so we'd rather skip viuer than let it pick
+/// that path.
+///
+/// Detection is two-tiered:
+/// 1. viuer's runtime queries (DA1 for sixel, kitty graphics ping,
+///    `$TERM_PROGRAM` for iTerm). Most accurate when they work,
+///    but they all rely on either a query/response round-trip or
+///    a local env var, so they often miss when SSH'd from a
+///    capable terminal to a server with a generic `$TERM`.
+/// 2. Environment-variable hints. Terminals like Ghostty, kitty,
+///    WezTerm, and iTerm leave fingerprints (`KITTY_WINDOW_ID`,
+///    `WEZTERM_PANE`, `GHOSTTY_RESOURCES_DIR`, `LC_TERMINAL`,
+///    `TERM_PROGRAM`) that survive an SSH session — `LC_*` is
+///    forwarded by default, the others if the user adds `SendEnv`
+///    to their `~/.ssh/config`. When any of those are set we
+///    optimistically pick Native; the `--image-backend sextant`
+///    override is the escape hatch if escapes get stripped (tmux
+///    on an old version, screen, etc.).
+fn detect_image_backend() -> ImageBackend {
+    let kitty = matches!(
+        viuer::get_kitty_support(),
+        viuer::KittySupport::Local | viuer::KittySupport::Remote
+    );
+    let iterm = viuer::is_iterm_supported();
+    let sixel = viuer::is_sixel_supported();
+    if kitty || iterm || sixel {
+        return ImageBackend::Native;
+    }
+    if env_hints_native_protocol() {
+        return ImageBackend::Native;
+    }
+    ImageBackend::Sextant
+}
+
+/// Inspect environment variables that capable terminals leave on a
+/// session — including some that survive SSH. Conservative on
+/// recognition (only known values) so we don't claim Native when a
+/// random tool happens to set `$TERM_PROGRAM`.
+fn env_hints_native_protocol() -> bool {
+    fn lower(name: &str) -> Option<String> {
+        std::env::var(name).ok().map(|s| s.to_ascii_lowercase())
+    }
+    // 1. Direct fingerprints — these are present only when the
+    //    matching terminal launched our session.
+    for var in ["KITTY_WINDOW_ID", "WEZTERM_PANE", "GHOSTTY_RESOURCES_DIR"] {
+        if std::env::var_os(var).is_some() {
+            return true;
+        }
+    }
+    // 2. iTerm's `LC_TERMINAL` is the gold standard for SSH
+    //    forwarding — `LC_*` is in OpenSSH's default `AcceptEnv`
+    //    pattern, so the value flows from laptop to server with no
+    //    config change.
+    if let Some(v) = lower("LC_TERMINAL") {
+        if v.contains("iterm") || v.contains("wezterm") {
+            return true;
+        }
+    }
+    // 3. `TERM_PROGRAM` is set locally by most modern terminals; it
+    //    only survives SSH if the user adds `SendEnv TERM_PROGRAM`
+    //    to `~/.ssh/config`, but when present it's authoritative.
+    if let Some(v) = lower("TERM_PROGRAM") {
+        if matches!(
+            v.as_str(),
+            "ghostty" | "kitty" | "iterm.app" | "wezterm" | "tabby" | "wayst"
+        ) {
+            return true;
+        }
+    }
+    // 4. `$TERM` itself — some terminfos identify a kitty-capable
+    //    surface (kitty itself sets `xterm-kitty`; some Ghostty
+    //    setups use `xterm-ghostty`).
+    if let Some(v) = lower("TERM") {
+        if v.contains("kitty") || v.contains("ghostty") || v.contains("wezterm") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Inner rect of a `BoxedPanel` that uses the bubble layout (the
+/// default — both side preview pane and modal). Mirrors
+/// `BoxedPanel::inner` for tall panels: cap row + top border + floor
+/// row eat 3 rows from the top, bottom border eats 1, and side
+/// borders each eat 1 column.
+fn bubble_panel_inner(rect: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    if rect.height < 5 {
+        // Falls back to flat layout for short panels — not relevant
+        // to our normal pane sizes but keeps the helper safe.
+        return ratatui::layout::Rect::new(
+            rect.x.saturating_add(1),
+            rect.y.saturating_add(1),
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(2),
+        );
+    }
+    ratatui::layout::Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(3),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(4),
+    )
+}
+
+/// Inner rect of a flat-layout `BoxedPanel` (used by the modal).
+fn flat_panel_inner(rect: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    ratatui::layout::Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    )
+}
+
+/// Compute the rect (in cells) where a native image should be
+/// painted this frame. Returns `None` if the current preview isn't
+/// a Ready image, the backend isn't Native, or the rect is degenerate.
+fn compute_native_image_rect(app: &App, area: ratatui::layout::Rect) -> Option<ratatui::layout::Rect> {
+    if app.image_backend() != ImageBackend::Native {
+        return None;
+    }
+    match app.preview_state() {
+        crate::preview::PreviewState::Ready { preview, .. } => {
+            if !matches!(preview.body, crate::preview::PreviewBody::Image(_)) {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let inner = if app.is_full_preview() {
+        let modal_w = ((area.width as u32 * 9 / 10) as u16).max(20);
+        let modal_h = ((area.height as u32 * 9 / 10) as u16).max(8);
+        let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+        let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+        let modal = ratatui::layout::Rect::new(modal_x, modal_y, modal_w, modal_h);
+        flat_panel_inner(modal)
+    } else {
+        let top = ratatui::layout::Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(1),
+        );
+        let rects = ui::split_main_columns(top);
+        let pane = rects.get(2).copied()?;
+        if pane.width == 0 {
+            return None;
+        }
+        bubble_panel_inner(pane)
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    Some(inner)
+}
+
+/// True when the key is a bare `g` (no modifiers) — the start of a
+/// jump chord. The chord is intercepted *before* `map_key` so we can
+/// retain `g` as the chord prefix without losing `gg` for top-of-list.
+fn is_jump_prefix(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('g'))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Recognize Ctrl-O / Ctrl-N as history navigation. Returns -1 for
+/// back, +1 for forward, None otherwise. We don't use Tab/Shift-Tab
+/// for history because Tab is already focus-toggle.
+fn is_history_key(key: KeyEvent) -> Option<i8> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('o') => Some(-1),
+        KeyCode::Char('n') => Some(1),
+        _ => None,
+    }
+}
+
+/// Resolve a `g`-chord bookmark character into a target path. The set
+/// is intentionally small for v1; user-defined bookmarks via config
+/// can layer on top later without breaking the resolver shape.
+fn resolve_bookmark(c: char, cwd: &Path) -> Option<PathBuf> {
+    match c {
+        'h' => std::env::var_os("HOME").map(PathBuf::from),
+        '/' => Some(PathBuf::from("/")),
+        't' => Some(PathBuf::from("/tmp")),
+        'r' => find_repo_root(cwd),
+        _ => None,
+    }
+}
+
+/// Walk up from `start` looking for a `.git` directory. Returns the
+/// deepest ancestor that contains one — the conventional "repo root."
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Push a SetTitle escape to the terminal so window managers / tab
+/// strips show "bobtop-fb: <basename>". Best-effort — terminals that
+/// don't honor the OSC sequence simply ignore it.
+fn update_terminal_title(cwd: &Path) {
+    let basename = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.display().to_string());
+    let title = if basename.is_empty() {
+        "bobtop-fb".to_string()
+    } else {
+        format!("bobtop-fb: {}", basename)
+    };
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&title));
+}
+
 /// Build a case-insensitive glob matcher for the filter input. Plain
 /// strings (no `*`, `?`, `[`) are wrapped as `*input*` so substring
 /// matching is the default. Returns None for malformed patterns —
@@ -151,10 +406,129 @@ pub struct App {
     /// pane the cursor is over.
     preview_pane_x_start: u16,
     preview_pane_x_end: u16,
+
+    /// `g` chord state — true when the user has pressed `g` and the
+    /// next key resolves a bookmark or `gg`/`gG` movement.
+    jump_pending: bool,
+    /// Bounded back/forward history. `history_pos` points at the
+    /// current cwd's slot — back decrements, forward increments.
+    /// `cd()` truncates anything past `history_pos` before pushing,
+    /// matching browser-history semantics.
+    history: Vec<PathBuf>,
+    history_pos: usize,
+    /// Filesystem watcher kept alive for the lifetime of the App.
+    /// Events arrive on `fs_rx`; the run loop drains it each tick
+    /// and triggers `refresh()` if anything fired.
+    _fs_watcher: Option<notify::RecommendedWatcher>,
+    fs_rx: Option<mpsc::Receiver<()>>,
+    /// Last mtime when we processed an FS event. Used to debounce
+    /// bursts (cargo build can fire dozens of events in <10 ms).
+    fs_dirty: bool,
+    /// Backend to use for image previews. Detected once at startup;
+    /// `Native` covers kitty / iTerm / sixel, anything else falls
+    /// back to our sextant-block rasterizer.
+    image_backend: ImageBackend,
+    /// Tracks the most recently-painted native image so we only
+    /// re-issue the escape codes when the path or rect changes.
+    /// Without this, terminals like sixel would flicker on every
+    /// frame.
+    last_image_paint: Option<(PathBuf, ratatui::layout::Rect)>,
+    /// Active input/confirm modal, if any. While Some, key events
+    /// route through `handle_input_modal_key` instead of normal
+    /// action dispatch.
+    input_modal: Option<InputModal>,
+    /// Recursive finder state. While Some, the list pane shows
+    /// finder results instead of the cwd entries; key events route
+    /// through `handle_finder_key` until Esc / Enter closes it.
+    finder: Option<FinderState>,
+    /// Transient status line shown in the action bar — used to flash
+    /// op results like "renamed", "trashed", or error messages.
+    /// Cleared after a few ticks so it doesn't linger.
+    status_message: Option<String>,
+    status_message_ticks: u8,
+}
+
+#[derive(Debug, Clone)]
+pub enum InputModal {
+    /// Rename `target` to `buffer`. Buffer is pre-filled with the
+    /// current name when the modal opens.
+    Rename { target: PathBuf, buffer: String },
+    /// Create a new empty file at `cwd / buffer`.
+    Touch { buffer: String },
+    /// Confirm sending `target` to trash. Recoverable, but the user
+    /// asked for a safety net so a slip on `d` doesn't reorganize
+    /// their filesystem.
+    ConfirmTrash { target: PathBuf },
+    /// Confirm permanent deletion of `target` — `y` deletes, anything
+    /// else cancels.
+    ConfirmHardDelete { target: PathBuf },
+}
+
+/// Which rasterization path the renderer should use for image bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBackend {
+    /// Unicode sextant blocks via our internal rasterizer. Always
+    /// works; supported by every modern monospace font.
+    Sextant,
+    /// Native bitmap protocol (kitty, iTerm2, or sixel) via viuer.
+    Native,
+}
+
+impl ImageBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageBackend::Sextant => "sextant",
+            ImageBackend::Native => "native",
+        }
+    }
+}
+
+/// State for the recursive finder overlay.
+#[derive(Debug, Clone)]
+pub struct FinderState {
+    pub input: String,
+    pub results: Vec<crate::find::FindResult>,
+    pub cursor: usize,
+    pub scroll: usize,
+}
+
+impl FinderState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            results: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+        }
+    }
+}
+
+impl Default for FinderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// User override for image backend selection. `Auto` uses runtime
+/// detection; the others force-enable a path so the user can verify
+/// what their terminal actually supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBackendChoice {
+    Auto,
+    Sextant,
+    Native,
 }
 
 impl App {
     pub fn new(start: PathBuf, theme: Theme) -> io::Result<Self> {
+        Self::new_with(start, theme, ImageBackendChoice::Auto)
+    }
+
+    pub fn new_with(
+        start: PathBuf,
+        theme: Theme,
+        backend_choice: ImageBackendChoice,
+    ) -> io::Result<Self> {
         let cwd = start.canonicalize().unwrap_or(start);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -163,7 +537,7 @@ impl App {
             .map_err(|e| io::Error::other(format!("tokio: {e}")))?;
         let (preview_tx, preview_rx) = mpsc::channel();
         let mut app = Self {
-            cwd,
+            cwd: cwd.clone(),
             all_entries: Vec::new(),
             entries: Vec::new(),
             nav: Nav::default(),
@@ -190,9 +564,27 @@ impl App {
             full_preview: false,
             preview_pane_x_start: 0,
             preview_pane_x_end: 0,
+            jump_pending: false,
+            history: vec![cwd.clone()],
+            history_pos: 0,
+            _fs_watcher: None,
+            fs_rx: None,
+            fs_dirty: false,
+            image_backend: match backend_choice {
+                ImageBackendChoice::Auto => detect_image_backend(),
+                ImageBackendChoice::Sextant => ImageBackend::Sextant,
+                ImageBackendChoice::Native => ImageBackend::Native,
+            },
+            last_image_paint: None,
+            input_modal: None,
+            finder: None,
+            status_message: None,
+            status_message_ticks: 0,
         };
+        app.start_watcher();
         app.refresh()?;
         app.request_preview();
+        update_terminal_title(&app.cwd);
         Ok(app)
     }
 
@@ -242,6 +634,41 @@ impl App {
 
     pub fn is_full_preview(&self) -> bool {
         self.full_preview
+    }
+
+    pub fn image_backend(&self) -> ImageBackend {
+        self.image_backend
+    }
+
+    pub fn input_modal(&self) -> Option<&InputModal> {
+        self.input_modal.as_ref()
+    }
+
+    pub fn finder(&self) -> Option<&FinderState> {
+        self.finder.as_ref()
+    }
+
+    pub fn is_finder_active(&self) -> bool {
+        self.finder.is_some()
+    }
+
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    fn flash_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        // ~1 second at 120 ms tick.
+        self.status_message_ticks = 8;
+    }
+
+    fn tick_status(&mut self) {
+        if self.status_message_ticks > 0 {
+            self.status_message_ticks -= 1;
+            if self.status_message_ticks == 0 {
+                self.status_message = None;
+            }
+        }
     }
 
     /// Recorded by the renderer once it knows the preview pane rect.
@@ -381,9 +808,128 @@ impl App {
 
     pub fn cd(&mut self, path: &Path) -> io::Result<()> {
         let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if target == self.cwd {
+            return Ok(());
+        }
+        // Truncate any forward history past the current position,
+        // then push. Matches browser back/forward semantics: a new
+        // navigation collapses the redo stack.
+        self.history.truncate(self.history_pos + 1);
+        self.history.push(target.clone());
+        self.history_pos = self.history.len() - 1;
+        // Cap to a reasonable depth so this doesn't grow unbounded
+        // for users who like to roam.
+        if self.history.len() > 64 {
+            let drop = self.history.len() - 64;
+            self.history.drain(0..drop);
+            self.history_pos = self.history_pos.saturating_sub(drop);
+        }
+        self.cd_internal(target)
+    }
+
+    /// `cd` without touching the history stack. Used by back/forward
+    /// navigation (which moves the pointer first, then jumps without
+    /// disturbing siblings).
+    fn cd_internal(&mut self, target: PathBuf) -> io::Result<()> {
         self.cwd = target;
         self.nav = Nav::default();
+        update_terminal_title(&self.cwd);
+        self.rewatch();
         self.refresh()
+    }
+
+    /// (Re-)create the filesystem watcher pointed at the current cwd.
+    /// Dropping the previous watcher implicitly stops the old watch.
+    fn start_watcher(&mut self) {
+        use notify::{recommended_watcher, RecursiveMode, Watcher};
+        let (tx, rx) = mpsc::channel();
+        let watcher = recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // We don't care about the event details — any change in
+            // the watched dir warrants a rescan. Errors are dropped
+            // so a transient inotify issue doesn't kill the watcher.
+            if res.is_ok() {
+                let _ = tx.send(());
+            }
+        });
+        match watcher {
+            Ok(mut w) => match w.watch(&self.cwd, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    self._fs_watcher = Some(w);
+                    self.fs_rx = Some(rx);
+                }
+                Err(_) => {
+                    self._fs_watcher = None;
+                    self.fs_rx = None;
+                }
+            },
+            Err(_) => {
+                self._fs_watcher = None;
+                self.fs_rx = None;
+            }
+        }
+    }
+
+    /// Tear down the old watcher and watch the new cwd. Called from
+    /// `cd_internal` so every cd carries a fresh watch.
+    fn rewatch(&mut self) {
+        self._fs_watcher = None;
+        self.fs_rx = None;
+        self.start_watcher();
+    }
+
+    /// Drain any pending fs events and mark the dir for refresh.
+    /// Returns true if a refresh is warranted.
+    fn drain_fs_events(&mut self) -> bool {
+        let Some(rx) = self.fs_rx.as_ref() else {
+            return false;
+        };
+        let mut got = false;
+        while rx.try_recv().is_ok() {
+            got = true;
+        }
+        if got {
+            self.fs_dirty = true;
+        }
+        got
+    }
+
+    fn history_back(&mut self) {
+        if self.history_pos == 0 {
+            return;
+        }
+        self.history_pos -= 1;
+        let target = self.history[self.history_pos].clone();
+        let _ = self.cd_internal(target);
+    }
+
+    fn history_forward(&mut self) {
+        if self.history_pos + 1 >= self.history.len() {
+            return;
+        }
+        self.history_pos += 1;
+        let target = self.history[self.history_pos].clone();
+        let _ = self.cd_internal(target);
+    }
+
+    pub fn jump_pending(&self) -> bool {
+        self.jump_pending
+    }
+
+    /// Process the second key of a `g`-prefixed chord.
+    pub fn handle_jump_key(&mut self, key: KeyEvent) {
+        self.jump_pending = false;
+        match key.code {
+            // `gg` — top of list, vim convention.
+            KeyCode::Char('g') => self.nav.home(),
+            // `gG` — bottom; mirrors `G` direct.
+            KeyCode::Char('G') => self.nav.end(self.entries.len()),
+            KeyCode::Char(c) => {
+                if let Some(path) = resolve_bookmark(c, &self.cwd) {
+                    let _ = self.cd(&path);
+                }
+            }
+            _ => {} // anything else cancels the chord silently.
+        }
     }
 
     /// Compute the preview for the currently selected entry.
@@ -567,6 +1113,36 @@ impl App {
                 // current filter so the user can edit it.
                 self.filter_input = Some(self.filter.clone().unwrap_or_default());
             }
+            Action::Trash => {
+                if let Some(entry) = self.selected() {
+                    self.input_modal = Some(InputModal::ConfirmTrash {
+                        target: entry.path.clone(),
+                    });
+                }
+            }
+            Action::HardDelete => {
+                if let Some(entry) = self.selected() {
+                    self.input_modal = Some(InputModal::ConfirmHardDelete {
+                        target: entry.path.clone(),
+                    });
+                }
+            }
+            Action::Rename => {
+                if let Some(entry) = self.selected() {
+                    self.input_modal = Some(InputModal::Rename {
+                        target: entry.path.clone(),
+                        buffer: entry.name.clone(),
+                    });
+                }
+            }
+            Action::Touch => {
+                self.input_modal = Some(InputModal::Touch {
+                    buffer: String::new(),
+                });
+            }
+            Action::StartFind => {
+                self.finder = Some(FinderState::new());
+            }
             Action::ParentDir => {
                 if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
                     let _ = self.cd(&parent);
@@ -660,6 +1236,262 @@ impl App {
         false
     }
 
+    pub fn is_input_modal(&self) -> bool {
+        self.input_modal.is_some()
+    }
+
+    /// Process a key while the finder overlay is open.
+    pub fn handle_finder_key(&mut self, key: KeyEvent) {
+        let Some(mut finder) = self.finder.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Drop the overlay; cursor on the underlying list
+                // pane is preserved.
+                return;
+            }
+            KeyCode::Enter => {
+                // Open: cd to the selected result's parent and put
+                // the list cursor on its row. Closes the overlay.
+                if let Some(result) = finder.results.get(finder.cursor).cloned() {
+                    let abs = self.cwd.join(&result.rel);
+                    if result.is_dir {
+                        let _ = self.cd(&abs);
+                    } else if let Some(parent) = abs.parent() {
+                        let _ = self.cd(parent);
+                        if let Some(idx) = self.entries.iter().position(|e| e.path == abs) {
+                            self.nav.jump_to(idx, self.entries.len());
+                            self.request_preview();
+                        }
+                    }
+                }
+                return; // overlay closed
+            }
+            KeyCode::Up => {
+                if finder.cursor > 0 {
+                    finder.cursor -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if finder.cursor + 1 < finder.results.len() {
+                    finder.cursor += 1;
+                }
+            }
+            other => {
+                let prior = finder.input.clone();
+                finder.input = edit_buffer(finder.input.clone(), key.modifiers, other);
+                if finder.input != prior {
+                    let cwd = self.cwd.clone();
+                    let show_hidden = self.show_hidden;
+                    finder.results = if finder.input.is_empty() {
+                        Vec::new()
+                    } else {
+                        crate::find::search(
+                            &cwd,
+                            &finder.input,
+                            show_hidden,
+                            crate::find::FindLimits::default(),
+                        )
+                    };
+                    finder.cursor = 0;
+                    finder.scroll = 0;
+                }
+            }
+        }
+        // Auto-scroll so the cursor stays visible — cheap math, no
+        // need to thread the viewport height back.
+        let viewport_h = self.list_viewport_h.max(1);
+        if finder.cursor < finder.scroll {
+            finder.scroll = finder.cursor;
+        } else if finder.cursor >= finder.scroll + viewport_h {
+            finder.scroll = finder.cursor + 1 - viewport_h;
+        }
+        // Live-preview the highlighted result so the preview pane
+        // stays in sync with what the user is browsing.
+        let preview_path = finder
+            .results
+            .get(finder.cursor)
+            .map(|r| self.cwd.join(&r.rel));
+        self.finder = Some(finder);
+        if let Some(path) = preview_path {
+            self.request_preview_for(&path);
+        }
+    }
+
+    /// Same as `request_preview` but targets an arbitrary path
+    /// instead of the currently-selected list entry. Used by the
+    /// finder to preview a result row without changing cwd.
+    fn request_preview_for(&mut self, path: &Path) {
+        if matches!(&self.preview_state, PreviewState::Ready { path: p, .. } | PreviewState::Loading(p) | PreviewState::Error { path: p, .. } if *p == *path)
+        {
+            return;
+        }
+        self.preview_scroll = 0;
+        if let Some(cached) = self.preview_cache.get(&path.to_path_buf()) {
+            self.preview_state = PreviewState::Ready {
+                path: path.to_path_buf(),
+                preview: cached,
+            };
+            return;
+        }
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        let gen = self.preview_gen;
+        self.preview_state = PreviewState::Loading(path.to_path_buf());
+        let tx = self.preview_tx.clone();
+        let limits = self.preview_limits;
+        let task_path = path.to_path_buf();
+        self.rt.spawn_blocking(move || {
+            let outcome = preview::render_blocking(&task_path, limits);
+            let _ = tx.send(PreviewResult {
+                generation: gen,
+                path: task_path,
+                outcome,
+            });
+        });
+    }
+
+    /// Process a key while an input/confirm modal is open. Returns
+    /// false (never quits) — the run loop only quits via Action::Quit.
+    pub fn handle_input_modal_key(&mut self, key: KeyEvent) {
+        let Some(modal) = self.input_modal.take() else {
+            return;
+        };
+        // Esc cancels every modal.
+        if matches!(key.code, KeyCode::Esc) {
+            return;
+        }
+        match modal {
+            InputModal::ConfirmTrash { target } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.run_trash(&target);
+                }
+                _ => {} // anything else cancels.
+            },
+            InputModal::ConfirmHardDelete { target } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.run_hard_delete(&target);
+                }
+                _ => {} // anything else cancels.
+            },
+            InputModal::Rename { target, buffer } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        self.run_rename(&target, &buffer);
+                    }
+                    other => {
+                        // Edit then re-stash; modal stays open until
+                        // Enter or Esc.
+                        let new_buf = edit_buffer(buffer, key.modifiers, other);
+                        self.input_modal = Some(InputModal::Rename {
+                            target,
+                            buffer: new_buf,
+                        });
+                    }
+                }
+            }
+            InputModal::Touch { buffer } => match key.code {
+                KeyCode::Enter => {
+                    self.run_touch(&buffer);
+                }
+                other => {
+                    let new_buf = edit_buffer(buffer, key.modifiers, other);
+                    self.input_modal = Some(InputModal::Touch { buffer: new_buf });
+                }
+            },
+        }
+    }
+
+    fn run_rename(&mut self, target: &Path, new_name: &str) {
+        if new_name.is_empty() || new_name.contains('/') {
+            self.flash_status("rename: invalid name");
+            return;
+        }
+        let parent = match target.parent() {
+            Some(p) => p,
+            None => {
+                self.flash_status("rename: no parent");
+                return;
+            }
+        };
+        let dest = parent.join(new_name);
+        if dest == target {
+            return; // no-op.
+        }
+        if dest.exists() {
+            self.flash_status("rename: target exists");
+            return;
+        }
+        match std::fs::rename(target, &dest) {
+            Ok(()) => {
+                self.flash_status(format!("renamed → {}", new_name));
+                self.preview_cache.invalidate(&target.to_path_buf());
+                let _ = self.refresh();
+                // Move cursor onto the renamed entry so it stays
+                // selected after the dir re-sorts.
+                if let Some(idx) = self.entries.iter().position(|e| e.path == dest) {
+                    self.nav.jump_to(idx, self.entries.len());
+                    self.request_preview();
+                }
+            }
+            Err(e) => self.flash_status(format!("rename: {}", e)),
+        }
+    }
+
+    fn run_touch(&mut self, name: &str) {
+        if name.is_empty() || name.contains('/') {
+            self.flash_status("touch: invalid name");
+            return;
+        }
+        let dest = self.cwd.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
+            Ok(_) => {
+                self.flash_status(format!("created {}", name));
+                let _ = self.refresh();
+                if let Some(idx) = self.entries.iter().position(|e| e.path == dest) {
+                    self.nav.jump_to(idx, self.entries.len());
+                    self.request_preview();
+                }
+            }
+            Err(e) => self.flash_status(format!("touch: {}", e)),
+        }
+    }
+
+    fn run_trash(&mut self, target: &Path) {
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.display().to_string());
+        match trash::delete(target) {
+            Ok(()) => {
+                self.flash_status(format!("trashed {}", name));
+                self.preview_cache.invalidate(&target.to_path_buf());
+                let _ = self.refresh();
+            }
+            Err(e) => self.flash_status(format!("trash: {}", e)),
+        }
+    }
+
+    fn run_hard_delete(&mut self, target: &Path) {
+        let result = if target.is_dir() {
+            std::fs::remove_dir_all(target)
+        } else {
+            std::fs::remove_file(target)
+        };
+        match result {
+            Ok(()) => {
+                self.flash_status("deleted");
+                self.preview_cache.invalidate(&target.to_path_buf());
+                let _ = self.refresh();
+            }
+            Err(e) => self.flash_status(format!("delete: {}", e)),
+        }
+    }
+
     fn scroll_preview(&mut self, delta: isize) {
         let total = self.preview_total_lines();
         // Route to whichever scroll state owns the active view. Side
@@ -682,9 +1514,61 @@ impl App {
         *target = next.clamp(0, max_top as isize) as usize;
     }
 
+    /// Issue the native image paint for the current frame if the
+    /// (path, rect) pair changed since last frame. Errors are
+    /// swallowed — a failed paint shouldn't kill the run loop, and
+    /// if the protocol stops working mid-session the user can press
+    /// `r` to refresh.
+    fn maybe_paint_native_image(&mut self) -> Result<()> {
+        let area = ratatui::layout::Rect::new(
+            0,
+            0,
+            crossterm::terminal::size().map(|s| s.0).unwrap_or(80),
+            crossterm::terminal::size().map(|s| s.1).unwrap_or(24),
+        );
+        let want_rect = compute_native_image_rect(self, area);
+        let want_path = match (self.preview_state(), want_rect) {
+            (crate::preview::PreviewState::Ready { path, .. }, Some(_)) => Some(path.clone()),
+            _ => None,
+        };
+        let want = match (want_path, want_rect) {
+            (Some(p), Some(r)) => Some((p, r)),
+            _ => None,
+        };
+        if want == self.last_image_paint {
+            return Ok(());
+        }
+        if let Some((path, rect)) = &want {
+            let conf = viuer::Config {
+                x: rect.x,
+                y: rect.y as i16,
+                width: Some(rect.width as u32),
+                height: Some(rect.height as u32),
+                absolute_offset: true,
+                use_kitty: true,
+                use_iterm: true,
+                ..Default::default()
+            };
+            // print_from_file errors when the protocol isn't
+            // actually supported; we already gated on detect, but
+            // be defensive — drop on error rather than panic.
+            let _ = viuer::print_from_file(path, &conf);
+        }
+        self.last_image_paint = want;
+        Ok(())
+    }
+
     pub fn run<B: Backend + std::io::Write>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
+            self.tick_status();
             self.drain_results();
+            if self.drain_fs_events() {
+                // The 120 ms event-poll tick acts as natural debounce
+                // — a burst of inotify events (cargo build can fire
+                // dozens) collapses into one refresh per tick.
+                let _ = self.refresh();
+                self.fs_dirty = false;
+            }
             terminal.draw(|frame| {
                 let area = frame.area();
                 // Both panes share the same vertical chrome budget
@@ -717,11 +1601,58 @@ impl App {
                 }
                 ui::draw(self, frame, &self.theme);
             })?;
+            // After ratatui's draw flushes, paint the native image
+            // on top (kitty / iTerm / sixel only). We only re-issue
+            // when the (path, rect) changed since the last frame so
+            // sixel doesn't flicker. The image cells in ratatui's
+            // buffer stay as inert spaces — its diff renderer won't
+            // touch them on the next frame, so the protocol's image
+            // overlay persists between repaints.
+            self.maybe_paint_native_image()?;
             if event::poll(Duration::from_millis(120))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        if self.is_filter_input() {
+                        if self.is_input_modal() {
+                            // Quit shortcut still works while a modal
+                            // is open so the user can always escape
+                            // the app.
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_input_modal_key(key);
+                        } else if self.is_finder_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_finder_key(key);
+                        } else if self.is_filter_input() {
                             self.handle_filter_key(key);
+                        } else if self.is_full_preview() {
+                            // Modal preempts chord/history routing —
+                            // jump out of the special interceptors so
+                            // navigation can't sneak past the modal.
+                            let action = map_key(key);
+                            if self.handle(action) {
+                                return Ok(());
+                            }
+                        } else if self.jump_pending() {
+                            self.handle_jump_key(key);
+                        } else if is_jump_prefix(key) {
+                            // Start of a `g`-chord — wait for the
+                            // second key. Cancellable by any non-
+                            // matching key in `handle_jump_key`.
+                            self.jump_pending = true;
+                        } else if let Some(direction) = is_history_key(key) {
+                            if direction < 0 {
+                                self.history_back();
+                            } else {
+                                self.history_forward();
+                            }
+                            self.request_preview();
                         } else {
                             let action = map_key(key);
                             if self.handle(action) {

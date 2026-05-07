@@ -17,7 +17,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, ImageBackend, InputModal};
+use crate::find::FindResult;
 
 /// Three-column miller layout shared between the renderer and the
 /// run loop's mouse-routing math. Returns one rect per column.
@@ -49,6 +50,69 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
     if app.is_full_preview() {
         draw_preview_modal(app, frame, theme, area);
     }
+    if let Some(modal) = app.input_modal() {
+        draw_input_modal(modal, frame, theme, area);
+    }
+}
+
+fn target_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// Centered input/confirm modal for rename / touch / hard-delete.
+/// Smaller than the preview modal — just a single-line input or a
+/// short prompt — but uses the same `ModalShell` chrome so themes
+/// stay consistent.
+fn draw_input_modal(modal: &InputModal, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    let (title, body_lines, controls) = match modal {
+        InputModal::Rename { buffer, .. } => (
+            "rename",
+            vec![Line::from(format!("→ {}▏", buffer))],
+            "Enter confirm  •  Esc cancel",
+        ),
+        InputModal::Touch { buffer } => (
+            "new file",
+            vec![Line::from(format!("→ {}▏", buffer))],
+            "Enter create  •  Esc cancel",
+        ),
+        InputModal::ConfirmTrash { target } => (
+            "send to trash?",
+            vec![
+                Line::from(target_name(target)),
+                Line::from(""),
+                Line::from("Recoverable from your system trash."),
+            ],
+            "y / Enter  trash  •  Esc cancel",
+        ),
+        InputModal::ConfirmHardDelete { target } => (
+            "permanent delete?",
+            vec![
+                Line::from(target_name(target)),
+                Line::from(""),
+                Line::from("This cannot be undone."),
+            ],
+            "y delete  •  any other key cancel",
+        ),
+    };
+    let panel = BoxedPanel::new(theme.proc_box, theme.title)
+        .with_title(title.to_string())
+        .with_controls(controls.to_string())
+        .flat();
+    let modal_w = ((area.width as u32 * 6 / 10) as u16).clamp(32, 80);
+    let modal_h = (body_lines.len() as u16 + 4).max(6);
+    let bg = theme.main_bg.unwrap_or(Color::Black);
+    let shell = ModalShell::new(panel, modal_w, modal_h)
+        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
+    let Some(body) = shell.render(frame, area) else {
+        return;
+    };
+    if body.height == 0 {
+        return;
+    }
+    let preview = ScrollableText::new(&body_lines, theme).with_line_numbers(false);
+    frame.render_widget(&preview, body);
 }
 
 /// Border color for a pane based on focus. Active pane uses its
@@ -73,6 +137,10 @@ fn split_top_bottom(area: Rect, bottom_h: u16) -> (Rect, Rect) {
 
 fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(finder) = app.finder() {
+        draw_finder_pane(app, finder, frame, theme, area);
         return;
     }
     let title = app.cwd_display();
@@ -101,6 +169,39 @@ fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     let table = Table::new(&columns, &rows, theme)
         .with_selection(Some(app.nav().cursor), app.nav().scroll);
     frame.render_widget(&table, inner);
+}
+
+fn draw_finder_pane(
+    app: &App,
+    finder: &crate::app::FinderState,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+) {
+    let bcol = border_color(theme, app.focus() == Focus::List, theme.proc_box);
+    let panel = BoxedPanel::new(bcol, theme.title)
+        .with_title(format!("🔍 find: {}▏", finder.input))
+        .with_controls(format!("{} results", finder.results.len()));
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.height == 0 {
+        return;
+    }
+    let cols = vec![Column::new("", u16::MAX)];
+    let rows = build_find_rows(&finder.results);
+    let table = Table::new(&cols, &rows, theme)
+        .with_selection(Some(finder.cursor), finder.scroll);
+    frame.render_widget(&table, inner);
+}
+
+fn build_find_rows(results: &[FindResult]) -> Vec<Row<'static>> {
+    results
+        .iter()
+        .map(|r| {
+            let prefix = if r.is_dir { "📁 " } else { "   " };
+            Row::data(vec![Cell::new(format!("{}{}", prefix, r.rel.display()))])
+        })
+        .collect()
 }
 
 fn draw_parent_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
@@ -170,7 +271,7 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
             let mut hint = match preview.kind {
                 crate::preview::PreviewKind::Text => format!("{} lines", preview.source_lines),
                 crate::preview::PreviewKind::Markdown => "markdown".into(),
-                crate::preview::PreviewKind::Image => "image".into(),
+                crate::preview::PreviewKind::Image => format!("image · {}", app.image_backend().label()),
                 crate::preview::PreviewKind::Empty => "empty".into(),
                 crate::preview::PreviewKind::TooLarge => "too large".into(),
                 crate::preview::PreviewKind::Binary => "binary".into(),
@@ -220,7 +321,18 @@ fn render_preview_body(
 ) {
     let final_lines: Vec<Line<'static>> = match app.preview_state() {
         crate::preview::PreviewState::Ready { preview, .. } => match &preview.body {
-            crate::preview::PreviewBody::Image(img) => rasterize_image(img, inner),
+            crate::preview::PreviewBody::Image(img) => {
+                if app.image_backend() == ImageBackend::Native {
+                    // Native protocols paint the bitmap as an overlay
+                    // *after* terminal.draw() flushes. Leave the body
+                    // empty so ratatui's diff renderer doesn't write
+                    // changing content into those cells (which would
+                    // otherwise erase the protocol's image).
+                    Vec::new()
+                } else {
+                    rasterize_image(img, inner)
+                }
+            }
             _ => fallback_lines,
         },
         _ => fallback_lines,
@@ -465,20 +577,61 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     if area.height == 0 {
         return;
     }
+    // Transient op-result flashes preempt the normal hint chips so
+    // the user sees feedback without losing the row to a tooltip.
+    if let Some(msg) = app.status_message() {
+        let bar = ActionBar::new(vec![("·".into(), msg.to_string())]).with_colors(
+            theme.div_line,
+            theme.hi_fg,
+            theme.main_fg,
+            theme.selected_bg,
+        );
+        frame.render_widget(&bar, area);
+        return;
+    }
     let move_label: &str = match app.focus() {
         Focus::List => "move",
         Focus::Preview => "scroll",
     };
-    let actions: Vec<(String, String)> = vec![
-        ("Tab".into(), "focus".into()),
-        ("Space".into(), "fullscreen".into()),
-        ("/".into(), "filter".into()),
-        ("h/l".into(), "parent / open".into()),
-        ("j/k".into(), move_label.into()),
-        ("g/G".into(), "top / bottom".into()),
-        (".".into(), "toggle hidden".into()),
-        ("q".into(), "quit".into()),
-    ];
+    if app.is_finder_active() {
+        let bar = ActionBar::new(vec![
+            ("type".into(), "filter".into()),
+            ("↑↓".into(), "select".into()),
+            ("Enter".into(), "open".into()),
+            ("Esc".into(), "close".into()),
+        ])
+        .with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+        frame.render_widget(&bar, area);
+        return;
+    }
+    let actions: Vec<(String, String)> = if app.jump_pending() {
+        // While the chord is pending the action bar shifts to a hint
+        // for which keys are valid second-presses. Mirrors what yazi
+        // does to make the chord feel discoverable.
+        vec![
+            ("g…".into(), "jump:".into()),
+            ("h".into(), "home".into()),
+            ("/".into(), "/".into()),
+            ("t".into(), "/tmp".into()),
+            ("r".into(), "repo".into()),
+            ("g".into(), "top".into()),
+            ("Esc".into(), "cancel".into()),
+        ]
+    } else {
+        vec![
+            ("Tab".into(), "focus".into()),
+            ("Space".into(), "full".into()),
+            ("/".into(), "filter".into()),
+            ("g_".into(), "jump".into()),
+            ("h/l".into(), "parent/open".into()),
+            ("j/k".into(), move_label.into()),
+            ("f".into(), "find".into()),
+            ("a".into(), "new".into()),
+            ("r".into(), "rename".into()),
+            ("d/D".into(), "trash/del".into()),
+            ("q".into(), "quit".into()),
+        ]
+    };
     let bar = ActionBar::new(actions).with_colors(
         theme.div_line,
         theme.hi_fg,

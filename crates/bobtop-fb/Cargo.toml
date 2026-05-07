@@ -38,3 +38,16 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # actually browse — the full feature flag pulls TIFF/HDR/etc. that we
 # don't need and add ~1 MB to the binary.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+# Live refresh — watch the cwd so file changes show up without
+# manual `r`. We only need a "something changed" signal, so the
+# default backend (inotify on Linux, kqueue on macOS) is fine.
+notify = "6"
+# XDG Trash on Linux, ~/.Trash on macOS, Recycle Bin on Windows.
+# Used by `d` so deletion is recoverable; hard `rm` is gated behind
+# Shift-D + a confirm modal.
+trash = "5"
+# Native image protocols (kitty / iTerm / sixel). We use viuer's
+# protocol detection but only call it when a real bitmap protocol
+# is available — otherwise we keep our sextant-block path, which
+# looks better than viuer's own half-block fallback.
+viuer = { version = "0.9", default-features = false, features = ["sixel", "print-file"] }
