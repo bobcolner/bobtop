@@ -92,10 +92,25 @@ pub fn format_bytes_compact(b: u64) -> String {
 }
 
 pub fn format_rate(bps: f64) -> String {
-    if bps >= 1024.0 * 1024.0 {
-        format!("{:.1}M", bps / (1024.0 * 1024.0))
-    } else if bps >= 1024.0 {
-        format!("{:.0}K", bps / 1024.0)
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    if bps >= GIB {
+        // Process-table columns are tight (≤6 chars). Drop the
+        // decimal once we cross 10G so "12G" wins over "12.3G".
+        if bps >= 10.0 * GIB {
+            format!("{:.0}G", bps / GIB)
+        } else {
+            format!("{:.1}G", bps / GIB)
+        }
+    } else if bps >= MIB {
+        if bps >= 10.0 * MIB {
+            format!("{:.0}M", bps / MIB)
+        } else {
+            format!("{:.1}M", bps / MIB)
+        }
+    } else if bps >= KIB {
+        format!("{:.0}K", bps / KIB)
     } else {
         format!("{:.0}B", bps)
     }
@@ -136,6 +151,13 @@ mod tests {
     fn formats_rates() {
         assert_eq!(format_rate(0.0), "0B");
         assert_eq!(format_rate(1024.0), "1K");
+        // Mid-range: keep one decimal so 1.5M doesn't read as 2M.
+        assert_eq!(format_rate(1.5 * 1024.0 * 1024.0), "1.5M");
+        // Above 10x, drop the decimal — "12M" is tighter than "12.3M".
+        assert_eq!(format_rate(12.3 * 1024.0 * 1024.0), "12M");
+        // Promote to GiB once we cross the threshold.
+        assert_eq!(format_rate(2.0 * 1024.0 * 1024.0 * 1024.0), "2.0G");
+        assert_eq!(format_rate(15.6 * 1024.0 * 1024.0 * 1024.0), "16G");
     }
 
     #[test]

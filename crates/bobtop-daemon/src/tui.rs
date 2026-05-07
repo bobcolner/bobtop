@@ -19,7 +19,7 @@ use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -49,7 +49,17 @@ pub fn init_terminal() -> io::Result<Term> {
     // on, kitty, alacritty, et) deliver Event::FocusGained on session
     // resume — that's our cue to force-clear the screen and repaint
     // because ratatui's diff buffer no longer matches reality.
-    execute!(stdout, EnterAlternateScreen, EnableFocusChange, Hide)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableFocusChange,
+        Hide,
+        // Tab / window title: just "bobtop" while we own the terminal.
+        // Window managers and tmux pick this up via OSC 0; the file
+        // browser overrides it to "bobtop-fb · <cwd>" when launched
+        // and we re-set it on resume via re_init_terminal.
+        SetTitle("bobtop"),
+    )?;
     install_panic_hook();
     let term = Terminal::new(CrosstermBackend::new(stdout))?;
     guard.disarm();
@@ -92,7 +102,15 @@ pub fn restore_terminal(term: &mut Term) -> io::Result<()> {
 /// resyncs against whatever the terminal shows now.
 pub fn re_init_terminal(term: &mut Term) -> io::Result<()> {
     enable_raw_mode()?;
-    execute!(term.backend_mut(), EnterAlternateScreen, EnableFocusChange, Hide)?;
+    execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        EnableFocusChange,
+        Hide,
+        // Restore the title — the subprocess we're returning from
+        // (`bobtop fb`, `$EDITOR`) will have stamped its own.
+        SetTitle("bobtop"),
+    )?;
     term.clear()?;
     Ok(())
 }
