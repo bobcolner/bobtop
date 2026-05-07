@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{AttributorTier, DiskAttributorTier, ProcessDiskSample, ProcessNetSample};
+use crate::{
+    AttributorTier, ConnectionInfo, DiskAttributorTier, ProcessDiskSample, ProcessNetSample,
+};
 
 /// Compact per-pid net rate. Bandwidth fields are `Option<f64>` because
 /// Tier 1 backends can enumerate connections but can't measure bytes —
@@ -23,6 +25,20 @@ use crate::{AttributorTier, DiskAttributorTier, ProcessDiskSample, ProcessNetSam
 pub struct NetAttribution {
     pub rx_bytes_per_sec: Option<f64>,
     pub tx_bytes_per_sec: Option<f64>,
+}
+
+/// One row of the flow view: a pid + a single connection it owns.
+/// Built by flattening every active `ProcessNetSample.connections` —
+/// downstream consumers (the flow panel, the agent) iterate this
+/// directly rather than re-traversing the per-pid map.
+#[derive(Debug, Clone)]
+pub struct FlowRow {
+    pub pid: u32,
+    /// Process name at sample time. Stored on each row so flow tables
+    /// don't need to dereference back into the live process table —
+    /// the flow may outlive the process by one tick.
+    pub name: String,
+    pub conn: ConnectionInfo,
 }
 
 /// Compact per-pid disk rate. `None` rates fall back to whatever the
@@ -40,6 +56,12 @@ pub struct DiskAttribution {
 pub struct AttributionState {
     pub net: HashMap<u32, NetAttribution>,
     pub disk: HashMap<u32, DiskAttribution>,
+    /// Flat list of every (pid, connection) pair from the latest net
+    /// sample. Replaced wholesale on each `set_net` call so stale flows
+    /// from departed pids drop out automatically. Kept flat (rather
+    /// than `HashMap<pid, Vec<ConnectionInfo>>`) so the flow panel can
+    /// iterate, sort, and render without an extra hash lookup per row.
+    pub flows: Vec<FlowRow>,
     /// Active net tier; surfaced on the wire so consumers can interpret
     /// `None` bandwidth fields ("Tier 1 can't measure" vs. "warming up").
     pub net_tier: AttributorTier,
@@ -71,7 +93,13 @@ impl AttributionStore {
             .unwrap_or_else(|p| p.into_inner());
         g.net.clear();
         g.net.reserve(samples.len());
-        for s in &samples {
+        g.flows.clear();
+        // Flatten all (pid, conn) pairs in one pass so the flow view
+        // gets a coherent snapshot — important when the active tier
+        // emits thousands of connections (servers under load).
+        let total_conns: usize = samples.iter().map(|s| s.connections.len()).sum();
+        g.flows.reserve(total_conns);
+        for s in samples {
             g.net.insert(
                 s.pid,
                 NetAttribution {
@@ -79,6 +107,13 @@ impl AttributionStore {
                     tx_bytes_per_sec: s.tx_bytes_per_sec,
                 },
             );
+            for conn in s.connections {
+                g.flows.push(FlowRow {
+                    pid: s.pid,
+                    name: s.name.clone(),
+                    conn,
+                });
+            }
         }
         g.net_tier = tier;
     }
@@ -125,6 +160,14 @@ impl AttributionStore {
     /// Active net tier (defaults to `Unavailable` until first set).
     pub fn net_tier(&self) -> AttributorTier {
         self.read(|s| s.net_tier)
+    }
+
+    /// Snapshot the current flow list. Returns an owned copy so the
+    /// caller can sort/filter without holding the read lock — flow
+    /// counts run into the low thousands at most, so the clone is
+    /// cheap relative to the render work the panel does next.
+    pub fn flows(&self) -> Vec<FlowRow> {
+        self.read(|s| s.flows.clone())
     }
 
     /// Active disk tier (defaults to `Unavailable` until first set).
@@ -182,6 +225,78 @@ mod tests {
         let a = s.disk_for(7).unwrap();
         assert_eq!(a.read_bytes_per_sec, Some(1024.0));
         assert_eq!(a.write_bytes_per_sec, Some(2048.0));
+    }
+
+    fn n_with_conns(
+        pid: u32,
+        rx: Option<f64>,
+        tx: Option<f64>,
+        conns: Vec<ConnectionInfo>,
+    ) -> ProcessNetSample {
+        ProcessNetSample {
+            pid,
+            name: format!("p{pid}"),
+            rx_bytes_per_sec: rx,
+            tx_bytes_per_sec: tx,
+            connections: conns,
+            attributor_tier: AttributorTier::ProcInode,
+        }
+    }
+
+    fn conn_v4(local_port: u16, remote_port: u16) -> ConnectionInfo {
+        use crate::sample::AddrEndpoint;
+        use std::net::Ipv4Addr;
+        ConnectionInfo {
+            local: AddrEndpoint::V4 {
+                addr: Ipv4Addr::new(127, 0, 0, 1),
+                port: local_port,
+            },
+            remote: AddrEndpoint::V4 {
+                addr: Ipv4Addr::new(8, 8, 8, 8),
+                port: remote_port,
+            },
+            state: crate::sample::SocketState::Established,
+            protocol: crate::sample::Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn set_net_flattens_connections_into_flow_view() {
+        let s = AttributionStore::new();
+        s.set_net(
+            vec![
+                n_with_conns(
+                    10,
+                    Some(1000.0),
+                    None,
+                    vec![conn_v4(1234, 80), conn_v4(1234, 443)],
+                ),
+                n_with_conns(20, None, None, vec![conn_v4(5678, 22)]),
+            ],
+            AttributorTier::ProcInode,
+        );
+        let flows = s.flows();
+        assert_eq!(flows.len(), 3, "all connections must appear");
+        assert!(flows.iter().any(|f| f.pid == 10 && f.conn.remote.port() == 80));
+        assert!(flows.iter().any(|f| f.pid == 10 && f.conn.remote.port() == 443));
+        assert!(flows.iter().any(|f| f.pid == 20 && f.conn.remote.port() == 22));
+        assert!(flows.iter().all(|f| !f.name.is_empty()));
+    }
+
+    #[test]
+    fn set_net_drops_stale_flows_from_departed_pids() {
+        let s = AttributionStore::new();
+        s.set_net(
+            vec![n_with_conns(99, None, None, vec![conn_v4(1, 2)])],
+            AttributorTier::ProcInode,
+        );
+        assert_eq!(s.flows().len(), 1);
+        // Re-publish without pid 99 — its flow row must vanish.
+        s.set_net(
+            vec![n_with_conns(100, None, None, vec![])],
+            AttributorTier::ProcInode,
+        );
+        assert!(s.flows().is_empty(), "stale pid's flows linger");
     }
 
     #[test]

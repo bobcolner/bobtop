@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
 
     app.net_tier = meta.net_tier;
     app.disk_tier = meta.disk_tier;
+    app.attribution = Some(engine.attribution.clone());
     let app = Arc::new(Mutex::new(app));
 
     tracing::warn!(

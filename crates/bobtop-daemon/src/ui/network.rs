@@ -4,12 +4,12 @@ use bobtop_collectors::{classify_interface, NetInterfaceKind};
 use bobtop_core::sample::InterfaceSample;
 use bobtop_tui::widgets::{BrailleGraph, DualMode, GraphStyle, Trace};
 use bobtop_tui::widgets::panel as boxed_panel;
-use bobtop_tui::{format_rate, truncate_chars, write_str_at};
+use bobtop_tui::{format_rate, truncate_chars, write_str_at, write_str_clipped};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, NetworkPanelVariant};
 
 use super::presenter;
 
@@ -19,6 +19,10 @@ use super::presenter;
 const MIN_GRAPH_H: u16 = 4;
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
+    if app.network_panel == NetworkPanelVariant::Flows {
+        draw_flows(frame, area, app);
+        return;
+    }
     let (rx_now, tx_now) = current_rates(app);
     let (counted, total) = interface_counts(app);
     let scale = app.net_scale_bps();
@@ -223,6 +227,151 @@ fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, _rx_now: f6
         let cell = &mut buf[(inner.x + x, div_y)];
         cell.set_char('─');
         cell.set_style(style);
+    }
+}
+
+/// Per-flow table view of network activity. Shows every (pid, conn)
+/// pair the active attributor reported, joined with the per-pid byte
+/// rates from the same store. Bytes are pid-aggregate for v1 — true
+/// per-flow byte attribution would require extending the eBPF program
+/// to key on (pid, 5-tuple).
+fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
+    let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
+        .with_title("net · flows".to_string())
+        .with_controls("press N to switch back".to_string());
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.width < 20 || inner.height < 2 {
+        return;
+    }
+
+    let Some(store) = app.attribution.as_ref() else {
+        write_str_clipped(
+            frame.buffer_mut(),
+            inner.x,
+            inner.y,
+            "(per-pid attribution unavailable)",
+            inner.width,
+            Style::default().fg(app.theme.inactive_fg),
+        );
+        return;
+    };
+    let mut flows = store.flows();
+    if flows.is_empty() {
+        write_str_clipped(
+            frame.buffer_mut(),
+            inner.x,
+            inner.y,
+            "(no active connections)",
+            inner.width,
+            Style::default().fg(app.theme.inactive_fg),
+        );
+        return;
+    }
+
+    // Established connections first; within state, by pid for stability.
+    flows.sort_by(|a, b| {
+        let a_est = a.conn.state == bobtop_pid_attr::SocketState::Established;
+        let b_est = b.conn.state == bobtop_pid_attr::SocketState::Established;
+        b_est.cmp(&a_est).then_with(|| a.pid.cmp(&b.pid))
+    });
+
+    // Header row uses the panel's title style for clarity.
+    let header_style = Style::default()
+        .fg(app.theme.title)
+        .add_modifier(Modifier::BOLD);
+    let row_style = Style::default().fg(app.theme.main_fg);
+    let buf = frame.buffer_mut();
+    // Layout (chars): pid 6 · proc 14 · local 22 · remote 22 · state 6 · ↓/s 11 · ↑/s 11
+    // Total 92; we clip to whatever the panel gives us.
+    let cols: [(u16, &str); 7] = [
+        (6, "PID"),
+        (14, "PROC"),
+        (22, "LOCAL"),
+        (22, "REMOTE"),
+        (6, "ST"),
+        (11, "↓/s"),
+        (11, "↑/s"),
+    ];
+    write_columns(buf, inner.x, inner.y, inner.width, &cols, header_style);
+
+    let body_top = inner.y.saturating_add(1);
+    let body_h = inner.height.saturating_sub(1) as usize;
+    for (i, flow) in flows.iter().take(body_h).enumerate() {
+        let y = body_top + i as u16;
+        let pid = flow.pid.to_string();
+        let proc_name = truncate_chars(&flow.name, 14);
+        let local = format_endpoint(&flow.conn.local);
+        let remote = format_endpoint(&flow.conn.remote);
+        let state = state_glyph(flow.conn.state);
+        let rate = store.net_for(flow.pid);
+        let rx = rate
+            .and_then(|n| n.rx_bytes_per_sec)
+            .map(|v| format!("{}/s", format_rate(v)))
+            .unwrap_or_else(|| "—".into());
+        let tx = rate
+            .and_then(|n| n.tx_bytes_per_sec)
+            .map(|v| format!("{}/s", format_rate(v)))
+            .unwrap_or_else(|| "—".into());
+        let cells: [(u16, &str); 7] = [
+            (6, pid.as_str()),
+            (14, &proc_name),
+            (22, &local),
+            (22, &remote),
+            (6, state),
+            (11, &rx),
+            (11, &tx),
+        ];
+        write_columns(buf, inner.x, y, inner.width, &cells, row_style);
+    }
+}
+
+fn write_columns(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    max_w: u16,
+    cols: &[(u16, &str)],
+    style: Style,
+) {
+    let mut cx = x;
+    let right = x.saturating_add(max_w);
+    for (w, text) in cols {
+        if cx >= right {
+            return;
+        }
+        let avail = (right - cx) as usize;
+        let cell_w = (*w as usize).min(avail);
+        write_str_clipped(buf, cx, y, text, cell_w.saturating_sub(1).max(1) as u16, style);
+        cx = cx.saturating_add(*w);
+    }
+}
+
+fn format_endpoint(ep: &bobtop_pid_attr::AddrEndpoint) -> String {
+    match ep {
+        bobtop_pid_attr::AddrEndpoint::V4 { addr, port } => format!("{addr}:{port}"),
+        bobtop_pid_attr::AddrEndpoint::V6 { addr, port } => {
+            // Bracket IPv6 so the colon-port is unambiguous; the table
+            // column will clip if it overflows.
+            format!("[{addr}]:{port}")
+        }
+    }
+}
+
+fn state_glyph(s: bobtop_pid_attr::SocketState) -> &'static str {
+    use bobtop_pid_attr::SocketState as S;
+    match s {
+        S::Established => "EST",
+        S::Listen => "LSN",
+        S::SynSent => "SYN",
+        S::SynRecv => "SYN",
+        S::FinWait1 | S::FinWait2 => "FIN",
+        S::TimeWait => "TW",
+        S::CloseWait => "CW",
+        S::LastAck => "ACK",
+        S::Closing => "CLG",
+        S::Close => "CLS",
+        S::NewSynRecv => "SYN",
     }
 }
 

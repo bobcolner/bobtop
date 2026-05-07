@@ -52,7 +52,7 @@ pub use error::{NetError, Result};
 pub use sample::{
     AddrEndpoint, ConnectionInfo, ProcessNetSample, Protocol, SocketState,
 };
-pub use store::{AttributionState, AttributionStore, DiskAttribution, NetAttribution};
+pub use store::{AttributionState, AttributionStore, DiskAttribution, FlowRow, NetAttribution};
 pub use tier::AttributorTier;
 pub use unavailable::UnavailableAttributor;
 

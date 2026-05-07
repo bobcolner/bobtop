@@ -60,6 +60,38 @@ pub enum ControlFlow {
 }
 
 
+/// Which network panel layout the user has selected. `Classic` is the
+/// existing rx/tx graph + interface rows the panel has shipped with.
+/// `Flows` is the new per-flow table — kept behind a toggle so the
+/// classic view stays intact while the flow view iterates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkPanelVariant {
+    Classic,
+    Flows,
+}
+
+impl NetworkPanelVariant {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Flows => "flows",
+        }
+    }
+
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Classic => Self::Flows,
+            Self::Flows => Self::Classic,
+        }
+    }
+}
+
+impl Default for NetworkPanelVariant {
+    fn default() -> Self {
+        Self::Classic
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub theme: Theme,
@@ -172,6 +204,17 @@ pub struct App {
     /// Process grouping mode (the "intelligent clustering" feature).
     /// `g` cycles flat → exec → cgroup → tree → flat.
     pub group_mode: crate::group::GroupMode,
+
+    /// Which network panel variant is active. `Classic` keeps the
+    /// existing rx/tx graph + interface rows; `Flows` swaps in the
+    /// per-flow table with pid attribution. Default Classic so
+    /// existing users see no change until they hit the toggle.
+    pub network_panel: NetworkPanelVariant,
+    /// Optional handle to the per-pid attribution store. Set by the
+    /// daemon at startup; left `None` in tests so the headless tests
+    /// don't need an attributor. The flow panel reads through this
+    /// when active; the classic panel ignores it.
+    pub attribution: Option<bobtop_pid_attr::AttributionStore>,
     /// Expand/collapse state. For grouped modes (exec/cgroup), entries
     /// are header keys that are EXPANDED (default = collapsed). For tree
     /// mode, entries are pids stringified that are COLLAPSED (default =
@@ -232,7 +275,23 @@ impl App {
             ui: UiState::default(),
             group_mode: crate::group::GroupMode::Flat,
             expanded: std::collections::HashSet::new(),
+            network_panel: NetworkPanelVariant::default(),
+            attribution: None,
         }
+    }
+
+    /// Builder-style hook for the daemon to share its `AttributionStore`
+    /// handle with the App. Kept optional so headless tests don't need
+    /// to construct an attributor.
+    pub fn with_attribution(mut self, store: bobtop_pid_attr::AttributionStore) -> Self {
+        self.attribution = Some(store);
+        self
+    }
+
+    /// Flip the network panel between Classic and Flows. Wired to the
+    /// `N` keybind in `keymap.rs`.
+    pub fn cycle_network_panel(&mut self) {
+        self.network_panel = self.network_panel.toggle();
     }
 
     /// Atomically read-and-clear the dirty flag. The render loop calls this
@@ -918,6 +977,14 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.set_sort(TableSort::Name);
+                ControlFlow::Continue
+            }
+            KeyCode::Char('N') => {
+                // Flip between the classic rx/tx graph + interface
+                // rows and the new per-flow table. The two views never
+                // co-exist; the toggle is intended to be reversible
+                // without losing any state.
+                self.cycle_network_panel();
                 ControlFlow::Continue
             }
             KeyCode::Char('m') => {
