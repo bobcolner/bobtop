@@ -79,7 +79,25 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     overlay_center_divider(frame, graph_area, app, rx_now, tx_now);
 
     if iface_rows > 0 {
-        let rows_area = Rect::new(inner.x, inner.y + graph_h, inner.width, iface_rows);
+        // Reserve one row for a subtle horizontal rule above the iface
+        // block when there's space — visually anchors the interface
+        // table without nesting another full BoxedPanel inside the
+        // existing one. When there's only room for a single row of
+        // interfaces, skip the rule rather than steal that row.
+        let rule_h: u16 = if iface_rows >= 2 { 1 } else { 0 };
+        let actual_iface_rows = iface_rows - rule_h;
+        if rule_h == 1 {
+            let rule_y = inner.y + graph_h;
+            let style = Style::default().fg(app.theme.div_line);
+            let buf = frame.buffer_mut();
+            for x in inner.x..inner.x.saturating_add(inner.width) {
+                let cell = &mut buf[(x, rule_y)];
+                cell.set_char('─');
+                cell.set_style(style);
+            }
+        }
+        let rows_y = inner.y + graph_h + rule_h;
+        let rows_area = Rect::new(inner.x, rows_y, inner.width, actual_iface_rows);
         draw_interface_rows(frame, rows_area, &visible, app);
     }
 }
@@ -179,20 +197,23 @@ fn draw_interface_row(
         Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
     );
 
-    // Interface name. Reserve 14 cells; longer names truncate.
+    // Interface name. Reserve 12 cells (was 14) — most NICs are
+    // ≤6 chars (eth0, wlan0, docker0, br-…); longer names still
+    // truncate cleanly.
     let name_x = area.x + 4;
-    let name_max: usize = 14;
+    let name_max: usize = 12;
     let name = truncate_chars(&iface.name, name_max);
     write_str_at(buf, name_x, area.y, &name, Style::default().fg(row_fg));
 
-    // Two fixed-width rate cells (arrow + 8-char right-aligned value).
-    // Fixed width means the `↑` / `↓` arrows line up across rows, so
-    // the eye can scan a column of rates instead of chasing them
-    // around like the previous variable-width layout did.
-    let cell_w: u16 = 10;
-    let block_w = cell_w * 2 + 2; // 2-cell gap between arrow blocks
+    // Two fixed-width rate cells. Each cell is `arrow + space + 7-char
+    // right-aligned value` = 9 cells, with a 1-cell gap between the
+    // two arrow blocks. Worst-case rate text after format_rate() is
+    // 6 cells ("999.9G/s") — 7 leaves a comfortable gutter without
+    // wasting space the way the previous 10-cell column did.
+    let cell_w: u16 = 9;
+    let block_w = cell_w * 2 + 1;
     let name_end = name_x + name_max as u16;
-    if name_end + block_w + 2 > area.right() {
+    if name_end + block_w + 1 > area.right() {
         return;
     }
     let block_x = area.right().saturating_sub(block_w);
@@ -209,12 +230,13 @@ fn draw_interface_row(
     let up_val = format!("{}/s", format_rate(iface.tx_bytes_per_sec));
     let dn_val = format!("{}/s", format_rate(iface.rx_bytes_per_sec));
     write_arrow_rate(buf, block_x, area.y, "↑", &up_val, cell_w, up_style);
-    write_arrow_rate(buf, block_x + cell_w + 2, area.y, "↓", &dn_val, cell_w, dn_style);
+    write_arrow_rate(buf, block_x + cell_w + 1, area.y, "↓", &dn_val, cell_w, dn_style);
 }
 
 /// Render a single arrow + right-aligned rate value into a fixed-width
 /// cell. Layout: `↑` at the cell's left edge, the rate text right-
-/// justified inside the remaining `cell_w - 2` cells.
+/// justified inside the remaining `cell_w - 2` cells (the `-2` reserves
+/// the arrow itself + a single-cell gutter after it).
 fn write_arrow_rate(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
