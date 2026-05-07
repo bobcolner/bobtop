@@ -733,7 +733,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
             ("a".into(), "new".into()),
             ("r".into(), "rename".into()),
             ("d/D".into(), "trash/del".into()),
-            ("q".into(), "quit".into()),
+            ("q/b".into(), "quit".into()),
         ]
     };
     let bar = ActionBar::new(actions).with_colors(

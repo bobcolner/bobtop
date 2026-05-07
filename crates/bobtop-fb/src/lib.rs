@@ -9,12 +9,14 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod cli;
 pub mod editor;
 pub mod find;
 pub mod fs;
 pub mod keys;
 pub mod nav;
 pub mod preview;
+pub mod state;
 pub mod ui;
 
 pub use app::{App, ImageBackend, ImageBackendChoice};

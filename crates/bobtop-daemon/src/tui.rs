@@ -97,24 +97,12 @@ pub fn re_init_terminal(term: &mut Term) -> io::Result<()> {
     Ok(())
 }
 
-/// Locate the `bobtop-fb` binary. Prefers a sibling of the current
-/// executable (cargo workspace target/, system installs side-by-side)
-/// before falling back to PATH lookup via `Command::new`.
-pub fn find_browser_binary() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let candidate = parent.join("bobtop-fb");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-    std::path::PathBuf::from("bobtop-fb")
-}
-
-/// Suspend the bobtop UI, spawn `bobtop-fb` as a subprocess, then
-/// resume bobtop. Pauses the input thread for the duration so the
-/// child has the terminal to itself.
+/// Suspend the bobtop UI, re-exec ourselves with the `fb` subcommand
+/// to run the file browser, then resume bobtop on return. Pauses the
+/// input thread for the duration so the child has the terminal to
+/// itself. Lives behind `cfg(feature = "fb")` — monitor-only builds
+/// strip this and the matching `b` keybind together.
+#[cfg(feature = "fb")]
 pub fn launch_file_browser(
     term: &mut Term,
     start: &std::path::Path,
@@ -124,23 +112,21 @@ pub fn launch_file_browser(
     // Reverse the bobtop terminal setup so the child can do its own
     // EnterAlternateScreen / raw mode without nesting ours.
     let _ = restore_terminal(term);
-    let bin = find_browser_binary();
-    let status = std::process::Command::new(&bin)
-        .arg(start)
-        .arg("--theme")
-        .arg(theme_name)
-        .status();
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bobtop"));
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("fb");
+    // An empty path means "let fb resume its persisted last_cwd";
+    // anything else is an explicit override (proc cwd from `b` on a
+    // selected process row).
+    if !start.as_os_str().is_empty() {
+        cmd.arg(start);
+    }
+    cmd.arg("--theme").arg(theme_name);
+    let status = cmd.status();
     let _ = re_init_terminal(term);
     resume_input_thread();
     match status {
         Ok(_) => Ok(()),
-        // Map the missing-binary case to a clear error so the
-        // status row can hint at the install path. Any other
-        // child failure (segfault, etc.) bubbles up unchanged.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("bobtop-fb not found (looked at {})", bin.display()),
-        )),
         Err(e) => Err(e),
     }
 }
@@ -271,25 +257,31 @@ pub async fn run(
                         if matches!(flow, ControlFlow::Quit) {
                             return Ok(());
                         }
-                        if let Some(start) = browser_launch {
-                            // Subprocess launch — paused input thread,
-                            // restored terminal, ran child, re-init,
-                            // resumed thread. Errors flash through the
-                            // status line so the user sees missing-
-                            // binary cases.
-                            if let Err(e) = launch_file_browser(term, &start, &theme_name) {
+                        if let Some(_start) = browser_launch {
+                            #[cfg(feature = "fb")]
+                            {
+                                // Subprocess launch — paused input thread,
+                                // restored terminal, ran child, re-init,
+                                // resumed thread.
+                                if let Err(e) = launch_file_browser(term, &_start, &theme_name) {
+                                    let mut g = lock(&app);
+                                    g.ui.last_options_msg =
+                                        Some(format!("file browser: {}", e));
+                                    g.ui.dirty = true;
+                                }
+                                // ratatui's prev-buffer is stale after the
+                                // child scribbled over the screen; mark a
+                                // full repaint so the next draw clears.
                                 let mut g = lock(&app);
-                                g.ui.last_options_msg =
-                                    Some(format!("file browser: {}", e));
-                                g.ui.dirty = true;
+                                g.ui.force_full_repaint = true;
+                                g.take_dirty();
+                                term.draw(|f| ui::draw(f, &g))?;
                             }
-                            // ratatui's prev-buffer is stale after the
-                            // child scribbled over the screen; mark a
-                            // full repaint so the next draw clears.
-                            let mut g = lock(&app);
-                            g.ui.force_full_repaint = true;
-                            g.take_dirty();
-                            term.draw(|f| ui::draw(f, &g))?;
+                            // suppress the unused-warning when fb feature is off
+                            #[cfg(not(feature = "fb"))]
+                            {
+                                let _ = theme_name;
+                            }
                         }
                     }
                     None => return Ok(()),

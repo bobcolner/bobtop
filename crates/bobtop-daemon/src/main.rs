@@ -28,6 +28,18 @@ async fn main() -> Result<()> {
         let code = bobtop_daemon::agent::client::run(&raw_args[1..]);
         std::process::exit(code);
     }
+    // `bobtop fb …` — BusyBox-style multi-call entry. Dispatches to
+    // the file-browser CLI without spawning a separate binary; the
+    // `b` keybind in the main UI also re-execs us with this prefix.
+    // Behind the `fb` feature so monitor-only builds skip the dep
+    // graph entirely.
+    #[cfg(feature = "fb")]
+    if raw_args.first().map(|s| s.as_str()) == Some("fb") {
+        let prog = std::env::args().next().unwrap_or_else(|| "bobtop-fb".into());
+        let mut fb_args = vec![prog];
+        fb_args.extend(raw_args.iter().skip(1).cloned());
+        return bobtop_fb::cli::run(fb_args);
+    }
 
     // Parse CLI via get_matches() so we can ask clap which fields the user
     // actually set on the command line vs. left at the default. That lets

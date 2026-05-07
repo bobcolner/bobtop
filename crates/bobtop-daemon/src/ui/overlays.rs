@@ -249,7 +249,8 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
-    ("b", "open file browser (selected proc's cwd, or $PWD)"),
+    #[cfg(feature = "fb")]
+    ("b", "open file browser (resumes last directory)"),
     // panels
     ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk size (default → large → off)"),
     ("B", "boxes overlay — quick on/off toggle for each panel"),
@@ -262,6 +263,7 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("p / n / m / c", "sort by Pid / Name / Mem / Cpu"),
     ("g", "cycle group mode: flat → exec → cgroup → tree"),
     ("Space", "expand/collapse selected group or subtree"),
+    ("[ / ]", "collapse all / expand all (group + tree views)"),
     ("Enter", "detail (process row) | expand (header)"),
     ("f", "filter processes by name/cmdline"),
     ("k / K", "kill SIGTERM / SIGKILL (confirm dialog)"),

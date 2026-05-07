@@ -15,7 +15,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
         let panel = boxed_panel(app.theme.proc_box, app.theme.title, app.corner_style)
         .with_title(title)
         .with_keybinds(
-            "q quit  ↑↓ select  ←→ sort  r rev  s sticky  f filter  g group  Space expand  k/K kill  Enter  ?",
+            "q quit  ↑↓ select  ←→ sort  r rev  s sticky  f filter  g group  Space [/] expand  k/K kill  Enter  ?",
         );
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -85,14 +85,67 @@ fn build_table_model(
     let show_net = app.net_tier.has_bandwidth();
     let columns = build_columns(layout, show_net);
     let sort_col = sort_column_index(app, layout, &columns);
+    let scales = compute_metric_scales(rows);
     let grid_rows = rows
         .iter()
         .map(|row| match row {
-            crate::group::TableRow::Header(h) => build_header_row(app, h, layout, show_net, &columns),
-            crate::group::TableRow::Item(p) => build_process_row(app, p, layout, show_net, &columns),
+            crate::group::TableRow::Header(h) => {
+                build_header_row(app, h, &columns, &scales)
+            }
+            crate::group::TableRow::Item(p) => {
+                build_process_row(app, p, layout, &columns, &scales)
+            }
         })
         .collect();
     (columns, grid_rows, sort_col)
+}
+
+/// Per-tick maxima used to scale gradient colors for the rate columns.
+/// CPU and Mem have natural ceilings (a single core / a fixed GiB
+/// reference) so we don't track them here — net and disk rates are
+/// open-ended and look uniform unless we normalize against the most
+/// active row in this frame.
+#[derive(Debug, Default, Clone, Copy)]
+struct MetricScales {
+    threads: u32,
+    net_rx: f64,
+    net_tx: f64,
+    disk_r: f64,
+    disk_w: f64,
+}
+
+fn compute_metric_scales(rows: &[crate::group::TableRow]) -> MetricScales {
+    let mut s = MetricScales::default();
+    for row in rows {
+        match row {
+            crate::group::TableRow::Item(meta) => {
+                let p = &meta.info;
+                s.threads = s.threads.max(p.threads);
+                if let Some(v) = p.net_rx_bytes_per_sec {
+                    if v > s.net_rx {
+                        s.net_rx = v;
+                    }
+                }
+                if let Some(v) = p.net_tx_bytes_per_sec {
+                    if v > s.net_tx {
+                        s.net_tx = v;
+                    }
+                }
+                if let Some(v) = p.disk_read_bytes_per_sec {
+                    if v > s.disk_r {
+                        s.disk_r = v;
+                    }
+                }
+                if let Some(v) = p.disk_write_bytes_per_sec {
+                    if v > s.disk_w {
+                        s.disk_w = v;
+                    }
+                }
+            }
+            crate::group::TableRow::Header(_) => {}
+        }
+    }
+    s
 }
 
 fn build_columns(
@@ -146,36 +199,48 @@ fn sort_column_index(
 fn build_header_row(
     app: &App,
     h: &crate::group::TableGroupHeader,
-    layout: bobtop_tui::widgets::TableLayout,
-    show_net: bool,
     columns: &[GridColumn<'static>],
+    scales: &MetricScales,
 ) -> GridRow<'static> {
     let mut cells = blank_cells(columns.len());
     let label_col = program_col(columns);
-    let mut idx = 0usize;
-    if layout.includes_pid() {
-        idx += 1;
+    let pos = |title: &str| columns.iter().position(|c| c.title.as_ref() == title);
+    let user_col = Style::default().fg(user_color(&h.dominant_user, &app.theme));
+    if let Some(i) = pos("User") {
+        cells[i] = GridCell::new(h.dominant_user.clone()).with_style(user_col);
     }
-    idx += 1; // program
-    if layout.includes_command() {
-        idx += 1;
+    if let Some(i) = pos("Th") {
+        let style = threads_style(h.threads_total, scales.threads, &app.theme);
+        cells[i] = GridCell::new(h.threads_total.to_string()).with_style(style);
     }
-    if layout.includes_user() {
-        idx += 1;
+    if let Some(i) = pos("MEM") {
+        let style = mem_style(h.mem_rss_total, &app.theme);
+        cells[i] = GridCell::bytes(h.mem_rss_total).with_style(style);
     }
-    cells[idx] = GridCell::new(h.threads_total.to_string());
-    cells[idx + 1] = GridCell::bytes(h.mem_rss_total);
-    cells[idx + 2] = GridCell::new(format!("{:.1}", h.cpu_fraction_total * 100.0));
-    let mut k = idx + 3;
-    if show_net {
-        cells[k] = GridCell::rate(h.net_rx_total);
-        cells[k + 1] = GridCell::rate(h.net_tx_total);
-        k += 2;
+    if let Some(i) = pos("CPU%") {
+        let style = cpu_style(h.cpu_fraction_total, &app.theme);
+        cells[i] =
+            GridCell::new(format!("{:.1}", h.cpu_fraction_total * 100.0)).with_style(style);
     }
-    cells[k] = GridCell::rate(h.disk_read_total);
-    cells[k + 1] = GridCell::rate(h.disk_write_total);
+    if let Some(i) = pos("RX/s") {
+        let style = rate_style(h.net_rx_total, scales.net_rx, app.theme.download, &app.theme);
+        cells[i] = GridCell::rate(h.net_rx_total).with_style(style);
+    }
+    if let Some(i) = pos("TX/s") {
+        let style = rate_style(h.net_tx_total, scales.net_tx, app.theme.upload, &app.theme);
+        cells[i] = GridCell::rate(h.net_tx_total).with_style(style);
+    }
+    if let Some(i) = pos("DR/s") {
+        let style = rate_style(h.disk_read_total, scales.disk_r, app.theme.used, &app.theme);
+        cells[i] = GridCell::rate(h.disk_read_total).with_style(style);
+    }
+    if let Some(i) = pos("DW/s") {
+        let style = rate_style(h.disk_write_total, scales.disk_w, app.theme.used, &app.theme);
+        cells[i] = GridCell::rate(h.disk_write_total).with_style(style);
+    }
 
-    let row = GridRow::header(format!("▼ {}", h.label), label_col, cells);
+    let glyph = if h.expanded { '▼' } else { '▶' };
+    let row = GridRow::header(format!("{} {}", glyph, h.label), label_col, cells);
     let style = if h.expanded {
         Style::default().fg(app.theme.hi_fg)
     } else {
@@ -188,91 +253,168 @@ fn build_process_row(
     app: &App,
     meta: &crate::group::TableRowMeta,
     layout: bobtop_tui::widgets::TableLayout,
-    show_net: bool,
     columns: &[GridColumn<'static>],
+    scales: &MetricScales,
 ) -> GridRow<'static> {
     let p = &meta.info;
-    let row_fg = bobtop_tui::color::lerp_color(app.theme.main_fg, app.theme.inactive_fg, 0.0);
-    let fade_fg = bobtop_tui::color::lerp_color(app.theme.main_fg, app.theme.inactive_fg, 0.25);
+    let row_fg = app.theme.main_fg;
+    let dim_fg = app.theme.inactive_fg;
     let base_style = Style::default().fg(row_fg);
+    let dim_style = Style::default().fg(dim_fg);
     let prefix = if layout.draws_tree_glyphs() {
         tree_prefix(meta)
     } else {
         "  ".repeat(meta.depth as usize)
     };
     let mut cells = blank_cells(columns.len());
-    let mut col = 0usize;
-    if layout.includes_pid() {
-        cells[col] = GridCell::new(p.pid.to_string()).with_style(Style::default().fg(fade_fg));
-        col += 1;
+    let pos = |title: &str| columns.iter().position(|c| c.title.as_ref() == title);
+
+    if let Some(i) = pos("Pid") {
+        cells[i] = GridCell::new(p.pid.to_string()).with_style(dim_style);
     }
-    let prog_style = if layout.draws_tree_glyphs() {
-        Style::default().fg(bobtop_tui::color::lerp_color(
-            app.theme.proc_misc,
-            app.theme.inactive_fg,
-            0.25,
-        ))
-    } else {
-        base_style
-    };
-    cells[col] = GridCell::new(format!("{prefix}{}", p.name)).with_style(prog_style);
-    col += 1;
-    if layout.includes_command() {
+    if let Some(i) = pos("Program") {
+        let prog_style = if layout.draws_tree_glyphs() {
+            Style::default().fg(app.theme.proc_misc)
+        } else {
+            base_style
+        };
+        cells[i] =
+            GridCell::new(format!("{prefix}{}", p.name)).with_style(prog_style);
+    }
+    if let Some(i) = pos("Command") {
         let cmd = if p.cmdline.is_empty() {
             p.name.clone()
         } else {
             p.cmdline.clone()
         };
-        cells[col] = GridCell::new(cmd).with_style(Style::default().fg(fade_fg));
-        col += 1;
+        cells[i] = GridCell::new(cmd).with_style(dim_style);
     }
-    if layout.includes_user() {
-        cells[col] = GridCell::new(p.user.clone()).with_style(Style::default().fg(fade_fg));
-        col += 1;
+    if let Some(i) = pos("User") {
+        cells[i] =
+            GridCell::new(p.user.clone()).with_style(Style::default().fg(user_color(&p.user, &app.theme)));
     }
-    cells[col] = GridCell::new(p.threads.to_string()).with_style(Style::default().fg(fade_fg));
+    if let Some(i) = pos("Th") {
+        let style = threads_style(p.threads, scales.threads, &app.theme);
+        cells[i] = GridCell::new(p.threads.to_string()).with_style(style);
+    }
+    if let Some(i) = pos("MEM") {
+        let style = mem_style(p.mem_rss_bytes, &app.theme);
+        cells[i] = GridCell::bytes(p.mem_rss_bytes).with_style(style);
+    }
+    if let Some(i) = pos("CPU%") {
+        let style = cpu_style(p.cpu_fraction, &app.theme);
+        cells[i] = GridCell::new(format!("{:.1}", p.cpu_fraction * 100.0)).with_style(style);
+    }
+    if let Some(i) = pos("RX/s") {
+        let style = rate_style(
+            p.net_rx_bytes_per_sec,
+            scales.net_rx,
+            app.theme.download,
+            &app.theme,
+        );
+        cells[i] = GridCell::rate(p.net_rx_bytes_per_sec).with_style(style);
+    }
+    if let Some(i) = pos("TX/s") {
+        let style = rate_style(
+            p.net_tx_bytes_per_sec,
+            scales.net_tx,
+            app.theme.upload,
+            &app.theme,
+        );
+        cells[i] = GridCell::rate(p.net_tx_bytes_per_sec).with_style(style);
+    }
+    if let Some(i) = pos("DR/s") {
+        let style = rate_style(
+            p.disk_read_bytes_per_sec,
+            scales.disk_r,
+            app.theme.used,
+            &app.theme,
+        );
+        cells[i] = GridCell::rate(p.disk_read_bytes_per_sec).with_style(style);
+    }
+    if let Some(i) = pos("DW/s") {
+        let style = rate_style(
+            p.disk_write_bytes_per_sec,
+            scales.disk_w,
+            app.theme.used,
+            &app.theme,
+        );
+        cells[i] = GridCell::rate(p.disk_write_bytes_per_sec).with_style(style);
+    }
 
-    let mem_ratio = if p.mem_rss_bytes == 0 {
+    GridRow::data(cells).with_style(base_style)
+}
+
+/// Color picker for the User column. Non-root users get a stable
+/// hash-derived hue (so multi-user hosts read at a glance — same
+/// uid is the same color across sessions); root is highlighted
+/// with the theme's `hi_fg` so it stands out as a privileged
+/// owner. `—` (mixed-user group) renders dim.
+fn user_color(user: &str, theme: &bobtop_tui::Theme) -> ratatui::style::Color {
+    if user == "—" || user.is_empty() {
+        return theme.inactive_fg;
+    }
+    if user == "root" {
+        return theme.hi_fg;
+    }
+    // Cheap deterministic hash → 0..1 slot in the theme's process
+    // gradient. Doesn't have to be cryptographic — we just want
+    // stability so `myuser` keeps the same color across ticks.
+    let mut h: u32 = 5381;
+    for b in user.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    let slot = (h % 256) as f32 / 255.0;
+    theme.process.sample(slot)
+}
+
+fn cpu_style(fraction: f32, theme: &bobtop_tui::Theme) -> Style {
+    Style::default().fg(theme.cpu.sample(fraction.clamp(0.0, 1.0)))
+}
+
+fn mem_style(bytes: u64, theme: &bobtop_tui::Theme) -> Style {
+    // 32 GiB reference matches the original code — proxy for "this
+    // process is using a meaningful slice of system memory."
+    let r = if bytes == 0 {
         0.0
     } else {
-        (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).min(1.0)
-    } as f32;
-    let mem_style = Style::default().fg(bobtop_tui::color::lerp_color(
-        app.theme.used.sample(mem_ratio),
-        app.theme.inactive_fg,
-        0.25,
-    ));
-    cells[col + 1] = GridCell::bytes(p.mem_rss_bytes).with_style(mem_style);
-
-    let cpu_style = Style::default().fg(bobtop_tui::color::lerp_color(
-        app.theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0)),
-        app.theme.inactive_fg,
-        0.25,
-    ));
-    cells[col + 2] =
-        GridCell::new(format!("{:.1}", p.cpu_fraction * 100.0)).with_style(cpu_style);
-
-    let net_style = Style::default().fg(fade_fg);
-    let mut k = col + 3;
-    if show_net {
-        cells[k] = GridCell::rate(p.net_rx_bytes_per_sec).with_style(net_style);
-        cells[k + 1] = GridCell::rate(p.net_tx_bytes_per_sec).with_style(net_style);
-        k += 2;
-    }
-    cells[k] = GridCell::rate(p.disk_read_bytes_per_sec).with_style(net_style);
-    cells[k + 1] = GridCell::rate(p.disk_write_bytes_per_sec).with_style(net_style);
-
-    let row_style = if meta.depth == 0 {
-        base_style
-    } else {
-        base_style.fg(bobtop_tui::color::lerp_color(
-            app.theme.main_fg,
-            app.theme.inactive_fg,
-            0.25,
-        ))
+        (bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0))
+            .clamp(0.0, 1.0) as f32
     };
+    Style::default().fg(theme.used.sample(r))
+}
 
-    GridRow::data(cells).with_style(row_style)
+fn threads_style(n: u32, max: u32, theme: &bobtop_tui::Theme) -> Style {
+    if max == 0 {
+        return Style::default().fg(theme.inactive_fg);
+    }
+    let r = (n as f32 / max as f32).clamp(0.0, 1.0);
+    if r < 0.10 {
+        // Most processes have a handful of threads; don't make them
+        // shout. Reserve color for the outliers.
+        Style::default().fg(theme.inactive_fg)
+    } else {
+        Style::default().fg(theme.process.sample(r))
+    }
+}
+
+fn rate_style(
+    value: Option<f64>,
+    max: f64,
+    gradient: bobtop_tui::color::Gradient,
+    theme: &bobtop_tui::Theme,
+) -> Style {
+    match value {
+        None => Style::default().fg(theme.inactive_fg),
+        Some(v) if v <= 0.0 || max <= 0.0 => Style::default().fg(theme.inactive_fg),
+        Some(v) => {
+            // Normalize against the largest value in the column this
+            // tick. Floors at 5 % so a single noisy process doesn't
+            // wash everything else into the cool end of the gradient.
+            let r = (v / max).clamp(0.05, 1.0) as f32;
+            Style::default().fg(gradient.sample(r))
+        }
+    }
 }
 
 fn selection_scroll_offset(selected: usize, total_rows: usize, body_h: usize) -> usize {

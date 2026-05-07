@@ -21,6 +21,12 @@ bobtop-collectors = { workspace = true }
 bobtop-pid-attr = { workspace = true }
 bobtop-engine = { workspace = true }
 bobtop-tui = { workspace = true }
+# bobtop-fb is folded into the bobtop binary as a `bobtop fb …`
+# subcommand when the default `fb` feature is on. Build with
+# `--no-default-features --features ebpf` to drop the file browser
+# entirely (saves ~5 MB of binary size + the syntect/image/viuer/
+# notify/trash dep tree).
+bobtop-fb = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -46,7 +52,13 @@ harness = false
 # eBPF on by default — build.rs in bobtop-pid-attr gracefully no-ops when
 # clang/libbpf-dev aren't present, so the daemon still builds on bare-bones
 # systems; it just falls through to Tier 2/1 attribution at runtime.
-default = ["ebpf"]
+#
+# `fb` folds bobtop-fb into the binary so `bobtop fb …` works and the
+# `b` keybind opens the file browser as a subprocess of the same
+# executable. Opt out with `--no-default-features --features ebpf` for
+# a leaner monitor-only build.
+default = ["ebpf", "fb"]
 ebpf = ["bobtop-pid-attr/ebpf"]
 pcap = ["bobtop-pid-attr/pcap"]
 nvidia = ["bobtop-collectors/nvidia"]
+fb = ["dep:bobtop-fb"]

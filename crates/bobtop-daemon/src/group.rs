@@ -97,6 +97,33 @@ pub fn build_display(
 /// Compare two `ProcessInfo`s by the active sort key. Used by tree mode to
 /// order siblings so pressing `m`/`c`/etc. actually re-shuffles the display
 /// instead of leaving everything pid-ascending.
+/// Pick the user that owns the most processes in `group`. Ties go to
+/// the first-seen owner. Returns `"—"` when the group is empty *or*
+/// genuinely mixed (no user > 50 % of the group) so the header reads
+/// "this is multi-user, look at the rows" instead of misattributing
+/// all of `firefox.service` to one user when init/system services
+/// chain through several uids.
+fn dominant_user(group: &[ProcessInfo]) -> String {
+    if group.is_empty() {
+        return "—".to_string();
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for p in group {
+        *counts.entry(p.user.as_str()).or_insert(0) += 1;
+    }
+    let total = group.len();
+    let (top_user, top_count) = counts
+        .iter()
+        .max_by_key(|(_, c)| **c)
+        .map(|(u, c)| (*u, *c))
+        .unwrap_or(("—", 0));
+    if top_count * 2 > total {
+        top_user.to_string()
+    } else {
+        "—".to_string()
+    }
+}
+
 fn cmp_processes(a: &ProcessInfo, b: &ProcessInfo, sort: TableSort) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match sort {
@@ -169,6 +196,7 @@ where
                 group.iter().filter_map(|p| p.disk_read_bytes_per_sec).collect();
             let disk_w: Vec<f64> =
                 group.iter().filter_map(|p| p.disk_write_bytes_per_sec).collect();
+            let dominant_user = dominant_user(&group);
             let header = TableGroupHeader {
                 label: format!("{} ({})", key, proc_count),
                 key: key.clone(),
@@ -180,6 +208,7 @@ where
                 net_tx_total: if net_tx.is_empty() { None } else { Some(net_tx.iter().sum()) },
                 disk_read_total: if disk_r.is_empty() { None } else { Some(disk_r.iter().sum()) },
                 disk_write_total: if disk_w.is_empty() { None } else { Some(disk_w.iter().sum()) },
+                dominant_user,
                 expanded: expanded.contains(&key),
             };
             (header, group)

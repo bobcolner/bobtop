@@ -539,20 +539,6 @@ impl App {
         )
     }
 
-    /// Resolve the start path for `b` (file-browser launch). Prefers
-    /// the cwd of the currently-selected process — `/proc/<pid>/cwd`
-    /// is a magic symlink kernel-side, so a single readlink gets the
-    /// absolute path. Returns `None` if nothing useful is selected
-    /// or the kernel rejected the read (process exited / EACCES).
-    fn resolve_browser_start(&self) -> Option<std::path::PathBuf> {
-        let rows = self.display_rows();
-        let pid = match rows.get(self.selected_proc)? {
-            crate::group::TableRow::Item(p) => p.info.pid,
-            crate::group::TableRow::Header(_) => return None,
-        };
-        std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
-    }
-
     fn row_pid(row: Option<&crate::group::TableRow>) -> Option<u32> {
         match row? {
             crate::group::TableRow::Item(p) => Some(p.info.pid),
@@ -652,6 +638,39 @@ impl App {
     /// Toggle expand/collapse for the row currently under the selection
     /// cursor. For grouped headers this expands the group; for tree
     /// processes this collapses/uncollapses the subtree rooted at that
+    /// Expand every collapsible row in the current grouping. In
+    /// Grouped views that means every group key; in Tree mode every
+    /// process pid that has at least one child. No-op in Flat.
+    pub fn expand_all(&mut self) {
+        let rows = self.display_rows();
+        for row in &rows {
+            match (self.group_mode, row) {
+                (crate::group::GroupMode::Flat, _) => return,
+                (_, crate::group::TableRow::Header(h)) => {
+                    self.expanded.insert(h.key.clone());
+                }
+                (crate::group::GroupMode::ByParent, crate::group::TableRow::Item(p)) => {
+                    self.expanded.insert(p.info.pid.to_string());
+                }
+                _ => {}
+            }
+        }
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
+    }
+
+    /// Mirror of `expand_all` — clears every expansion. Selection
+    /// snaps to the row whose key encloses the previous selection so
+    /// the user doesn't lose their place.
+    pub fn collapse_all(&mut self) {
+        if matches!(self.group_mode, crate::group::GroupMode::Flat) {
+            return;
+        }
+        self.expanded.clear();
+        let rows = self.display_rows();
+        self.sync_selected_process_position_from_rows(&rows);
+    }
+
     /// pid. No-op for Flat mode (no children to hide).
     pub fn toggle_selected_expand(&mut self) {
         let rows = self.display_rows();
@@ -784,19 +803,16 @@ impl App {
                 self.ui.boxes_overlay_cursor = 0;
                 ControlFlow::Continue
             }
+            #[cfg(feature = "fb")]
             KeyCode::Char('b') => {
                 // Lowercase `b` launches bobtop-fb as a subprocess.
-                // Smart default for the start path: if the cursor is
-                // on a process row and `/proc/<pid>/cwd` is readable,
-                // browse there — it's the most useful "jump from
-                // proc to filesystem" flow. Otherwise fall back to
-                // the user's working dir.
-                let start = self
-                    .resolve_browser_start()
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-                    });
-                self.ui.pending_browser_launch = Some(start);
+                // Always resume from fb's persisted state (last_cwd)
+                // so bouncing in and out of `b` keeps you in the
+                // same browser directory. The previous "jump to
+                // selected proc's /proc/<pid>/cwd" flow was actively
+                // fighting this — left as a placeholder for a
+                // separate keybind (Shift-B?) if it returns.
+                self.ui.pending_browser_launch = Some(std::path::PathBuf::new());
                 ControlFlow::Continue
             }
             KeyCode::Char('f') => {
@@ -831,10 +847,21 @@ impl App {
                 self.cycle_group_mode();
                 ControlFlow::Continue
             }
-            // `[` / `]` previously cycled a focused network interface.
-            // The net panel now lists every visible interface inline,
-            // so the focus mode (and these chord keys) was retired.
-            KeyCode::Char('[') | KeyCode::Char(']') => ControlFlow::Continue,
+            // `[` / `]` collapse / expand every group in the current
+            // proc-table view (Grouped, ByCgroup, Tree). Originally
+            // these cycled the network panel's focused interface;
+            // that mode was retired when the net panel switched to a
+            // per-interface row layout, freeing the keys for
+            // something more useful in the place where they sit on
+            // most keyboards (next to Enter and Space).
+            KeyCode::Char('[') => {
+                self.collapse_all();
+                ControlFlow::Continue
+            }
+            KeyCode::Char(']') => {
+                self.expand_all();
+                ControlFlow::Continue
+            }
             KeyCode::Char(' ') => {
                 // Space toggles expand on the row at cursor (header in
                 // grouped modes, subtree root in tree mode).

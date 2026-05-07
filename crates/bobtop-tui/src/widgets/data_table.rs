@@ -12,6 +12,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
+use unicode_width::UnicodeWidthChar;
 
 use crate::Theme;
 
@@ -39,6 +40,12 @@ pub struct TableGroupHeader {
     pub net_tx_total: Option<f64>,
     pub disk_read_total: Option<f64>,
     pub disk_write_total: Option<f64>,
+    /// Most-common owning user across the group's processes; "—" when
+    /// the group is mixed-user (e.g. a parent-process tree spanning
+    /// privilege boundaries). Surfaced in the "User" column of the
+    /// header row so groups carry the same per-user context as flat
+    /// rows do.
+    pub dominant_user: String,
     pub expanded: bool,
 }
 
@@ -156,11 +163,16 @@ impl TableLayout {
         matches!(self, TableLayout::Flat)
     }
 
-    /// Whether the User column is rendered. Dropped in Grouped (no
-    /// single user across a group). Kept in Tree for per-process
-    /// ownership context.
+    /// Whether the User column is rendered. All layouts now include
+    /// it — Grouped surfaces the dominant user via
+    /// `TableGroupHeader::dominant_user`, child rows under the header
+    /// keep their own user. Earlier the column was dropped in Grouped
+    /// because "no single user across a group" felt true; in practice
+    /// most groups (a service unit, a cgroup, a parent tree) have a
+    /// dominant owner and dropping the column made it impossible to
+    /// answer "who started this?" in clustering view.
     pub fn includes_user(self) -> bool {
-        matches!(self, TableLayout::Flat | TableLayout::Tree)
+        true
     }
 
     pub fn program_width(self) -> u16 {
@@ -639,7 +651,7 @@ where
             break;
         }
         let (text, style, right_align) = cell_fn(i);
-        let len = text.chars().count() as u16;
+        let len = crate::text::display_width(&text) as u16;
         let (text_x, text) = if right_align && len < avail {
             (cursor + (avail - len), text)
         } else if len > avail {
@@ -656,13 +668,17 @@ fn write_str(buf: &mut Buffer, x: u16, y: u16, s: &str, max_cols: usize, style: 
     let mut col = x;
     let right = x.saturating_add(max_cols as u16).min(buf.area.right());
     for ch in s.chars() {
-        if col >= right {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if cw == 0 {
+            continue;
+        }
+        if col.saturating_add(cw) > right {
             break;
         }
         let c = &mut buf[(col, y)];
         c.set_char(ch);
         c.set_style(c.style().patch(style));
-        col = col.saturating_add(1);
+        col = col.saturating_add(cw);
     }
 }
 
@@ -823,12 +839,14 @@ mod tests {
         assert!(flat.iter().any(|c| c.title == "Pid"));
         assert!(flat.iter().any(|c| c.title == "User"));
 
-        // Grouped: Pid + Command + User dropped. 8 columns. Program flexes.
+        // Grouped: Pid + Command dropped. User now stays so grouped
+        // headers can show their dominant owner. 9 columns total.
+        // Program flexes.
         let grouped = build_cols(TableLayout::Grouped, true);
-        assert_eq!(grouped.len(), 8);
+        assert_eq!(grouped.len(), 9);
         assert!(!grouped.iter().any(|c| c.title == "Pid"));
         assert!(!grouped.iter().any(|c| c.title == "Command"));
-        assert!(!grouped.iter().any(|c| c.title == "User"));
+        assert!(grouped.iter().any(|c| c.title == "User"));
         let prog = grouped.iter().position(|c| c.title == "Program").unwrap();
         assert!(col_actual_width(&grouped, total, prog) > 20, "Grouped Program should flex");
 

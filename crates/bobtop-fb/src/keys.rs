@@ -54,7 +54,11 @@ pub fn map(ev: KeyEvent) -> Action {
         };
     }
     match ev.code {
-        KeyCode::Char('q') => Action::Quit,
+        // `q` and `b` both quit. `b` mirrors bobtop's launch key so
+        // a single tap toggles between the two apps when bobtop-fb
+        // was opened from the main monitor — feels like flipping
+        // panes rather than spawning / killing a subprocess.
+        KeyCode::Char('q') | KeyCode::Char('b') => Action::Quit,
         KeyCode::Esc => Action::Cancel,
         KeyCode::Char(' ') => Action::ToggleFullPreview,
         KeyCode::Char('/') => Action::StartFilter,
