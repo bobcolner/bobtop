@@ -128,8 +128,7 @@ fn detect_image_backend() -> ImageBackend {
         viuer::KittySupport::Local | viuer::KittySupport::Remote
     );
     let iterm = viuer::is_iterm_supported();
-    let sixel = viuer::is_sixel_supported();
-    if kitty || iterm || sixel {
+    if kitty || iterm {
         return ImageBackend::Native;
     }
     if env_hints_native_protocol() {

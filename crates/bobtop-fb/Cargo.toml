@@ -50,4 +50,4 @@ trash = "5"
 # protocol detection but only call it when a real bitmap protocol
 # is available — otherwise we keep our sextant-block path, which
 # looks better than viuer's own half-block fallback.
-viuer = { version = "0.9", default-features = false, features = ["sixel", "print-file"] }
+viuer = { version = "0.9", default-features = false, features = ["print-file"] }

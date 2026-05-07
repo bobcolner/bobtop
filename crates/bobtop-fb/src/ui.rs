@@ -41,6 +41,21 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
     if area.height < 4 || area.width < 16 {
         return;
     }
+    // Paint the theme's main_bg across the whole canvas first so
+    // panels, text, and gaps between widgets all inherit the
+    // intended background. Cells that subsequent widgets don't
+    // explicitly restyle (most chrome and gutter cells) keep this
+    // bg, which is what makes a Solarized or Dracula theme actually
+    // *look* dark/light instead of falling through to the user's
+    // terminal default.
+    if let Some(bg) = theme.main_bg {
+        let buf = frame.buffer_mut();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                buf[(x, y)].set_bg(bg);
+            }
+        }
+    }
     let (top, bottom) = split_top_bottom(area, 1);
     let rects = split_main_columns(top);
     draw_parent_pane(app, frame, theme, rects[0]);

@@ -249,6 +249,7 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
+    ("b", "open file browser (selected proc's cwd, or $PWD)"),
     // panels
     ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk size (default → large → off)"),
     ("B", "boxes overlay — quick on/off toggle for each panel"),
@@ -268,7 +269,6 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("[ / ]", "cycle network interface in net panel (back / next)"),
     ("+ / -", "adjust global tick (sample rate)"),
     ("O", "options — edit config + save to disk"),
-    ("b", "open file browser (selected proc's cwd, or $PWD)"),
 ];
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
