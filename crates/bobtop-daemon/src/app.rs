@@ -222,6 +222,12 @@ pub struct App {
     /// coexist — switching modes resets the meaning.
     pub expanded: std::collections::HashSet<String>,
 
+    /// Tree-mode depth cap. `None` = no cap (fully expanded). `Some(n)`
+    /// hides every subtree past depth `n`, where `n=0` is roots-only.
+    /// Driven by `[` (decrement) and `]` (increment); composes with the
+    /// per-subtree manual collapse state in `expanded`.
+    pub tree_depth_cap: Option<u8>,
+
     pub ui: UiState,
 }
 
@@ -275,6 +281,7 @@ impl App {
             ui: UiState::default(),
             group_mode: crate::group::GroupMode::Flat,
             expanded: std::collections::HashSet::new(),
+            tree_depth_cap: None,
             network_panel: NetworkPanelVariant::default(),
             attribution: None,
         }
@@ -595,6 +602,7 @@ impl App {
             &self.expanded,
             self.proc_sort,
             self.proc_sort_descending,
+            self.tree_depth_cap,
         )
     }
 
@@ -690,6 +698,7 @@ impl App {
     pub fn cycle_group_mode(&mut self) {
         self.group_mode = self.group_mode.next();
         self.expanded.clear();
+        self.tree_depth_cap = None;
         let rows = self.display_rows();
         self.sync_selected_process_position_from_rows(&rows);
     }
@@ -697,35 +706,59 @@ impl App {
     /// Toggle expand/collapse for the row currently under the selection
     /// cursor. For grouped headers this expands the group; for tree
     /// processes this collapses/uncollapses the subtree rooted at that
-    /// Expand every collapsible row in the current grouping. In
-    /// Grouped views that means every group key; in Tree mode every
-    /// process pid that has at least one child. No-op in Flat.
-    pub fn expand_all(&mut self) {
-        let rows = self.display_rows();
-        for row in &rows {
-            match (self.group_mode, row) {
-                (crate::group::GroupMode::Flat, _) => return,
-                (_, crate::group::TableRow::Header(h)) => {
-                    self.expanded.insert(h.key.clone());
+    /// Raise the tree-mode depth cap by one (or, in Grouped views,
+    /// expand every group at once). The cap is a global ceiling: every
+    /// subtree past it is hidden uniformly, so a single press always
+    /// produces a visible change as long as deeper layers exist.
+    /// Past the full tree depth the cap is unset (= unlimited).
+    pub fn expand_step(&mut self) {
+        match self.group_mode {
+            crate::group::GroupMode::Flat => return,
+            crate::group::GroupMode::ByParent => {
+                let full = crate::group::tree_full_depth(&self.processes_sorted);
+                self.tree_depth_cap = match self.tree_depth_cap {
+                    None => return, // already unlimited
+                    Some(n) if n + 1 >= full => None,
+                    Some(n) => Some(n + 1),
+                };
+            }
+            _ => {
+                let rows = self.display_rows();
+                for row in &rows {
+                    if let crate::group::TableRow::Header(h) = row {
+                        self.expanded.insert(h.key.clone());
+                    }
                 }
-                (crate::group::GroupMode::ByParent, crate::group::TableRow::Item(p)) => {
-                    self.expanded.insert(p.info.pid.to_string());
-                }
-                _ => {}
             }
         }
         let rows = self.display_rows();
         self.sync_selected_process_position_from_rows(&rows);
     }
 
-    /// Mirror of `expand_all` — clears every expansion. Selection
-    /// snaps to the row whose key encloses the previous selection so
-    /// the user doesn't lose their place.
-    pub fn collapse_all(&mut self) {
-        if matches!(self.group_mode, crate::group::GroupMode::Flat) {
-            return;
+    /// Lower the tree-mode depth cap by one. Each press globally
+    /// hides the next-deepest layer: from unlimited it snaps to
+    /// `current_max - 1` (so the press produces an immediate visible
+    /// change even on huge trees where leaves are off-screen);
+    /// otherwise decrements. Bottoms out at `Some(0)` = roots-only.
+    /// In Grouped views collapses every group at once.
+    pub fn collapse_step(&mut self) {
+        match self.group_mode {
+            crate::group::GroupMode::Flat => return,
+            crate::group::GroupMode::ByParent => {
+                self.tree_depth_cap = match self.tree_depth_cap {
+                    None => {
+                        let full = crate::group::tree_full_depth(&self.processes_sorted);
+                        if full == 0 {
+                            return;
+                        }
+                        Some(full - 1)
+                    }
+                    Some(0) => return,
+                    Some(n) => Some(n - 1),
+                };
+            }
+            _ => self.expanded.clear(),
         }
-        self.expanded.clear();
         let rows = self.display_rows();
         self.sync_selected_process_position_from_rows(&rows);
     }
@@ -906,19 +939,25 @@ impl App {
                 self.cycle_group_mode();
                 ControlFlow::Continue
             }
-            // `[` / `]` collapse / expand every group in the current
-            // proc-table view (Grouped, ByCgroup, Tree). Originally
-            // these cycled the network panel's focused interface;
-            // that mode was retired when the net panel switched to a
-            // per-interface row layout, freeing the keys for
-            // something more useful in the place where they sit on
-            // most keyboards (next to Enter and Space).
+            // `[` / `]` step the current proc-table view shut/open by
+            // one nesting level. In Tree (ByParent) mode that's one
+            // depth layer per press — `[` peels the deepest visible
+            // layer, `]` reveals the next-deepest — so repeated taps
+            // walk the tree from fully-expanded down to just-roots
+            // and back. In single-nesting Grouped views the first
+            // press collapses/expands every group at once and further
+            // presses are no-ops. Originally these cycled the
+            // network panel's focused interface; that mode was
+            // retired when the net panel switched to a per-interface
+            // row layout, freeing the keys for something more useful
+            // in the place where they sit on most keyboards (next to
+            // Enter and Space).
             KeyCode::Char('[') => {
-                self.collapse_all();
+                self.collapse_step();
                 ControlFlow::Continue
             }
             KeyCode::Char(']') => {
-                self.expand_all();
+                self.expand_step();
                 ControlFlow::Continue
             }
             KeyCode::Char(' ') => {
@@ -1620,5 +1659,148 @@ mod tests {
         // Saturates at last row.
         app.handle_input(down);
         assert_eq!(app.selected_proc, 1);
+    }
+
+    fn fake_proc_with_parent(pid: u32, parent: Option<u32>, name: &str) -> ProcessInfo {
+        let mut p = fake_proc(pid, name, 0.0);
+        p.parent_pid = parent;
+        p
+    }
+
+    fn rows_at_depths(rows: &[crate::group::TableRow]) -> Vec<u8> {
+        rows.iter()
+            .filter_map(|r| match r {
+                crate::group::TableRow::Item(p) => Some(p.depth),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tree_step_cycles_through_each_intermediate_depth() {
+        // Tree of depth 3:
+        //   1 (root)
+        //   └── 2
+        //       └── 3
+        //           └── 4
+        let mut app =
+            App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        app.group_mode = crate::group::GroupMode::ByParent;
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc_with_parent(1, None, "init"),
+                fake_proc_with_parent(2, Some(1), "child"),
+                fake_proc_with_parent(3, Some(2), "grandchild"),
+                fake_proc_with_parent(4, Some(3), "great"),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+
+        // Fully expanded: all four rows visible at depths 0..3.
+        let depths = rows_at_depths(&app.display_rows());
+        assert_eq!(depths, vec![0, 1, 2, 3]);
+
+        // [ peels one layer per press until just-roots.
+        app.collapse_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2]);
+        app.collapse_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1]);
+        app.collapse_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0]);
+        // Floor: further [ does nothing.
+        app.collapse_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0]);
+
+        // ] reveals one layer per press, hitting every intermediate state.
+        app.expand_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1]);
+        app.expand_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2]);
+        app.expand_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2, 3]);
+        // Ceiling: further ] does nothing.
+        app.expand_step();
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn tree_step_handles_branching_and_uneven_depth() {
+        // Two roots, uneven branches:
+        //   1 ── 2 ── 3   (depth 0,1,2)
+        //   ├──  4        (depth 0,1)
+        //   5             (depth 0, no children)
+        let mut app =
+            App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        app.group_mode = crate::group::GroupMode::ByParent;
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc_with_parent(1, None, "r1"),
+                fake_proc_with_parent(2, Some(1), "c"),
+                fake_proc_with_parent(3, Some(2), "gc"),
+                fake_proc_with_parent(4, Some(1), "c2"),
+                fake_proc_with_parent(5, None, "r2"),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+
+        let mut depths = rows_at_depths(&app.display_rows());
+        depths.sort_unstable();
+        assert_eq!(depths, vec![0, 0, 1, 1, 2]);
+
+        // [ peels deepest layer (depth 2 hidden) — 4 rows now, still has depth 1.
+        app.collapse_step();
+        let mut d = rows_at_depths(&app.display_rows());
+        d.sort_unstable();
+        assert_eq!(d, vec![0, 0, 1, 1]);
+
+        // [ again — depth 1 hidden, just roots.
+        app.collapse_step();
+        let mut d = rows_at_depths(&app.display_rows());
+        d.sort_unstable();
+        assert_eq!(d, vec![0, 0]);
+
+        // ] reveals depth 1 in both branches.
+        app.expand_step();
+        let mut d = rows_at_depths(&app.display_rows());
+        d.sort_unstable();
+        assert_eq!(d, vec![0, 0, 1, 1]);
+
+        // ] reveals depth 2 (only the deep branch has it).
+        app.expand_step();
+        let mut d = rows_at_depths(&app.display_rows());
+        d.sort_unstable();
+        assert_eq!(d, vec![0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn bracket_keys_step_tree_through_handle_input() {
+        // End-to-end via handle_input — confirms no earlier handler
+        // (filter, modal, overlay) is swallowing `[` / `]`.
+        let mut app =
+            App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
+        app.group_mode = crate::group::GroupMode::ByParent;
+        let sample = ProcessSample {
+            timestamp: Instant::now(),
+            processes: vec![
+                fake_proc_with_parent(1, None, "init"),
+                fake_proc_with_parent(2, Some(1), "a"),
+                fake_proc_with_parent(3, Some(2), "b"),
+            ],
+        };
+        app.apply_event(MetricEvent::Process(sample));
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2]);
+
+        let lb = Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        let rb = Event::Key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        app.handle_input(lb.clone());
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1]);
+        app.handle_input(lb);
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0]);
+        app.handle_input(rb.clone());
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1]);
+        app.handle_input(rb);
+        assert_eq!(rows_at_depths(&app.display_rows()), vec![0, 1, 2]);
     }
 }

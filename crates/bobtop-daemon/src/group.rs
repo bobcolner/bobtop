@@ -79,6 +79,7 @@ pub fn build_display(
     expanded: &HashSet<String>,
     sort: TableSort,
     descending: bool,
+    tree_depth_cap: Option<u8>,
 ) -> Vec<TableRow> {
     match mode {
         GroupMode::Flat => procs
@@ -107,8 +108,49 @@ pub fn build_display(
                 .map(|c| c.display())
                 .unwrap_or_else(|| "host".into())
         }),
-        GroupMode::ByParent => build_tree(procs, expanded, sort, descending),
+        GroupMode::ByParent => build_tree(procs, expanded, sort, descending, tree_depth_cap),
     }
+}
+
+/// Walk the parent tree and report its full depth (max depth a child sits
+/// at). 0 = roots only, no descendants in the snapshot. Used to know how
+/// far `]` can step before saturating.
+pub fn tree_full_depth(procs: &[ProcessInfo]) -> u8 {
+    let by_pid: HashMap<u32, &ProcessInfo> = procs.iter().map(|p| (p.pid, p)).collect();
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for p in procs {
+        if let Some(pp) = p.parent_pid {
+            if pp != p.pid && by_pid.contains_key(&pp) {
+                children_of.entry(pp).or_default().push(p.pid);
+            }
+        }
+    }
+    fn walk(pid: u32, kids: &HashMap<u32, Vec<u32>>, depth: u8) -> u8 {
+        let mut max = depth;
+        if let Some(children) = kids.get(&pid) {
+            for &c in children {
+                let d = walk(c, kids, depth + 1);
+                if d > max {
+                    max = d;
+                }
+            }
+        }
+        max
+    }
+    let mut deepest = 0;
+    for p in procs {
+        let is_root = match p.parent_pid {
+            None => true,
+            Some(pp) => !by_pid.contains_key(&pp),
+        };
+        if is_root {
+            let d = walk(p.pid, &children_of, 0);
+            if d > deepest {
+                deepest = d;
+            }
+        }
+    }
+    deepest
 }
 
 /// Compare two `ProcessInfo`s by the active sort key. Used by tree mode to
@@ -312,6 +354,7 @@ fn build_tree(
     collapsed: &HashSet<String>,
     sort: TableSort,
     descending: bool,
+    depth_cap: Option<u8>,
 ) -> Vec<TableRow> {
     // Index pid -> ProcessInfo and parent_pid -> children list.
     let by_pid: HashMap<u32, &ProcessInfo> = procs.iter().map(|p| (p.pid, p)).collect();
@@ -367,6 +410,7 @@ fn build_tree(
             &by_pid,
             &children_of,
             collapsed,
+            depth_cap,
             &mut out,
         );
     }
@@ -381,6 +425,7 @@ fn emit_subtree(
     by_pid: &HashMap<u32, &ProcessInfo>,
     children_of: &HashMap<u32, Vec<u32>>,
     collapsed: &HashSet<String>,
+    depth_cap: Option<u8>,
     out: &mut Vec<TableRow>,
 ) {
     let Some(info) = by_pid.get(&pid) else { return };
@@ -395,6 +440,11 @@ fn emit_subtree(
     if collapsed.contains(&key) {
         return;
     }
+    if let Some(cap) = depth_cap {
+        if depth >= cap {
+            return;
+        }
+    }
     let Some(kids) = children_of.get(&pid) else { return };
     let mut next_anc = ancestor_continues.to_vec();
     next_anc.push(!is_last);
@@ -408,6 +458,7 @@ fn emit_subtree(
             by_pid,
             children_of,
             collapsed,
+            depth_cap,
             out,
         );
     }
@@ -455,7 +506,7 @@ mod tests {
     #[test]
     fn flat_mode_yields_one_row_per_process() {
         let ps = vec![p(1, None, "a", 0.0, 0, None), p(2, None, "b", 0.0, 0, None)];
-        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::Flat, &HashSet::new(), TableSort::Cpu, true, None);
         assert_eq!(rows.len(), 2);
         assert!(matches!(rows[0], TableRow::Item(_)));
     }
@@ -467,7 +518,7 @@ mod tests {
             p(2, None, "chrome", 0.20, 200, None),
             p(3, None, "vim", 0.05, 50, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true, None);
         assert_eq!(rows.len(), 2, "two collapsed headers");
         // First header should be chrome (more total CPU).
         match &rows[0] {
@@ -493,14 +544,14 @@ mod tests {
         ];
 
         let rows_by_mem =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, true, None);
         match &rows_by_mem[0] {
             TableRow::Header(h) => assert_eq!(h.key, "small", "Mem sort should put small first"),
             _ => panic!("expected Header"),
         }
 
         let rows_by_cpu =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true, None);
         match &rows_by_cpu[0] {
             TableRow::Header(h) => assert_eq!(h.key, "huge", "Cpu sort should put huge first"),
             _ => panic!("expected Header"),
@@ -508,7 +559,7 @@ mod tests {
 
         // Ascending direction reverses both.
         let rows_by_mem_asc =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, false);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Mem, false, None);
         match &rows_by_mem_asc[0] {
             TableRow::Header(h) => assert_eq!(h.key, "huge", "Mem asc should flip"),
             _ => panic!("expected Header"),
@@ -524,7 +575,7 @@ mod tests {
         ps[0].threads = 5;
         ps[1].threads = 7;
         let rows =
-            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true);
+            build_display(&ps, GroupMode::ByExecutable, &HashSet::new(), TableSort::Cpu, true, None);
         match &rows[0] {
             TableRow::Header(h) => assert_eq!(h.threads_total, 12),
             _ => panic!("expected Header"),
@@ -540,7 +591,7 @@ mod tests {
         ];
         let mut expanded = HashSet::new();
         expanded.insert("chrome".to_string());
-        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByExecutable, &expanded, TableSort::Cpu, true, None);
         // chrome header + 2 children + vim header.
         assert_eq!(rows.len(), 4);
         assert!(matches!(rows[0], TableRow::Header(_)));
@@ -558,7 +609,7 @@ mod tests {
             p(4, None, "sshd", 0.01, 5, None),
             p(5, None, "bash", 0.01, 5, Some("user-1000.slice")),
         ];
-        let rows = build_display(&ps, GroupMode::ByContainer, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByContainer, &HashSet::new(), TableSort::Cpu, true, None);
         let keys: Vec<_> = rows
             .iter()
             .filter_map(|r| match r {
@@ -588,7 +639,7 @@ mod tests {
             p(1, None, "x", 0.0, 0, Some("firefox.service")),
             p(2, None, "y", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByCgroup, &HashSet::new(), TableSort::Cpu, true, None);
         let keys: Vec<_> = rows
             .iter()
             .filter_map(|r| match r {
@@ -609,7 +660,7 @@ mod tests {
             p(200, Some(1), "daemon", 0.0, 0, None),
             p(300, Some(100), "cmd", 0.0, 0, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true, None);
         let depths: Vec<u8> = rows
             .iter()
             .filter_map(|r| match r {
@@ -629,7 +680,7 @@ mod tests {
         ];
         let mut collapsed = HashSet::new();
         collapsed.insert("100".to_string());
-        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &collapsed, TableSort::Cpu, true, None);
         // init + shell — cmd should be hidden under collapsed shell.
         assert_eq!(rows.len(), 2);
     }
@@ -646,7 +697,7 @@ mod tests {
             p(5, None, "high", 0.90, 0, None),
         ];
 
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, true, None);
         let pids: Vec<u32> = rows
             .iter()
             .filter_map(|r| match r {
@@ -657,7 +708,7 @@ mod tests {
         assert_eq!(pids, vec![5, 1], "Cpu desc should put high-cpu root first");
 
         let rows_asc =
-            build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, false);
+            build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, false, None);
         let pids_asc: Vec<u32> = rows_asc
             .iter()
             .filter_map(|r| match r {
@@ -677,7 +728,7 @@ mod tests {
             p(200, Some(1), "big", 0.0, 500, None),
             p(300, Some(1), "mid", 0.0, 200, None),
         ];
-        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Mem, true);
+        let rows = build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Mem, true, None);
         let pids: Vec<u32> = rows
             .iter()
             .filter_map(|r| match r {
@@ -703,7 +754,7 @@ mod tests {
 
         for desc in [true, false] {
             let rows =
-                build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, desc);
+                build_display(&ps, GroupMode::ByParent, &HashSet::new(), TableSort::Cpu, desc, None);
             let pids: Vec<u32> = rows
                 .iter()
                 .filter_map(|r| match r {
