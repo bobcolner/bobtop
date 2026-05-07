@@ -212,19 +212,12 @@ fn draw_interface_row(
     let cell_w: u16 = 9;
     let block_w = cell_w * 2 + 1;
     let name_end = name_x + name_max as u16;
-    // Anchor the rate block 2 cells after the name reservation rather
-    // than the panel's right edge. The name reservation is fixed-width
-    // (`name_max`), so rates still line up across rows; what changes is
-    // that we don't blow a wide panel's spare cells on whitespace
-    // between name and rates. Falls back to right-anchored only when
-    // there literally isn't room at the fixed offset (very narrow
-    // panel) — keeps the data visible.
-    let preferred_x = name_end + 2;
-    let max_x = area.right().saturating_sub(block_w);
+    // Right-justify the rate block to the panel's right edge so the
+    // ↑/↓ arrows + rates flush against the border.
     if name_end + block_w + 1 > area.right() {
         return;
     }
-    let block_x = preferred_x.min(max_x);
+    let block_x = area.right().saturating_sub(block_w);
     let up_style = if active {
         rate_style(&theme.upload, iface.tx_bytes_per_sec, peak_bps)
     } else {
