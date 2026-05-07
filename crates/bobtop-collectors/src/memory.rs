@@ -70,6 +70,12 @@ fn read_memory_sample() -> Result<MemorySample> {
     sample.pressure = std::fs::read_to_string("/proc/pressure/memory")
         .ok()
         .and_then(|t| parse_pressure(&t));
+    sample.cpu_pressure = std::fs::read_to_string("/proc/pressure/cpu")
+        .ok()
+        .and_then(|t| parse_pressure(&t));
+    sample.io_pressure = std::fs::read_to_string("/proc/pressure/io")
+        .ok()
+        .and_then(|t| parse_pressure(&t));
     Ok(sample)
 }
 
@@ -201,8 +207,10 @@ fn sample_from_meminfo(map: &HashMap<&str, u64>, now: Instant) -> Result<MemoryS
         buffers_bytes,
         free_bytes,
         // PSI is filled by `read_memory_sample` after this constructor;
-        // tests that go through `sample_from_meminfo` directly leave it None.
+        // tests that go through `sample_from_meminfo` directly leave them None.
         pressure: None,
+        cpu_pressure: None,
+        io_pressure: None,
     })
 }
 

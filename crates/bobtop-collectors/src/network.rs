@@ -186,19 +186,67 @@ fn parse_proc_net_dev(text: &str) -> HashMap<String, RawCounters> {
     out
 }
 
-/// Heuristic — interfaces that should be excluded from "real internet" totals
-/// (loopback, docker, vlan, virtual). The collector reports them anyway; this
-/// is a UI helper.
-pub fn is_virtual_interface(name: &str) -> bool {
-    matches!(
-        name,
-        "lo" | "lo0"
-    ) || name.starts_with("docker")
+/// What kind of network interface this is — drives whether traffic on
+/// it counts as "leaving the host" (External / Tunnel) or "staying
+/// inside the host" (Container / Loopback) in the UI breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetInterfaceKind {
+    /// Physical-or-equivalent NIC: ethernet, wifi, cellular, or any
+    /// interface name that doesn't match a known virtual prefix. The
+    /// kernel doesn't expose "is physical" cleanly, so this is the
+    /// fallthrough — anything we don't recognize is treated as real.
+    External,
+    /// VPN / point-to-point tunnel (tun, tap, wg, ppp). Carries
+    /// outbound traffic just like an NIC, so "external" totals
+    /// include this kind.
+    Tunnel,
+    /// Container bridge or virtual ethernet (docker0, br-*, veth*,
+    /// virbr*). Traffic stays on the host.
+    Container,
+    /// Loopback. Always stays on the host.
+    Loopback,
+}
+
+impl NetInterfaceKind {
+    /// Whether traffic on interfaces of this kind leaves the host.
+    /// Used by the UI to split the "external" vs "internal" totals.
+    pub fn is_external(self) -> bool {
+        matches!(self, NetInterfaceKind::External | NetInterfaceKind::Tunnel)
+    }
+}
+
+/// Classify an interface by its kernel name. Heuristic based on
+/// well-known prefixes; on Linux the canonical mappings are stable
+/// (kernel net device naming guidelines + container runtime
+/// conventions).
+pub fn classify_interface(name: &str) -> NetInterfaceKind {
+    if matches!(name, "lo" | "lo0") {
+        return NetInterfaceKind::Loopback;
+    }
+    if name.starts_with("docker")
         || name.starts_with("br-")
         || name.starts_with("veth")
         || name.starts_with("virbr")
-        || name.starts_with("tun")
+        || name.starts_with("cni")
+    {
+        return NetInterfaceKind::Container;
+    }
+    if name.starts_with("tun")
         || name.starts_with("tap")
+        || name.starts_with("wg")
+        || name.starts_with("ppp")
+    {
+        return NetInterfaceKind::Tunnel;
+    }
+    NetInterfaceKind::External
+}
+
+/// Heuristic — interfaces that should be excluded from "real internet"
+/// totals (loopback, docker, vlan). Kept as a thin wrapper over
+/// [`classify_interface`] for callers that only need the binary
+/// view; new code should use [`classify_interface`] directly.
+pub fn is_virtual_interface(name: &str) -> bool {
+    !classify_interface(name).is_external()
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -247,5 +295,27 @@ mod tests {
         assert!(is_virtual_interface("veth123"));
         assert!(!is_virtual_interface("eth0"));
         assert!(!is_virtual_interface("wlp3s0"));
+    }
+
+    #[test]
+    fn classify_distinguishes_tunnel_from_container() {
+        assert_eq!(classify_interface("eth0"), NetInterfaceKind::External);
+        assert_eq!(classify_interface("wlp3s0"), NetInterfaceKind::External);
+        assert_eq!(classify_interface("lo"), NetInterfaceKind::Loopback);
+        assert_eq!(classify_interface("docker0"), NetInterfaceKind::Container);
+        assert_eq!(classify_interface("veth5a4b"), NetInterfaceKind::Container);
+        assert_eq!(classify_interface("br-abcd"), NetInterfaceKind::Container);
+        assert_eq!(classify_interface("virbr0"), NetInterfaceKind::Container);
+        assert_eq!(classify_interface("tun0"), NetInterfaceKind::Tunnel);
+        assert_eq!(classify_interface("wg0"), NetInterfaceKind::Tunnel);
+        assert_eq!(classify_interface("ppp0"), NetInterfaceKind::Tunnel);
+    }
+
+    #[test]
+    fn tunnels_count_as_external_for_outbound_totals() {
+        assert!(NetInterfaceKind::External.is_external());
+        assert!(NetInterfaceKind::Tunnel.is_external());
+        assert!(!NetInterfaceKind::Container.is_external());
+        assert!(!NetInterfaceKind::Loopback.is_external());
     }
 }

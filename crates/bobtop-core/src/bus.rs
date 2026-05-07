@@ -76,6 +76,8 @@ mod tests {
             buffers_bytes: 0,
             free_bytes: 768,
             pressure: None,
+            cpu_pressure: None,
+            io_pressure: None,
         }
     }
 

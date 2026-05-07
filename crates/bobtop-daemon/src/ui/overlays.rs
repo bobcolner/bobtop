@@ -266,7 +266,6 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("f", "filter processes by name/cmdline"),
     ("k / K", "kill SIGTERM / SIGKILL (confirm dialog)"),
     // misc
-    ("[ / ]", "cycle network interface in net panel (back / next)"),
     ("+ / -", "adjust global tick (sample rate)"),
     ("O", "options — edit config + save to disk"),
 ];

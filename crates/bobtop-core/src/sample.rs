@@ -63,6 +63,14 @@ pub struct MemorySample {
     /// Pressure-stall info from `/proc/pressure/memory`. Linux 4.20+;
     /// `None` on hosts that don't expose it (older kernels, some VMs).
     pub pressure: Option<MemoryPressure>,
+    /// PSI from `/proc/pressure/cpu`. Same shape as memory PSI but
+    /// attributable to CPU contention — usually the most-active
+    /// source on busy hosts and the one users see fluctuate.
+    pub cpu_pressure: Option<MemoryPressure>,
+    /// PSI from `/proc/pressure/io`. Reflects time waiting on block
+    /// device I/O — informative on hosts with slow disks or heavy
+    /// swap.
+    pub io_pressure: Option<MemoryPressure>,
 }
 
 #[derive(Debug, Clone, Copy)]

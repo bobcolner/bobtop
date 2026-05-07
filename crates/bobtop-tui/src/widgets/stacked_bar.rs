@@ -96,6 +96,11 @@ pub enum LegendStyle {
     /// Each label sits in the column range of its segment. Labels truncate
     /// or drop entirely when their segment is too narrow to fit them.
     Aligned,
+    /// One legend row per segment. Lets each row use the full bar
+    /// width for `■ name  value` — best when proportions are very
+    /// uneven and the inline list would crowd. Caller must reserve
+    /// enough height: `1 + segments.len()` rows total.
+    Stacked,
 }
 
 impl<'a> StackedBar<'a> {
@@ -197,8 +202,69 @@ impl<'a> Widget for &StackedBar<'a> {
                         chrome,
                     );
                 }
+                LegendStyle::Stacked => {
+                    render_legend_stacked(
+                        buf,
+                        area.x,
+                        bar_y + 1,
+                        area.width,
+                        area.height.saturating_sub(1),
+                        self.segments,
+                        chrome,
+                    );
+                }
             }
         }
+    }
+}
+
+/// One legend row per segment. Each row gets the full available
+/// width so `■ Cached  4.8 GiB (32%)` reads cleanly even when the
+/// segment itself occupies a thin slice. Truncates to `max_rows` so
+/// short panels don't overflow into adjacent widgets.
+fn render_legend_stacked(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    max_rows: u16,
+    segments: &[StackedSegment],
+    chrome: Style,
+) {
+    if width == 0 || max_rows == 0 {
+        return;
+    }
+    let total: f64 = segments
+        .iter()
+        .map(|s| s.fraction)
+        .sum::<f64>()
+        .max(f64::EPSILON);
+    for (i, seg) in segments.iter().enumerate() {
+        if i as u16 >= max_rows {
+            break;
+        }
+        let row_y = y + i as u16;
+        // Color marker.
+        let cell = &mut buf[(x, row_y)];
+        cell.set_char('■');
+        cell.set_style(Style::default().fg(seg.color));
+        // Label + value + percentage. Percentage hint mirrors what
+        // the bar's segment width represents — saves the user from
+        // measuring the bar with their eyes.
+        let pct = seg.fraction / total * 100.0;
+        let value = seg.value.as_deref().unwrap_or("");
+        let body = if value.is_empty() {
+            format!(" {}  {:.0}%", seg.label, pct)
+        } else {
+            format!(" {}  {}  ({:.0}%)", seg.label, value, pct)
+        };
+        let avail = width.saturating_sub(1) as usize;
+        let drawn = if body.chars().count() > avail {
+            truncate_to(&body, avail)
+        } else {
+            body
+        };
+        write_str_n(buf, x + 1, row_y, &drawn, avail, chrome);
     }
 }
 

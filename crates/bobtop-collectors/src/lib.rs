@@ -19,5 +19,7 @@ pub mod process;
 pub use cpu::CpuCollector;
 pub use disk::DiskCollector;
 pub use memory::MemoryCollector;
-pub use network::{is_virtual_interface, NetworkGlobalCollector};
+pub use network::{
+    classify_interface, is_virtual_interface, NetInterfaceKind, NetworkGlobalCollector,
+};
 pub use process::ProcessCollector;

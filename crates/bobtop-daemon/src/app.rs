@@ -129,6 +129,13 @@ pub struct App {
     /// 0..=100. Drives the PSI sparkline. Empty on hosts without
     /// `/proc/pressure/memory`.
     pub mem_pressure_history: VecDeque<f64>,
+    /// CPU PSI history (same units as `mem_pressure_history`). Usually
+    /// the most active source — memory PSI is rare on healthy hosts
+    /// but cpu PSI fluctuates with normal contention.
+    pub cpu_pressure_history: VecDeque<f64>,
+    /// I/O PSI history. Spikes during heavy disk reads/writes or
+    /// swap activity.
+    pub io_pressure_history: VecDeque<f64>,
     pub latest_cpu: Option<CpuSample>,
     pub latest_mem: Option<MemorySample>,
     pub latest_processes: Option<ProcessSample>,
@@ -205,6 +212,8 @@ impl App {
             disk_history: std::collections::HashMap::new(),
             mem_history: VecDeque::with_capacity(HISTORY_CAP),
             mem_pressure_history: VecDeque::with_capacity(PER_TRACK_HISTORY_CAP),
+            cpu_pressure_history: VecDeque::with_capacity(PER_TRACK_HISTORY_CAP),
+            io_pressure_history: VecDeque::with_capacity(PER_TRACK_HISTORY_CAP),
             latest_cpu: None,
             latest_mem: None,
             latest_processes: None,
@@ -295,10 +304,21 @@ impl App {
             push_capped(&mut self.mem_history, used_frac, HISTORY_CAP);
         }
         // PSI: most-responsive window (`some_avg10`) as 0..=1 fraction of
-        // "100% stalled for the full 10s window."
+        // "100% stalled for the full 10s window." We track three
+        // sources so the sparkline catches whichever one a host
+        // actually exercises (memory PSI is rarely non-zero on
+        // healthy hosts; cpu / io often are).
         if let Some(p) = s.pressure {
             let frac = (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0);
             push_capped(&mut self.mem_pressure_history, frac, PER_TRACK_HISTORY_CAP);
+        }
+        if let Some(p) = s.cpu_pressure {
+            let frac = (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0);
+            push_capped(&mut self.cpu_pressure_history, frac, PER_TRACK_HISTORY_CAP);
+        }
+        if let Some(p) = s.io_pressure {
+            let frac = (p.some_avg10 as f64 / 100.0).clamp(0.0, 1.0);
+            push_capped(&mut self.io_pressure_history, frac, PER_TRACK_HISTORY_CAP);
         }
         self.latest_mem = Some(s);
     }
@@ -581,11 +601,20 @@ impl App {
     /// the panel's filter.
     pub fn cycle_selected_iface(&mut self, direction: i32) {
         let Some(s) = &self.latest_network else { return };
+        // Cycling filter: by default land only on physical / external
+        // NICs. Tunnels (tun*, wg*, ppp*) count as "outbound" in the
+        // category breakdown but we don't want a stale wg0 from an
+        // old VPN session to be a landing slot in `[`/`]`. With
+        // show_virtual_net = true, every interface is reachable.
         let mut names: Vec<String> = s
             .interfaces
             .iter()
             .filter(|i| {
-                self.show_virtual_net || !bobtop_collectors::is_virtual_interface(&i.name)
+                self.show_virtual_net
+                    || matches!(
+                        bobtop_collectors::classify_interface(&i.name),
+                        bobtop_collectors::NetInterfaceKind::External
+                    )
             })
             .map(|i| i.name.clone())
             .collect();
@@ -802,17 +831,10 @@ impl App {
                 self.cycle_group_mode();
                 ControlFlow::Continue
             }
-            // `[` / `]` cycle the focused network interface in the net
-            // panel. `n` was the obvious mnemonic but it's already bound
-            // to sort-by-name in the proc panel.
-            KeyCode::Char('[') => {
-                self.cycle_selected_iface(-1);
-                ControlFlow::Continue
-            }
-            KeyCode::Char(']') => {
-                self.cycle_selected_iface(1);
-                ControlFlow::Continue
-            }
+            // `[` / `]` previously cycled a focused network interface.
+            // The net panel now lists every visible interface inline,
+            // so the focus mode (and these chord keys) was retired.
+            KeyCode::Char('[') | KeyCode::Char(']') => ControlFlow::Continue,
             KeyCode::Char(' ') => {
                 // Space toggles expand on the row at cursor (header in
                 // grouped modes, subtree root in tree mode).

@@ -121,6 +121,8 @@ mod tests {
             buffers_bytes: 0,
             free_bytes: 1024 - used,
             pressure: None,
+            cpu_pressure: None,
+            io_pressure: None,
         }
     }
 
