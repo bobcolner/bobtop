@@ -1,23 +1,21 @@
 //! `bobtop-fb` — TUI file browser library.
 //!
-//! Public surface intentionally narrow: callers (the `bobtop-fb` binary
-//! today, possibly bobtop later) construct an [`App`], hand it a terminal
-//! and an event stream, and let `App::run` drive. All rendering goes
-//! through `bobtop-tui` widgets — this crate does not import ratatui
-//! drawing primitives directly.
+//! Public surface intentionally narrow: external callers go through
+//! [`cli::run`] and nothing else. All other modules are crate-internal
+//! plumbing — they were previously `pub` so the binary in `src/bin/`
+//! could reach them, but the binary only ever called `cli::run`, so
+//! exposing the rest was bloat.
 
 #![forbid(unsafe_code)]
 
-pub mod app;
 pub mod cli;
-pub mod editor;
-pub mod find;
-pub mod fs;
-pub mod keys;
-pub mod nav;
-pub mod preview;
-pub mod state;
-pub mod ui;
 
-pub use app::{App, ImageBackend, ImageBackendChoice};
-pub use fs::entry::{EntryKind, FsEntry};
+pub(crate) mod app;
+pub(crate) mod editor;
+pub(crate) mod find;
+pub(crate) mod fs;
+pub(crate) mod keys;
+pub(crate) mod nav;
+pub(crate) mod preview;
+pub(crate) mod state;
+pub(crate) mod ui;

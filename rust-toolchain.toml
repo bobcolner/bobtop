@@ -1,0 +1,7 @@
+# Pin contributors and CI to the same channel. We track stable rather
+# than a specific version so the toolchain floats — the documented MSRV
+# lives in `Cargo.toml`'s `[workspace.package].rust-version`, which
+# cargo enforces at build time.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

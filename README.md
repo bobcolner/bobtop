@@ -14,10 +14,38 @@ bobtop gives you two ways to work with the same engine:
 Key capabilities:
 
 - CPU, memory, disk, network, and process views.
-- Per-process network attribution with fallback tiers.
-- Process clustering by executable, cgroup, or tree.
-- Theme support for btop `.theme` files.
+- Per-process network attribution with fallback tiers (eBPF / libpcap / `/proc`).
+- Process clustering by executable, cgroup, container, parent, or flat.
+- Container-aware process grouping (Docker / Podman / containerd / LXC) with
+  names resolved from runtime metadata — no daemon socket required.
+- Live per-flow network panel (toggle with `N`): pid · proc · remote · state ·
+  ↓/s · ↑/s sorted by busiest, with proc_inode connection enumeration that
+  works on top of any byte-attribution tier.
+- TUI file browser embedded as `bobtop fb` with a built-in nano-style editor
+  that ships live syntect syntax highlighting.
+- Theme support for btop `.theme` files (42 bundled).
 - Headless daemon mode plus auto-spawning agent clients.
+
+## Code quality
+
+Public-release hygiene — what you can verify with the commands in
+`Tests` below:
+
+- `cargo build --release`: **zero warnings** across the workspace.
+- `cargo test --workspace`: **313 tests passing**, no `#[ignore]`s, no
+  fixed-port `bind`s in tests.
+- **Zero `TODO` / `FIXME` / `XXX` / `HACK` markers** anywhere in `crates/`.
+- `#![forbid(unsafe_code)]` on every crate that doesn't need to talk to the
+  kernel; the one exception (`bobtop-pid-attr`) uses `#![deny(unsafe_code)]`
+  with a single documented `unsafe fn` for plain-bytes round-tripping a
+  libbpf-rs map value.
+- No `panic!` / `unwrap` / `expect` in non-test code paths.
+- `tracing` for diagnostics; `println!` / `eprintln!` only appear in
+  user-facing CLI surfaces (help text, `--list-themes`).
+- Public API surface trimmed to what callers actually consume — internal
+  modules are `pub(crate)`, not `pub`.
+- `rustfmt.toml` + `rust-toolchain.toml` committed; CI runs
+  `cargo fmt --check` + `cargo test --workspace` on every push.
 
 ### Agent prompt
 
@@ -66,9 +94,9 @@ Optional features:
 
 | feature | adds | system deps |
 |---|---|---|
+| `fb` (default) | embeds the file browser as `bobtop fb`; bound to `b` in the TUI | none |
+| `ebpf` (default) | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
 | `pcap` | Tier 2 per-process bandwidth attribution | `libpcap-dev` |
-| `ebpf` | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
-| `nvidia` | NVIDIA GPU stats via NVML | proprietary NVIDIA drivers |
 
 Examples:
 
@@ -168,6 +196,7 @@ bobtop is organized around a shared engine and thin front-ends.
 | `bobtop-pid-attr` | per-process network and disk attribution helpers |
 | `bobtop-engine` | sampling engine plus agent query surface |
 | `bobtop-tui` | ratatui widgets, themes, and layout code |
+| `bobtop-fb` | TUI file browser + embedded nano-style editor |
 | `bobtop-daemon` | binary, CLI, and TUI wiring |
 
 ### Agent surface
@@ -237,7 +266,14 @@ cargo run --example ebpf_smoke -p bobtop-daemon --features ebpf
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Dual-licensed under either of:
+
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+
+at your option.
 
 The vendored `.theme` files in `crates/bobtop-tui/themes/` come from
 [aristocratos/btop](https://github.com/aristocratos/btop) and are

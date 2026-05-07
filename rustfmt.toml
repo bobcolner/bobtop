@@ -1,0 +1,3 @@
+# Stable rustfmt defaults — empty file is intentional. The point of
+# committing it is to lock contributors to the same channel-stable
+# behavior; bobtop's existing source is already formatted by it.

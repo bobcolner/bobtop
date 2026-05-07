@@ -16,7 +16,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod agent;
-pub mod engine;
+pub(crate) mod engine;
 
 // Top-level re-exports for the most common entry points.
 pub use engine::{Engine, EngineConfig, EngineMeta};

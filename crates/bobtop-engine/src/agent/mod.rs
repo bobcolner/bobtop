@@ -7,8 +7,8 @@
 //! requests over the socket.
 
 pub mod client;
-pub mod query;
-pub mod schema;
+pub(crate) mod query;
+pub(crate) mod schema;
 pub mod server;
 
 pub use server::spawn;

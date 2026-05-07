@@ -10,12 +10,12 @@
 
 #![forbid(unsafe_code)]
 
-pub mod container;
-pub mod cpu;
-pub mod disk;
-pub mod memory;
-pub mod network;
-pub mod process;
+pub(crate) mod container;
+pub(crate) mod cpu;
+pub(crate) mod disk;
+pub(crate) mod memory;
+pub(crate) mod network;
+pub(crate) mod process;
 
 pub use cpu::CpuCollector;
 pub use disk::DiskCollector;

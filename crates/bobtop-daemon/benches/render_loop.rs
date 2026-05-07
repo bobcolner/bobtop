@@ -23,7 +23,7 @@ use bobtop_core::sample::{
 use bobtop_core::MetricEvent;
 use bobtop_daemon::app::App;
 use bobtop_daemon::ui;
-use bobtop_pid_attr::{AttributorTier, ProcessNetSample};
+use bobtop_pid_attr::AttributorTier;
 use bobtop_tui::LayoutPreset;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ratatui::backend::TestBackend;
@@ -64,6 +64,8 @@ fn populated_app() -> App {
             buffers_bytes: 1u64 * (1 << 30),
             free_bytes: 7u64 * (1 << 30),
             pressure: None,
+            cpu_pressure: None,
+            io_pressure: None,
         }));
         app.apply_event(MetricEvent::Network(NetworkSample {
             timestamp: Instant::now(),
@@ -129,17 +131,10 @@ fn populated_app() -> App {
         timestamp: Instant::now(),
         processes: procs,
     }));
-    app.apply_net(
-        vec![ProcessNetSample {
-            pid: 1234,
-            name: "active-app".into(),
-            rx_bytes_per_sec: Some(125_000.0),
-            tx_bytes_per_sec: Some(48_000.0),
-            connections: vec![],
-            attributor_tier: AttributorTier::EbpfKernel,
-        }],
-        AttributorTier::EbpfKernel,
-    );
+    // Per-pid net rates flow through `AttributionStore` now, not a
+    // direct `apply_net` on App — and the render-loop bench measures
+    // draw-side hot paths, not attribution plumbing, so synthetic net
+    // is no longer needed.
     app
 }
 

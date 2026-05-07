@@ -15,36 +15,41 @@
 //! specific tier or pass capability hints (`--no-ebpf`, `--no-pcap`) via
 //! [`SelectOptions`].
 
-// `deny` rather than `forbid` so the `ebpf` module can opt in for the single
-// `unsafe impl aya::Pod for PidBytes`. Every other unsafe block in the crate
-// remains a hard error.
+// `deny` rather than `forbid` so the `ebpf::net` module can opt in for
+// the single `unsafe fn pid_bytes_from_slice` (plain-bytes round-trip
+// of the kernel-side struct via libbpf-rs). Every other unsafe block
+// in the crate remains a hard error.
 #![deny(unsafe_code)]
 
-pub mod attributor;
-pub mod disk_attributor;
-pub mod error;
-pub mod sample;
-pub mod store;
-pub mod tier;
-pub mod unavailable;
+pub(crate) mod attributor;
+pub(crate) mod disk_attributor;
+pub(crate) mod error;
+pub(crate) mod sample;
+pub(crate) mod store;
+pub(crate) mod tier;
+pub(crate) mod unavailable;
 
+// `proc_inode` is the only submodule whose path is reached externally
+// (`bobtop_pid_attr::proc_inode::ProcInodeAttributor`) — the engine's
+// flow enumerator constructs one directly to populate connection lists
+// independent of the active byte tier.
 #[cfg(target_os = "linux")]
 pub mod proc_inode;
 
 #[cfg(target_os = "linux")]
-pub mod proc_io;
+pub(crate) mod proc_io;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod proc_walk;
 
 #[cfg(target_os = "macos")]
-pub mod macos;
+pub(crate) mod macos;
 
 #[cfg(feature = "pcap")]
-pub mod pcap_backend;
+pub(crate) mod pcap_backend;
 
 #[cfg(all(target_os = "linux", feature = "ebpf"))]
-pub mod ebpf;
+pub(crate) mod ebpf;
 
 pub use attributor::NetworkAttributor;
 pub use disk_attributor::{DiskAttributor, DiskAttributorTier, ProcessDiskSample};

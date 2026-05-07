@@ -58,6 +58,7 @@ pub enum MatchQuery {
 }
 
 impl MatchQuery {
+    #[allow(dead_code)]
     pub fn into_vec(self) -> Vec<String> {
         match self {
             MatchQuery::One(s) => vec![s],

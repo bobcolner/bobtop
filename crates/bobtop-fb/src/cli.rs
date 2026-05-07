@@ -18,7 +18,8 @@ use ratatui::Terminal;
 
 use bobtop_tui::{load_theme, DEFAULT_THEME_NAME};
 
-use crate::{state, App, ImageBackendChoice};
+use crate::app::{App, ImageBackendChoice};
+use crate::state;
 
 #[derive(Debug, Parser)]
 #[command(

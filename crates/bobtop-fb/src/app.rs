@@ -577,6 +577,10 @@ pub enum ImageBackendChoice {
 }
 
 impl App {
+    /// Convenience constructor that lets the image backend auto-detect.
+    /// Currently the binary always specifies a backend explicitly via
+    /// `new_with`; this entry point is kept for symmetric API.
+    #[allow(dead_code)]
     pub fn new(start: PathBuf, theme: Theme) -> io::Result<Self> {
         Self::new_with(start, theme, ImageBackendChoice::Auto)
     }
@@ -672,6 +676,7 @@ impl App {
         self.entries.get(self.nav.cursor)
     }
 
+    #[allow(dead_code)]
     pub fn theme(&self) -> &Theme {
         &self.theme
     }
@@ -745,7 +750,8 @@ impl App {
 
     /// Recorded by the renderer once it knows the preview pane rect.
     /// Mouse-wheel routing reads this back to tell which pane the user
-    /// is hovering.
+    /// is hovering. Currently unused — mouse routing landed elsewhere.
+    #[allow(dead_code)]
     pub fn record_preview_pane_x(&mut self, start: u16, end: u16) {
         self.preview_pane_x_start = start;
         self.preview_pane_x_end = end;

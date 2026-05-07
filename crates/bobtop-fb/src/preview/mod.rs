@@ -23,6 +23,7 @@ use ::image::DynamicImage;
 use ratatui::text::Line;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // TooLarge reserved for future size-cap rejection path.
 pub enum PreviewKind {
     /// Plain or syntax-highlighted text.
     Text,
@@ -96,6 +97,7 @@ pub enum PreviewState {
 }
 
 impl PreviewState {
+    #[allow(dead_code)]
     pub fn path(&self) -> Option<&PathBuf> {
         match self {
             PreviewState::None => None,

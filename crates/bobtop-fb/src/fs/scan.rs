@@ -12,6 +12,7 @@ use std::path::Path;
 use super::entry::{EntryKind, FsEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Size / Mtime wired to scan_dir but no UI yet binds the toggle.
 pub enum SortMode {
     Name,
     Size,
