@@ -7,6 +7,7 @@ members = [
     "crates/bobtop-engine",
     "crates/bobtop-tui",
     "crates/bobtop-daemon",
+    "crates/bobtop-fb",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ bobtop-collectors = { path = "crates/bobtop-collectors" }
 bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
 bobtop-engine = { path = "crates/bobtop-engine" }
 bobtop-tui = { path = "crates/bobtop-tui" }
+bobtop-fb = { path = "crates/bobtop-fb" }
 
 # TUI rendering
 ratatui = "0.29"

@@ -15,6 +15,8 @@ pub mod meter;
 pub mod modal;
 pub mod mini_meter;
 pub mod data_table;
+pub mod miller_columns;
+pub mod scrollable_text;
 pub mod selectable_list;
 pub mod settings_form;
 pub mod section_header;
@@ -34,6 +36,8 @@ pub use data_table::{
     DataTable, TableLayout, TableRow as ProcessTableRow, TableRowMeta as ProcessTableRowMeta,
     TableGroupHeader as ProcessTableGroupHeader, TableSort as ProcessTableSort,
 };
+pub use miller_columns::{MillerColumn, MillerColumns};
+pub use scrollable_text::ScrollableText;
 pub use selectable_list::SelectableList;
 pub use settings_form::{SettingRow, SettingValue, SettingsForm};
 pub use section_header::SectionHeader;
