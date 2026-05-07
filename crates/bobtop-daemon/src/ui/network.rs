@@ -118,6 +118,18 @@ fn draw_interface_rows(
     interfaces: &[InterfaceSample],
     app: &App,
 ) {
+    // Heatmap denominator — biggest single-direction rate among visible
+    // interfaces. Cells colour themselves at `value / peak`, so the
+    // busiest row hits gradient `end` and quieter rows stay muted.
+    // Floor at 1 MiB/s so an idle host doesn't drive a full-bright
+    // colour for a 200 B/s heartbeat.
+    let mut peak = 1024.0_f64 * 1024.0;
+    for iface in interfaces {
+        let r = iface.rx_bytes_per_sec.max(iface.tx_bytes_per_sec);
+        if r > peak {
+            peak = r;
+        }
+    }
     let buf = frame.buffer_mut();
     for (i, iface) in interfaces.iter().take(area.height as usize).enumerate() {
         draw_interface_row(
@@ -125,15 +137,23 @@ fn draw_interface_rows(
             Rect::new(area.x, area.y + i as u16, area.width, 1),
             iface,
             app,
+            peak,
         );
     }
 }
+
+/// Below this combined throughput an interface is treated as idle and
+/// the whole row is rendered in `inactive_fg`. ~256 B/s catches the
+/// background-chatter floor (mDNS pings, ARP, an idle SSH keepalive)
+/// without dimming a row that's actually moving data.
+const IDLE_BPS_THRESHOLD: f64 = 256.0;
 
 fn draw_interface_row(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
     iface: &InterfaceSample,
     app: &App,
+    peak_bps: f64,
 ) {
     if area.width < 16 {
         return;
@@ -146,8 +166,11 @@ fn draw_interface_row(
         NetInterfaceKind::Container => ("lan", theme.inactive_fg),
         NetInterfaceKind::Loopback => ("lo ", theme.inactive_fg),
     };
+    let active = iface.rx_bytes_per_sec + iface.tx_bytes_per_sec >= IDLE_BPS_THRESHOLD;
+    let row_fg = if active { theme.main_fg } else { theme.inactive_fg };
 
-    // 1: 3-cell category badge in the kind's accent color.
+    // Category badge — kept in its accent colour even on idle rows so
+    // the kind is always legible at a glance.
     write_str_at(
         buf,
         area.x,
@@ -156,41 +179,58 @@ fn draw_interface_row(
         Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
     );
 
-    // 2: interface name (truncated). Reserve ~14 cells; longer names
-    // truncate with the standard ellipsis helper.
+    // Interface name. Reserve 14 cells; longer names truncate.
     let name_x = area.x + 4;
     let name_max: usize = 14;
     let name = truncate_chars(&iface.name, name_max);
-    write_str_at(
-        buf,
-        name_x,
-        area.y,
-        &name,
-        Style::default().fg(theme.main_fg),
-    );
+    write_str_at(buf, name_x, area.y, &name, Style::default().fg(row_fg));
 
-    // 3: right-aligned rates `↑ X/s   ↓ Y/s`. Skip when the row is
-    // narrower than the rate block itself.
-    let up = format!("↑ {}/s", format_rate(iface.tx_bytes_per_sec));
-    let dn = format!("↓ {}/s", format_rate(iface.rx_bytes_per_sec));
-    let block = format!("{}  {}", up, dn);
-    let block_w = block.chars().count() as u16;
+    // Two fixed-width rate cells (arrow + 8-char right-aligned value).
+    // Fixed width means the `↑` / `↓` arrows line up across rows, so
+    // the eye can scan a column of rates instead of chasing them
+    // around like the previous variable-width layout did.
+    let cell_w: u16 = 10;
+    let block_w = cell_w * 2 + 2; // 2-cell gap between arrow blocks
     let name_end = name_x + name_max as u16;
-    if name_end + block_w + 2 <= area.right() {
-        // Color the arrows by direction; main_fg for everything else
-        // so the eye picks up rates first, units second.
-        let block_x = area.right().saturating_sub(block_w);
-        write_str_at(buf, block_x, area.y, &up, Style::default().fg(theme.upload.end));
-        let dn_x = block_x + up.chars().count() as u16 + 2;
-        write_str_at(
-            buf,
-            dn_x,
-            area.y,
-            &dn,
-            Style::default().fg(theme.download.end),
-        );
+    if name_end + block_w + 2 > area.right() {
+        return;
     }
+    let block_x = area.right().saturating_sub(block_w);
+    let up_style = if active {
+        rate_style(&theme.upload, iface.tx_bytes_per_sec, peak_bps)
+    } else {
+        Style::default().fg(theme.inactive_fg)
+    };
+    let dn_style = if active {
+        rate_style(&theme.download, iface.rx_bytes_per_sec, peak_bps)
+    } else {
+        Style::default().fg(theme.inactive_fg)
+    };
+    let up_val = format!("{}/s", format_rate(iface.tx_bytes_per_sec));
+    let dn_val = format!("{}/s", format_rate(iface.rx_bytes_per_sec));
+    write_arrow_rate(buf, block_x, area.y, "↑", &up_val, cell_w, up_style);
+    write_arrow_rate(buf, block_x + cell_w + 2, area.y, "↓", &dn_val, cell_w, dn_style);
 }
+
+/// Render a single arrow + right-aligned rate value into a fixed-width
+/// cell. Layout: `↑` at the cell's left edge, the rate text right-
+/// justified inside the remaining `cell_w - 2` cells.
+fn write_arrow_rate(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    arrow: &str,
+    rate: &str,
+    cell_w: u16,
+    style: Style,
+) {
+    write_str_at(buf, x, y, arrow, style);
+    let value_w = cell_w.saturating_sub(2);
+    let rate_w = bobtop_tui::display_width(rate) as u16;
+    let pad = value_w.saturating_sub(rate_w);
+    write_str_at(buf, x + 2 + pad, y, rate, style);
+}
+
 
 /// Aggregate current rate across all visible (filtered) interfaces.
 /// Drives the centerline labels above/below the dual-trace graph.
