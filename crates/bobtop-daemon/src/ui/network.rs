@@ -187,37 +187,42 @@ fn draw_interface_row(
     let active = iface.rx_bytes_per_sec + iface.tx_bytes_per_sec >= IDLE_BPS_THRESHOLD;
     let row_fg = if active { theme.main_fg } else { theme.inactive_fg };
 
+    // Layout: pack the entire row (badge + name + rate block) into one
+    // tight unit and anchor that unit to the panel's right edge. Each
+    // sub-element keeps its fixed reservation so rates still column-
+    // align across rows.
+    //
+    //   [badge 3] [gap 1] [name 12] [gap 2] [↑ cell 9] [gap 1] [↓ cell 9]
+    //   = 37 cells total
+    let cell_w: u16 = 9;
+    let name_max: u16 = 12;
+    let row_w: u16 = 3 + 1 + name_max + 2 + cell_w + 1 + cell_w;
+    if row_w + 1 > area.width {
+        return;
+    }
+    let row_x = area.right().saturating_sub(row_w);
+
     // Category badge — kept in its accent colour even on idle rows so
     // the kind is always legible at a glance.
     write_str_at(
         buf,
-        area.x,
+        row_x,
         area.y,
         cat_label,
         Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
     );
 
-    // Interface name. Reserve 12 cells (was 14) — most NICs are
-    // ≤6 chars (eth0, wlan0, docker0, br-…); longer names still
-    // truncate cleanly.
-    let name_x = area.x + 4;
-    let name_max: usize = 12;
-    let name = truncate_chars(&iface.name, name_max);
+    // Interface name. Reserve 12 cells — most NICs are ≤6 chars (eth0,
+    // wlan0, docker0, br-…); longer names still truncate cleanly.
+    let name_x = row_x + 4;
+    let name = truncate_chars(&iface.name, name_max as usize);
     write_str_at(buf, name_x, area.y, &name, Style::default().fg(row_fg));
 
     // Two fixed-width rate cells. Each cell is `arrow + space + 7-char
     // right-aligned value` = 9 cells, with a 1-cell gap between the
     // two arrow blocks. Worst-case rate text after format_rate() is
     // 6 cells ("999.9G/s") — 7 leaves a comfortable gutter.
-    let cell_w: u16 = 9;
-    let block_w = cell_w * 2 + 1;
-    let name_end = name_x + name_max as u16;
-    // Right-justify the rate block to the panel's right edge so the
-    // ↑/↓ arrows + rates flush against the border.
-    if name_end + block_w + 1 > area.right() {
-        return;
-    }
-    let block_x = area.right().saturating_sub(block_w);
+    let block_x = name_x + name_max + 2;
     let up_style = if active {
         rate_style(&theme.upload, iface.tx_bytes_per_sec, peak_bps)
     } else {
