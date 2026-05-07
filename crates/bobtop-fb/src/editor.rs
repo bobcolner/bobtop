@@ -5,19 +5,47 @@
 //! (`bobtop_tui::EditableText`) renders these; this module only
 //! mutates state in response to keystrokes.
 //!
-//! Ops covered for v1: char insert, Backspace / Delete, newline,
-//! Tab (4-space soft tab), arrow keys, Home / End, PgUp / PgDn,
-//! Ctrl-Home / Ctrl-End, Ctrl-S save (atomic via sibling tmp +
-//! rename), Ctrl-X exit with dirty-confirm. No undo, selection, or
-//! search yet — those land in v2 if used.
+//! Ops covered: char insert, Backspace / Delete, newline, Tab (4-space
+//! soft tab), arrow keys, Home / End, PgUp / PgDn, Ctrl-S save (atomic
+//! via sibling tmp + rename), Ctrl-X exit with dirty-confirm. No undo,
+//! selection, or search yet.
+//!
+//! Movement bindings are layered to survive Mac terminals that strip
+//! Ctrl+arrow / Alt+arrow before delivery:
+//!
+//! * Readline-style (works everywhere): Ctrl-A / Ctrl-E line start/end,
+//!   Ctrl-F / Ctrl-B / Ctrl-N / Ctrl-P char/line motion, Ctrl-T / Ctrl-G
+//!   buffer top/bottom, Ctrl-W kill-word-back, Ctrl-K / Ctrl-U kill to
+//!   EOL / BOL, Ctrl-D forward delete.
+//! * PC-style (works on most Linux/Windows terminals): Ctrl-Home /
+//!   Ctrl-End buffer top/bottom, Ctrl-Left / Ctrl-Right word jumps,
+//!   Ctrl-Backspace / Ctrl-Delete word delete.
+//! * Meta-style (works when "Option as Meta" is enabled in iTerm2 /
+//!   Terminal.app): Alt-B / Alt-F / Alt-D word ops, Alt-< / Alt->
+//!   buffer top/bottom, Alt-Home / Alt-End viewport top/bottom.
+//!
+//! Live syntax highlighting: a `Vec<Line<'static>>` cache parallel to
+//! `lines` is rebuilt eagerly after every mutation via syntect. Files
+//! over `MAX_HIGHLIGHT_LINES` skip the cache and fall through to the
+//! widget's plain-text path so very large buffers stay responsive.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
 use unicode_width::UnicodeWidthChar;
 
+use crate::preview::highlight::{syntax_for_path, syntaxes, theme, to_ratatui};
+
 const SOFT_TAB: &str = "    ";
+
+/// Cap on file size for live highlighting. Above this we skip the cache
+/// to keep keystroke latency bounded — syntect over the full buffer on
+/// every mutation is a few ms / 5k lines, which is fine, but a 100k-line
+/// log file would feel laggy. Plain rendering kicks in instead.
+const MAX_HIGHLIGHT_LINES: usize = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct EditorState {
@@ -34,6 +62,9 @@ pub struct EditorState {
     /// Set when the user pressed Ctrl-X / Esc on a dirty buffer —
     /// the next key picks save / discard / cancel.
     pub quit_confirm: bool,
+    /// Pre-styled lines parallel to `lines`. Empty when over the line
+    /// cap, in which case the renderer falls back to plain text.
+    pub highlighted: Vec<Line<'static>>,
 }
 
 /// What the run loop should do after `handle_key` returns.
@@ -62,7 +93,7 @@ impl EditorState {
         if lines.is_empty() {
             lines.push(String::new());
         }
-        Ok(Self {
+        let mut state = Self {
             path: path.to_path_buf(),
             lines,
             cursor: (0, 0),
@@ -72,7 +103,10 @@ impl EditorState {
             message: None,
             message_ttl: 0,
             quit_confirm: false,
-        })
+            highlighted: Vec::new(),
+        };
+        state.rebuild_highlight();
+        Ok(state)
     }
 
     pub fn name(&self) -> String {
@@ -94,6 +128,56 @@ impl EditorState {
                 self.message = None;
             }
         }
+    }
+
+    /// Mark the buffer as modified — bumps the file-dirty flag *and*
+    /// triggers a syntax-highlight rebuild. Prefer this over flipping
+    /// `self.dirty` directly so the two stay in sync.
+    fn mark_modified(&mut self) {
+        self.dirty = true;
+        self.rebuild_highlight();
+    }
+
+    /// Re-run syntect over the entire buffer. Cheap for typical edit
+    /// sizes; bypassed for files over `MAX_HIGHLIGHT_LINES`.
+    pub fn rebuild_highlight(&mut self) {
+        if self.lines.len() > MAX_HIGHLIGHT_LINES {
+            self.highlighted.clear();
+            return;
+        }
+        let syntax_set = syntaxes();
+        let theme = theme();
+        let syn = syntax_for_path(&self.path, syntax_set);
+        let mut hl = HighlightLines::new(syn, theme);
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(self.lines.len());
+        for raw in &self.lines {
+            // syntect expects newline-terminated input for its line
+            // grammars (multi-line constructs anchor on `\n`). We feed
+            // each buffer line plus a synthetic newline.
+            let mut buf = String::with_capacity(raw.len() + 1);
+            buf.push_str(raw);
+            buf.push('\n');
+            let regions = match hl.highlight_line(&buf, syntax_set) {
+                Ok(r) => r,
+                Err(_) => {
+                    // On failure (rare; syntect doesn't usually error
+                    // mid-stream) fall back to a plain line so the
+                    // editor stays usable.
+                    out.push(Line::from(raw.clone()));
+                    continue;
+                }
+            };
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(regions.len());
+            for (style, text) in regions {
+                let stripped = text.trim_end_matches(|c| c == '\n' || c == '\r');
+                if stripped.is_empty() {
+                    continue;
+                }
+                spans.push(Span::styled(stripped.to_string(), to_ratatui(style)));
+            }
+            out.push(Line::from(spans));
+        }
+        self.highlighted = out;
     }
 
     /// Atomic save: write to a sibling temp file and rename. Avoids
@@ -136,6 +220,7 @@ impl EditorState {
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if ctrl {
             return match key.code {
                 KeyCode::Char('s') => {
@@ -163,12 +248,196 @@ impl EditorState {
                 }
                 KeyCode::Home => {
                     self.cursor = (0, 0);
+                    self.ensure_visible(viewport_rows, viewport_cols);
                     EditorOutcome::Continue
                 }
                 KeyCode::End => {
                     let last = self.lines.len().saturating_sub(1);
                     let col = self.lines[last].chars().count();
                     self.cursor = (last, col);
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Left => {
+                    self.move_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Right => {
+                    self.move_word_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Backspace => {
+                    self.delete_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                // Readline-style movements — these reach the app
+                // reliably even on macOS where Ctrl+arrow / Alt+arrow
+                // are stripped by the terminal.
+                KeyCode::Char('a') => {
+                    self.cursor.1 = 0;
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('e') => {
+                    let row = self.cursor.0;
+                    self.cursor.1 = self.lines[row].chars().count();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('f') => {
+                    self.move_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('b') => {
+                    self.move_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('n') => {
+                    self.move_down();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('p') => {
+                    self.move_up();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('d') => {
+                    // Forward delete — same as Delete key.
+                    self.delete_forward();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('w') => {
+                    // Kill previous word (readline / emacs / nano).
+                    self.delete_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('k') => {
+                    // Kill from cursor to end of line; if already at
+                    // EOL, swallow the line break.
+                    let row = self.cursor.0;
+                    let len = self.lines[row].chars().count();
+                    if self.cursor.1 < len {
+                        self.delete_range(self.cursor, (row, len));
+                    } else if row + 1 < self.lines.len() {
+                        let next = self.lines.remove(row + 1);
+                        self.lines[row].push_str(&next);
+                        self.mark_modified();
+                    }
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('u') => {
+                    // Kill from cursor to start of line.
+                    let row = self.cursor.0;
+                    if self.cursor.1 > 0 {
+                        self.delete_range((row, 0), self.cursor);
+                    }
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('t') => {
+                    // Jump to top of buffer (Mac terminals strip
+                    // Ctrl-Home so this gives users a path that
+                    // actually arrives at the app).
+                    self.cursor = (0, 0);
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('g') => {
+                    // Jump to bottom of buffer — symmetric with ^T.
+                    let last = self.lines.len().saturating_sub(1);
+                    let col = self.lines[last].chars().count();
+                    self.cursor = (last, col);
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Delete => {
+                    self.delete_word_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                _ => EditorOutcome::Continue,
+            };
+        }
+        if alt {
+            return match key.code {
+                KeyCode::Home => {
+                    // Jump cursor to the top of the visible viewport.
+                    self.cursor.0 = self.scroll_row;
+                    self.clamp_cursor();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::End => {
+                    // Bottom of visible viewport. `viewport_rows` is the
+                    // body height, so the last visible row index is
+                    // `scroll_row + viewport_rows - 1` clamped to EOF.
+                    let last = self.lines.len().saturating_sub(1);
+                    let target = self
+                        .scroll_row
+                        .saturating_add(viewport_rows.saturating_sub(1))
+                        .min(last);
+                    self.cursor.0 = target;
+                    self.clamp_cursor();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                // Alt-Left/Right also map to word jumps as a fallback —
+                // not all terminals send Ctrl+arrow cleanly.
+                KeyCode::Left => {
+                    self.move_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Right => {
+                    self.move_word_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Backspace => {
+                    self.delete_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                // Readline-style word ops via Meta key — reach the app
+                // when iTerm2 / Terminal.app have "Option as Meta key"
+                // enabled.
+                KeyCode::Char('b') => {
+                    self.move_word_left();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('f') => {
+                    self.move_word_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('d') => {
+                    self.delete_word_right();
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                // Emacs-style buffer top / bottom — the Mac-friendly
+                // equivalent of Ctrl-Home / Ctrl-End. `Alt-<` is
+                // typed as Option-Shift-comma.
+                KeyCode::Char('<') => {
+                    self.cursor = (0, 0);
+                    self.ensure_visible(viewport_rows, viewport_cols);
+                    EditorOutcome::Continue
+                }
+                KeyCode::Char('>') => {
+                    let last = self.lines.len().saturating_sub(1);
+                    let col = self.lines[last].chars().count();
+                    self.cursor = (last, col);
+                    self.ensure_visible(viewport_rows, viewport_cols);
                     EditorOutcome::Continue
                 }
                 _ => EditorOutcome::Continue,
@@ -268,7 +537,7 @@ impl EditorState {
         let byte_idx = char_to_byte(line, col);
         line.insert(byte_idx, c);
         self.cursor.1 = col + 1;
-        self.dirty = true;
+        self.mark_modified();
     }
 
     fn insert_newline(&mut self) {
@@ -279,7 +548,7 @@ impl EditorState {
         self.lines[row] = head.to_string();
         self.lines.insert(row + 1, tail.to_string());
         self.cursor = (row + 1, 0);
-        self.dirty = true;
+        self.mark_modified();
     }
 
     fn backspace(&mut self) {
@@ -294,13 +563,13 @@ impl EditorState {
                 .unwrap_or(byte_end);
             line.replace_range(prev_byte..byte_end, "");
             self.cursor.1 = col - 1;
-            self.dirty = true;
+            self.mark_modified();
         } else if row > 0 {
             let removed = self.lines.remove(row);
             let prev_chars = self.lines[row - 1].chars().count();
             self.lines[row - 1].push_str(&removed);
             self.cursor = (row - 1, prev_chars);
-            self.dirty = true;
+            self.mark_modified();
         }
     }
 
@@ -316,12 +585,132 @@ impl EditorState {
                 .map(|c| byte_start + c.len_utf8())
                 .unwrap_or(byte_start);
             line.replace_range(byte_start..next_byte, "");
-            self.dirty = true;
+            self.mark_modified();
         } else if row + 1 < self.lines.len() {
             let next_line = self.lines.remove(row + 1);
             self.lines[row].push_str(&next_line);
-            self.dirty = true;
+            self.mark_modified();
         }
+    }
+
+    /// Move the cursor to the beginning of the previous word group.
+    /// Behavior models common editors: from the current position skip
+    /// any whitespace backwards, then skip a single contiguous run of
+    /// word-characters (or a run of punctuation), landing on the first
+    /// character of that run. Crosses line boundaries when at column 0.
+    fn move_word_left(&mut self) {
+        let (mut row, mut col) = self.cursor;
+        if col == 0 {
+            if row == 0 {
+                return;
+            }
+            row -= 1;
+            col = self.lines[row].chars().count();
+            self.cursor = (row, col);
+            return;
+        }
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        // Skip whitespace immediately left of cursor.
+        while col > 0 && chars[col - 1].is_whitespace() {
+            col -= 1;
+        }
+        if col == 0 {
+            self.cursor = (row, col);
+            return;
+        }
+        // Skip a contiguous run of the same category (word vs. punct).
+        let kind_word = is_word_char(chars[col - 1]);
+        while col > 0
+            && !chars[col - 1].is_whitespace()
+            && is_word_char(chars[col - 1]) == kind_word
+        {
+            col -= 1;
+        }
+        self.cursor = (row, col);
+    }
+
+    /// Mirror of `move_word_left` — places the cursor at the start of
+    /// the next word: skip the current category run, then skip any
+    /// trailing whitespace. Crosses line boundaries at end of line.
+    fn move_word_right(&mut self) {
+        let (row, mut col) = self.cursor;
+        let chars: Vec<char> = self.lines[row].chars().collect();
+        let len = chars.len();
+        if col >= len {
+            if row + 1 < self.lines.len() {
+                self.cursor = (row + 1, 0);
+            }
+            return;
+        }
+        let kind_word = is_word_char(chars[col]);
+        let starting_in_ws = chars[col].is_whitespace();
+        if !starting_in_ws {
+            // Skip current category run forward.
+            while col < len
+                && !chars[col].is_whitespace()
+                && is_word_char(chars[col]) == kind_word
+            {
+                col += 1;
+            }
+        }
+        // Skip whitespace after.
+        while col < len && chars[col].is_whitespace() {
+            col += 1;
+        }
+        // If we landed at end of line and didn't actually move, hop to
+        // the next line so repeated Ctrl-Right always advances.
+        if col == self.cursor.1 && col == len && row + 1 < self.lines.len() {
+            self.cursor = (row + 1, 0);
+            return;
+        }
+        self.cursor = (row, col);
+        let _ = starting_in_ws; // silence warn — kept for readability
+    }
+
+    fn delete_word_left(&mut self) {
+        let start = self.cursor;
+        self.move_word_left();
+        let end = start;
+        if self.cursor == end {
+            return;
+        }
+        self.delete_range(self.cursor, end);
+    }
+
+    fn delete_word_right(&mut self) {
+        let start = self.cursor;
+        self.move_word_right();
+        let end = self.cursor;
+        if start == end {
+            return;
+        }
+        // `move_word_right` advanced the cursor; restore it so the
+        // delete is forward-from-start.
+        self.cursor = start;
+        self.delete_range(start, end);
+    }
+
+    /// Delete text in `[from, to)` where both are `(row, col)` pairs in
+    /// chars. Caller guarantees `from <= to` and both are valid. Cursor
+    /// ends at `from`.
+    fn delete_range(&mut self, from: (usize, usize), to: (usize, usize)) {
+        let (fr, fc) = from;
+        let (tr, tc) = to;
+        if fr == tr {
+            let line = &mut self.lines[fr];
+            let bs = char_to_byte(line, fc);
+            let be = char_to_byte(line, tc);
+            line.replace_range(bs..be, "");
+        } else {
+            let head_byte = char_to_byte(&self.lines[fr], fc);
+            let tail_byte = char_to_byte(&self.lines[tr], tc);
+            let tail = self.lines[tr][tail_byte..].to_string();
+            self.lines[fr].truncate(head_byte);
+            self.lines[fr].push_str(&tail);
+            self.lines.drain(fr + 1..=tr);
+        }
+        self.cursor = from;
+        self.mark_modified();
     }
 
     fn move_left(&mut self) {
@@ -389,6 +778,14 @@ impl EditorState {
     }
 }
 
+/// Word-character predicate used for word jumps and word delete.
+/// Matches what most editors call a "word": alphanumeric runs plus
+/// underscore. Punctuation forms its own contiguous run so e.g.
+/// `foo()` jumps land between `foo` and `()`.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// Convert a `(line, char_col)` pair into a byte index suitable for
 /// `String::insert`/`replace_range`. Out-of-range cols clamp to end.
 fn char_to_byte(s: &str, col: usize) -> usize {
@@ -430,6 +827,7 @@ mod tests {
             message: None,
             message_ttl: 0,
             quit_confirm: false,
+            highlighted: Vec::new(),
         }
     }
 
@@ -485,6 +883,135 @@ mod tests {
         e.insert_char('a');
         assert_eq!(e.lines, vec!["éa".to_string()]);
         assert_eq!(e.cursor, (0, 2));
+    }
+
+    #[test]
+    fn word_jump_right_lands_at_next_word_start() {
+        let mut e = ed("foo  bar() baz");
+        e.cursor = (0, 0);
+        e.move_word_right();
+        // Past `foo`, past whitespace → start of `bar`.
+        assert_eq!(e.cursor, (0, 5));
+        e.move_word_right();
+        // From inside `bar`'s start: skip word run `bar`, no whitespace,
+        // land at `(`.
+        assert_eq!(e.cursor, (0, 8));
+        e.move_word_right();
+        // Skip `()`, then whitespace → start of `baz`.
+        assert_eq!(e.cursor, (0, 11));
+    }
+
+    #[test]
+    fn word_jump_right_crosses_lines_at_eol() {
+        let mut e = ed("end\nnext");
+        e.cursor = (0, 3); // end of first line
+        e.move_word_right();
+        assert_eq!(e.cursor, (1, 0));
+    }
+
+    #[test]
+    fn word_jump_left_lands_at_word_start() {
+        let mut e = ed("foo  bar baz");
+        e.cursor = (0, 12); // EOL
+        e.move_word_left();
+        assert_eq!(e.cursor, (0, 9)); // start of `baz`
+        e.move_word_left();
+        assert_eq!(e.cursor, (0, 5)); // start of `bar`
+    }
+
+    #[test]
+    fn word_jump_left_crosses_lines_at_col_zero() {
+        let mut e = ed("first\nsecond");
+        e.cursor = (1, 0);
+        e.move_word_left();
+        assert_eq!(e.cursor, (0, 5));
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_previous_word() {
+        let mut e = ed("hello world");
+        e.cursor = (0, 11);
+        e.delete_word_left();
+        // Deleted `world`; line is `hello ` (trailing space stays — the
+        // motion stopped at the space boundary).
+        assert_eq!(e.lines, vec!["hello ".to_string()]);
+        assert_eq!(e.cursor, (0, 6));
+    }
+
+    #[test]
+    fn ctrl_delete_removes_next_word() {
+        let mut e = ed("hello world");
+        e.cursor = (0, 0);
+        e.delete_word_right();
+        // Deleted `hello ` (word + trailing space jump); line is `world`.
+        assert_eq!(e.lines, vec!["world".to_string()]);
+        assert_eq!(e.cursor, (0, 0));
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_a_jumps_to_line_start_ctrl_e_to_end() {
+        let mut e = ed("hello world");
+        e.cursor = (0, 5);
+        e.handle_key(ctrl('a'), 24, 80);
+        assert_eq!(e.cursor, (0, 0));
+        e.handle_key(ctrl('e'), 24, 80);
+        assert_eq!(e.cursor, (0, 11));
+    }
+
+    #[test]
+    fn ctrl_t_g_jump_buffer_top_and_bottom() {
+        let mut e = ed("a\nb\nc");
+        e.cursor = (1, 0);
+        e.handle_key(ctrl('t'), 24, 80);
+        assert_eq!(e.cursor, (0, 0));
+        e.handle_key(ctrl('g'), 24, 80);
+        assert_eq!(e.cursor, (2, 1));
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_end_of_line_then_swallows_break() {
+        let mut e = ed("hello\nworld");
+        e.cursor = (0, 2);
+        e.handle_key(ctrl('k'), 24, 80);
+        // Killed "llo"; line is now "he\nworld".
+        assert_eq!(e.lines, vec!["he".to_string(), "world".to_string()]);
+        e.handle_key(ctrl('k'), 24, 80);
+        // At EOL → second ^K joins the next line.
+        assert_eq!(e.lines, vec!["heworld".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_u_kills_to_beginning_of_line() {
+        let mut e = ed("hello world");
+        e.cursor = (0, 6);
+        e.handle_key(ctrl('u'), 24, 80);
+        assert_eq!(e.lines, vec!["world".to_string()]);
+        assert_eq!(e.cursor, (0, 0));
+    }
+
+    #[test]
+    fn ctrl_w_deletes_previous_word_via_handle_key() {
+        let mut e = ed("foo bar");
+        e.cursor = (0, 7);
+        e.handle_key(ctrl('w'), 24, 80);
+        assert_eq!(e.lines, vec!["foo ".to_string()]);
+    }
+
+    #[test]
+    fn highlight_cache_populates_for_known_extension() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("bobtop-fb-editor-hl-{}.rs", std::process::id()));
+        std::fs::write(&p, "fn main() { let x = 1; }\n").unwrap();
+        let e = EditorState::open(&p).unwrap();
+        // Cache should have one entry per buffer line and the first
+        // line should have multiple spans (proves syntect ran).
+        assert_eq!(e.highlighted.len(), e.lines.len());
+        assert!(e.highlighted[0].spans.len() > 1);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

@@ -2,42 +2,19 @@
 //!
 //! Path → bytes → lines → syntax-highlighted ratatui `Line`s.
 //!
-//! The `SyntaxSet` and `ThemeSet` are loaded once on first use (a few MB
-//! of regex tables) and reused for the rest of the process. The active
-//! syntect theme is hardcoded to `base16-ocean.dark` for v1; tying it to
-//! the bobtop theme's luminance is a milestone-3 polish item.
+//! Syntect resources live in `super::highlight` so the in-place editor
+//! can reuse them without doubling the ~2 MB of regex tables.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::OnceLock;
 
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Style as SynStyle, Theme as SynTheme, ThemeSet};
-use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use super::highlight::{syntaxes, theme, to_ratatui};
 use super::{Preview, PreviewBody, PreviewKind, PreviewLimits};
-
-/// Lazy-loaded syntax tables (default-syntaxes feature). Roughly 2 MB of
-/// regex DFAs — building them per file would dominate every preview.
-fn syntaxes() -> &'static SyntaxSet {
-    static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(SyntaxSet::load_defaults_newlines)
-}
-
-fn theme() -> &'static SynTheme {
-    static T: OnceLock<SynTheme> = OnceLock::new();
-    T.get_or_init(|| {
-        let ts = ThemeSet::load_defaults();
-        ts.themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .unwrap_or_else(|| ts.themes.values().next().cloned().expect("syntect ships defaults"))
-    })
-}
 
 pub fn render_text(path: &Path, limits: PreviewLimits) -> Result<Preview, String> {
     let mut file = File::open(path).map_err(|e| format!("open: {e}"))?;
@@ -195,24 +172,6 @@ fn render_binary_summary(buf: &[u8], total: u64) -> Preview {
         source_lines: 0,
         note: None,
     }
-}
-
-fn to_ratatui(s: SynStyle) -> Style {
-    let mut style = Style::default().fg(ratatui::style::Color::Rgb(
-        s.foreground.r,
-        s.foreground.g,
-        s.foreground.b,
-    ));
-    if s.font_style.contains(FontStyle::BOLD) {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if s.font_style.contains(FontStyle::ITALIC) {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if s.font_style.contains(FontStyle::UNDERLINE) {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    style
 }
 
 #[cfg(test)]

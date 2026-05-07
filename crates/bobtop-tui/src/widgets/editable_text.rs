@@ -13,6 +13,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthChar;
 
@@ -21,6 +22,11 @@ use crate::Theme;
 #[derive(Debug, Clone)]
 pub struct EditableText<'a> {
     pub lines: &'a [String],
+    /// Optional pre-styled overlay aligned line-for-line with `lines`.
+    /// When present, spans drive painting (colors / emphasis); when
+    /// empty or shorter than `lines`, the missing rows fall back to
+    /// plain rendering using `theme.main_fg`.
+    pub styled: &'a [Line<'a>],
     /// Top source-line index shown in the viewport.
     pub scroll_row: usize,
     /// Leftmost source-column shown — the editor scrolls horizontally
@@ -37,6 +43,7 @@ impl<'a> EditableText<'a> {
     pub fn new(lines: &'a [String], cursor: (usize, usize), theme: &'a Theme) -> Self {
         Self {
             lines,
+            styled: &[],
             scroll_row: 0,
             scroll_col: 0,
             cursor,
@@ -53,6 +60,15 @@ impl<'a> EditableText<'a> {
 
     pub fn with_line_numbers(mut self, on: bool) -> Self {
         self.show_line_numbers = on;
+        self
+    }
+
+    /// Attach a pre-styled overlay (e.g. syntect highlights). The
+    /// overlay is indexed by source-line, parallel to `lines`. Spans
+    /// are painted in their styled colors; cursor math still operates
+    /// on the raw `&[String]` so column counting stays in chars.
+    pub fn with_styled(mut self, styled: &'a [Line<'a>]) -> Self {
+        self.styled = styled;
         self
     }
 
@@ -147,27 +163,58 @@ impl<'a> Widget for &EditableText<'a> {
                 write_plain(buf, area.x, y, &label, gutter_w as usize, style);
             }
             let base_style = Style::default().fg(self.theme.main_fg);
-            // Skip cells before scroll_col; render the rest into body.
+            // Prefer the styled overlay if a Line for this source row is
+            // available; otherwise paint the raw chars in `base_style`.
+            // `styled` may be a prefix of `lines` (e.g. when the editor
+            // skips highlighting for very large buffers) — bounds-check.
+            let styled_line = self.styled.get(idx);
             let mut col_cells: u16 = 0;
             let mut x = body_x;
             let right = body_x + body_w;
-            for ch in line.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-                if cw == 0 {
-                    continue;
+            if let Some(sl) = styled_line {
+                'spans: for span in sl.spans.iter() {
+                    // `patch` overlays the span's set fields onto the
+                    // base — span colors win when set, base.main_fg
+                    // covers any span that didn't specify a color.
+                    let style = base_style.patch(span.style);
+                    for ch in span.content.chars() {
+                        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                        if cw == 0 {
+                            continue;
+                        }
+                        if (col_cells as usize) < self.scroll_col {
+                            col_cells = col_cells.saturating_add(cw);
+                            continue;
+                        }
+                        if x.saturating_add(cw) > right {
+                            break 'spans;
+                        }
+                        let cell = &mut buf[(x, y)];
+                        cell.set_char(ch);
+                        cell.set_style(style);
+                        x = x.saturating_add(cw);
+                        col_cells = col_cells.saturating_add(cw);
+                    }
                 }
-                if (col_cells as usize) < self.scroll_col {
+            } else {
+                for ch in line.chars() {
+                    let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                    if cw == 0 {
+                        continue;
+                    }
+                    if (col_cells as usize) < self.scroll_col {
+                        col_cells = col_cells.saturating_add(cw);
+                        continue;
+                    }
+                    if x.saturating_add(cw) > right {
+                        break;
+                    }
+                    let cell = &mut buf[(x, y)];
+                    cell.set_char(ch);
+                    cell.set_style(base_style);
+                    x = x.saturating_add(cw);
                     col_cells = col_cells.saturating_add(cw);
-                    continue;
                 }
-                if x.saturating_add(cw) > right {
-                    break;
-                }
-                let cell = &mut buf[(x, y)];
-                cell.set_char(ch);
-                cell.set_style(base_style);
-                x = x.saturating_add(cw);
-                col_cells = col_cells.saturating_add(cw);
             }
         }
     }
@@ -232,6 +279,32 @@ mod tests {
         let w = EditableText::new(&lines, (2, 0), &theme).with_scroll(0, 0);
         // Row 2 is scrolled off (only 1 visible row) → None.
         assert!(w.cursor_screen_xy(area).is_none());
+    }
+
+    #[test]
+    fn styled_overlay_paints_span_colors() {
+        let theme = theme();
+        let lines = vec!["abc".to_string()];
+        let red = ratatui::style::Color::Rgb(255, 0, 0);
+        let blue = ratatui::style::Color::Rgb(0, 0, 255);
+        let styled = vec![Line::from(vec![
+            ratatui::text::Span::styled("a", Style::default().fg(red)),
+            ratatui::text::Span::styled("bc", Style::default().fg(blue)),
+        ])];
+        let area = Rect::new(0, 0, 12, 1);
+        let mut buf = Buffer::empty(area);
+        let w = EditableText::new(&lines, (0, 0), &theme).with_styled(&styled);
+        (&w).render(area, &mut buf);
+        // Gutter is 3 cells (1 digit + 2 padding); body starts at x=3.
+        let cell_a = &buf[(3, 0)];
+        let cell_b = &buf[(4, 0)];
+        let cell_c = &buf[(5, 0)];
+        assert_eq!(cell_a.symbol(), "a");
+        assert_eq!(cell_a.fg, red, "styled red fg should win over main_fg");
+        assert_eq!(cell_b.symbol(), "b");
+        assert_eq!(cell_b.fg, blue);
+        assert_eq!(cell_c.symbol(), "c");
+        assert_eq!(cell_c.fg, blue);
     }
 
     #[test]

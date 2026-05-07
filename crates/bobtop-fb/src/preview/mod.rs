@@ -11,6 +11,7 @@
 //! results when the cursor has moved on.
 
 pub mod cache;
+pub mod highlight;
 pub mod image;
 pub mod markdown;
 pub mod text;

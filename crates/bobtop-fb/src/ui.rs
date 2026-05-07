@@ -414,7 +414,8 @@ fn render_editor_body(app: &App, frame: &mut Frame<'_>, theme: &Theme, inner: Re
     let Some(editor) = app.editor() else { return };
     let widget = EditableText::new(&editor.lines, editor.cursor, theme)
         .with_scroll(editor.scroll_row, editor.scroll_col)
-        .with_line_numbers(true);
+        .with_line_numbers(true)
+        .with_styled(&editor.highlighted);
     if let Some((cx, cy)) = widget.cursor_screen_xy(inner) {
         frame.set_cursor_position((cx, cy));
     }
@@ -673,9 +674,11 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
             ActionBar::new(vec![
                 ("^S".into(), "save".into()),
                 ("^X".into(), "exit".into()),
-                ("^Home/^End".into(), "top/bottom".into()),
+                ("^A/^E".into(), "line".into()),
+                ("^T/^G".into(), "top/bot".into()),
+                ("^W".into(), "del word".into()),
+                ("^K/^U".into(), "kill EOL/BOL".into()),
                 ("PgUp/PgDn".into(), "page".into()),
-                ("Tab".into(), "indent".into()),
                 ("Space".into(), "fullscreen".into()),
             ])
         };
