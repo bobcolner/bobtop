@@ -187,33 +187,26 @@ fn draw_interface_row(
     let active = iface.rx_bytes_per_sec + iface.tx_bytes_per_sec >= IDLE_BPS_THRESHOLD;
     let row_fg = if active { theme.main_fg } else { theme.inactive_fg };
 
-    // Layout: pack the entire row (rate block + badge + name) into one
-    // tight unit and anchor that unit to the panel's left edge. Rates
-    // come first so the eye lands on what's moving bytes; badge + name
-    // sit alongside as identifiers.
+    // Layout: pack the entire row (badge + name + rate block) into one
+    // tight unit and anchor that unit to the panel's right edge. Each
+    // sub-element keeps its fixed reservation so rates still column-
+    // align across rows.
     //
-    //   [↑ cell 9] [gap 1] [↓ cell 9] [gap 2] [badge 3] [gap 1] [name 12]
+    //   [badge 3] [gap 1] [name 12] [gap 2] [↑ cell 9] [gap 1] [↓ cell 9]
     //   = 37 cells total
     let cell_w: u16 = 9;
     let name_max: u16 = 12;
-    let row_w: u16 = cell_w + 1 + cell_w + 2 + 3 + 1 + name_max;
+    let row_w: u16 = 3 + 1 + name_max + 2 + cell_w + 1 + cell_w;
     if row_w + 1 > area.width {
         return;
     }
-    let row_x = area.x;
-
-    // Two fixed-width rate cells. Each cell is `arrow + space + 7-char
-    // right-aligned value` = 9 cells, with a 1-cell gap between the
-    // two arrow blocks. Worst-case rate text after format_rate() is
-    // 6 cells ("999.9G/s") — 7 leaves a comfortable gutter.
-    let block_x = row_x;
+    let row_x = area.right().saturating_sub(row_w);
 
     // Category badge — kept in its accent colour even on idle rows so
     // the kind is always legible at a glance.
-    let badge_x = block_x + cell_w * 2 + 1 + 2;
     write_str_at(
         buf,
-        badge_x,
+        row_x,
         area.y,
         cat_label,
         Style::default().fg(cat_color).add_modifier(Modifier::BOLD),
@@ -221,9 +214,15 @@ fn draw_interface_row(
 
     // Interface name. Reserve 12 cells — most NICs are ≤6 chars (eth0,
     // wlan0, docker0, br-…); longer names still truncate cleanly.
-    let name_x = badge_x + 4;
+    let name_x = row_x + 4;
     let name = truncate_chars(&iface.name, name_max as usize);
     write_str_at(buf, name_x, area.y, &name, Style::default().fg(row_fg));
+
+    // Two fixed-width rate cells. Each cell is `arrow + space + 7-char
+    // right-aligned value` = 9 cells, with a 1-cell gap between the
+    // two arrow blocks. Worst-case rate text after format_rate() is
+    // 6 cells ("999.9G/s") — 7 leaves a comfortable gutter.
+    let block_x = name_x + name_max + 2;
     let up_style = if active {
         rate_style(&theme.upload, iface.tx_bytes_per_sec, peak_bps)
     } else {
