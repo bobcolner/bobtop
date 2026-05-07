@@ -519,6 +519,20 @@ impl App {
         )
     }
 
+    /// Resolve the start path for `b` (file-browser launch). Prefers
+    /// the cwd of the currently-selected process — `/proc/<pid>/cwd`
+    /// is a magic symlink kernel-side, so a single readlink gets the
+    /// absolute path. Returns `None` if nothing useful is selected
+    /// or the kernel rejected the read (process exited / EACCES).
+    fn resolve_browser_start(&self) -> Option<std::path::PathBuf> {
+        let rows = self.display_rows();
+        let pid = match rows.get(self.selected_proc)? {
+            crate::group::TableRow::Item(p) => p.info.pid,
+            crate::group::TableRow::Header(_) => return None,
+        };
+        std::fs::read_link(format!("/proc/{}/cwd", pid)).ok()
+    }
+
     fn row_pid(row: Option<&crate::group::TableRow>) -> Option<u32> {
         match row? {
             crate::group::TableRow::Item(p) => Some(p.info.pid),
@@ -736,10 +750,24 @@ impl App {
                 ControlFlow::Continue
             }
             KeyCode::Char('B') => {
-                // Capital B opens the boxes overlay. Lowercase `b` is left
-                // free for future use (btop's `b` cycles network interfaces).
+                // Capital B opens the boxes overlay.
                 self.ui.show_boxes_overlay = true;
                 self.ui.boxes_overlay_cursor = 0;
+                ControlFlow::Continue
+            }
+            KeyCode::Char('b') => {
+                // Lowercase `b` launches bobtop-fb as a subprocess.
+                // Smart default for the start path: if the cursor is
+                // on a process row and `/proc/<pid>/cwd` is readable,
+                // browse there — it's the most useful "jump from
+                // proc to filesystem" flow. Otherwise fall back to
+                // the user's working dir.
+                let start = self
+                    .resolve_browser_start()
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                    });
+                self.ui.pending_browser_launch = Some(start);
                 ControlFlow::Continue
             }
             KeyCode::Char('f') => {

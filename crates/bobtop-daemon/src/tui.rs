@@ -85,6 +85,66 @@ pub fn restore_terminal(term: &mut Term) -> io::Result<()> {
     Ok(())
 }
 
+/// Re-enter the alt screen + raw mode on an existing `Term` — the
+/// inverse of `restore_terminal`. Used after running a subprocess
+/// (`bobtop fb`, `$EDITOR`, etc.) that took the terminal for itself
+/// and returned. We force a full clear so ratatui's diff buffer
+/// resyncs against whatever the terminal shows now.
+pub fn re_init_terminal(term: &mut Term) -> io::Result<()> {
+    enable_raw_mode()?;
+    execute!(term.backend_mut(), EnterAlternateScreen, EnableFocusChange, Hide)?;
+    term.clear()?;
+    Ok(())
+}
+
+/// Locate the `bobtop-fb` binary. Prefers a sibling of the current
+/// executable (cargo workspace target/, system installs side-by-side)
+/// before falling back to PATH lookup via `Command::new`.
+pub fn find_browser_binary() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("bobtop-fb");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from("bobtop-fb")
+}
+
+/// Suspend the bobtop UI, spawn `bobtop-fb` as a subprocess, then
+/// resume bobtop. Pauses the input thread for the duration so the
+/// child has the terminal to itself.
+pub fn launch_file_browser(
+    term: &mut Term,
+    start: &std::path::Path,
+    theme_name: &str,
+) -> io::Result<()> {
+    pause_input_thread();
+    // Reverse the bobtop terminal setup so the child can do its own
+    // EnterAlternateScreen / raw mode without nesting ours.
+    let _ = restore_terminal(term);
+    let bin = find_browser_binary();
+    let status = std::process::Command::new(&bin)
+        .arg(start)
+        .arg("--theme")
+        .arg(theme_name)
+        .status();
+    let _ = re_init_terminal(term);
+    resume_input_thread();
+    match status {
+        Ok(_) => Ok(()),
+        // Map the missing-binary case to a clear error so the
+        // status row can hint at the install path. Any other
+        // child failure (segfault, etc.) bubbles up unchanged.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("bobtop-fb not found (looked at {})", bin.display()),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -96,6 +156,21 @@ fn install_panic_hook() {
     }));
 }
 
+/// Pause flag for the input thread. While true, the thread sleeps
+/// instead of consuming stdin events — that way a child process
+/// (e.g. `bobtop fb`) can read the terminal without racing us.
+/// Toggled via `pause_input_thread()` / `resume_input_thread()`.
+static INPUT_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn pause_input_thread() {
+    INPUT_PAUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn resume_input_thread() {
+    INPUT_PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Spawn a blocking OS thread that polls crossterm and forwards events
 /// onto the async runtime via an unbounded mpsc.
 pub fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
@@ -103,6 +178,12 @@ pub fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
     std::thread::Builder::new()
         .name("bobtop-input".into())
         .spawn(move || loop {
+            // While paused, sleep without polling so the child has
+            // the terminal to itself.
+            if INPUT_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
@@ -177,12 +258,38 @@ pub async fn run(
             input = input_rx.recv() => {
                 match input {
                     Some(ev) => {
-                        let flow = {
+                        let (flow, browser_launch, theme_name) = {
                             let mut g = lock(&app);
-                            g.handle_input(ev)
+                            let flow = g.handle_input(ev);
+                            // Drain the launch request before unlocking
+                            // so a second `b` press during the launch
+                            // can't queue another one.
+                            let launch = g.ui.pending_browser_launch.take();
+                            let theme = g.theme.name.clone();
+                            (flow, launch, theme)
                         };
                         if matches!(flow, ControlFlow::Quit) {
                             return Ok(());
+                        }
+                        if let Some(start) = browser_launch {
+                            // Subprocess launch — paused input thread,
+                            // restored terminal, ran child, re-init,
+                            // resumed thread. Errors flash through the
+                            // status line so the user sees missing-
+                            // binary cases.
+                            if let Err(e) = launch_file_browser(term, &start, &theme_name) {
+                                let mut g = lock(&app);
+                                g.ui.last_options_msg =
+                                    Some(format!("file browser: {}", e));
+                                g.ui.dirty = true;
+                            }
+                            // ratatui's prev-buffer is stale after the
+                            // child scribbled over the screen; mark a
+                            // full repaint so the next draw clears.
+                            let mut g = lock(&app);
+                            g.ui.force_full_repaint = true;
+                            g.take_dirty();
+                            term.draw(|f| ui::draw(f, &g))?;
                         }
                     }
                     None => return Ok(()),

@@ -46,6 +46,12 @@ pub struct UiState {
     /// on change instead of on a 60Hz heartbeat — see `tui::run`.
     pub dirty: bool,
 
+    /// Pending request to launch the bobtop-fb file browser as a
+    /// subprocess. Set by the `b` keybind; consumed by the run loop
+    /// after `handle_input` returns so the launch happens between
+    /// key dispatch and the next draw.
+    pub pending_browser_launch: Option<std::path::PathBuf>,
+
     /// Set when the next frame must wipe the terminal first via
     /// `Terminal::clear()` rather than relying on ratatui's diff-based
     /// rendering against the previous buffer. Triggered by Resize and
@@ -70,6 +76,7 @@ impl Default for UiState {
             detail: None,
             options: None,
             last_options_msg: None,
+            pending_browser_launch: None,
             dirty: true,
             // First frame already wipes-via-clear in `tui::run`'s startup
             // paint, so we don't need to ask for an extra one here.

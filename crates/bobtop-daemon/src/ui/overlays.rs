@@ -268,6 +268,7 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("[ / ]", "cycle network interface in net panel (back / next)"),
     ("+ / -", "adjust global tick (sample rate)"),
     ("O", "options — edit config + save to disk"),
+    ("b", "open file browser (selected proc's cwd, or $PWD)"),
 ];
 
 pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
