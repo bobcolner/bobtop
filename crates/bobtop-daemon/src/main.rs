@@ -17,8 +17,21 @@ use bobtop_daemon::app::App;
 use bobtop_daemon::cli::{Cli, LayoutChoice};
 use bobtop_daemon::tui;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Synchronous entry point: handles the multi-call dispatches (`agent`,
+// `fb`) without entering a tokio runtime. Both subcommands build their
+// own runtimes internally — the agent client constructs a single-thread
+// runtime for the socket round-trip, and the fb crate constructs a
+// multi-thread runtime for its preview pipeline. Wrapping them in an
+// outer `#[tokio::main]` runtime would mean dropping the inner runtime
+// inside the outer's async context, which tokio panics on:
+//
+//     "Cannot drop a runtime in a context where blocking is not allowed."
+//
+// Symptom: `bobtop fb` (and the `b` keybind that re-execs to it) would
+// crash on every invocation. Splitting the entry point keeps the daemon
+// path wrapped (it really is async) while letting the dispatched
+// subcommands run in plain sync context.
+fn main() -> Result<()> {
     // Short-circuit: `bobtop agent <subcommand>` is a thin Unix-socket
     // client that never starts collectors or the TUI. Detect it before
     // clap parses so we don't have to graft the agent surface into the
@@ -41,6 +54,15 @@ async fn main() -> Result<()> {
         return bobtop_fb::cli::run(fb_args);
     }
 
+    // Daemon / TUI path is genuinely async — build the runtime here and
+    // run the rest of main inside it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(daemon_main())
+}
+
+async fn daemon_main() -> Result<()> {
     // Parse CLI via get_matches() so we can ask clap which fields the user
     // actually set on the command line vs. left at the default. That lets
     // us implement strict CLI > config-file > default precedence below.
