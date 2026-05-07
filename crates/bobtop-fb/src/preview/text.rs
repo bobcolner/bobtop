@@ -15,6 +15,8 @@ use syntect::util::LinesWithEndings;
 
 use super::highlight::{syntaxes, theme, to_ratatui};
 use super::{Preview, PreviewBody, PreviewKind, PreviewLimits};
+use crate::fs::entry::EntryKind;
+use crate::fs::scan::{scan_dir, SortMode};
 
 pub fn render_text(path: &Path, limits: PreviewLimits) -> Result<Preview, String> {
     let mut file = File::open(path).map_err(|e| format!("open: {e}"))?;
@@ -91,31 +93,26 @@ pub fn render_text(path: &Path, limits: PreviewLimits) -> Result<Preview, String
     })
 }
 
-pub fn render_directory(path: &Path) -> Result<Preview, String> {
-    let mut entries: Vec<String> = std::fs::read_dir(path)
-        .map_err(|e| format!("read_dir: {e}"))?
-        .filter_map(|r| r.ok())
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let kind = e
-                .file_type()
-                .map(|t| {
-                    if t.is_dir() {
-                        "📁 "
-                    } else if t.is_symlink() {
-                        "🔗 "
-                    } else {
-                        "   "
-                    }
-                })
-                .unwrap_or("   ");
-            format!("{}{}", kind, name)
-        })
-        .collect();
-    entries.sort();
+pub fn render_directory(
+    path: &Path,
+    sort: SortMode,
+    show_hidden: bool,
+) -> Result<Preview, String> {
+    // Reuse `scan_dir` so the preview-pane listing matches the center
+    // pane: same dirs-first ordering, same name/size/mtime sort, same
+    // hidden-file policy. Without this the right pane re-sorted with
+    // stdlib lexicographic order and disagreed with the cursor list.
+    let entries = scan_dir(path, show_hidden, sort).map_err(|e| format!("read_dir: {e}"))?;
     let lines: Vec<Line<'static>> = entries
         .iter()
-        .map(|s| Line::from(s.clone()))
+        .map(|e| {
+            let glyph = match e.kind {
+                EntryKind::Dir => "📁 ",
+                EntryKind::Symlink => "🔗 ",
+                EntryKind::File | EntryKind::Other => "   ",
+            };
+            Line::from(format!("{}{}", glyph, e.name))
+        })
         .collect();
     let total = lines.len();
     Ok(Preview {

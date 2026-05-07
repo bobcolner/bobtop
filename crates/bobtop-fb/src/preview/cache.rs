@@ -36,6 +36,13 @@ impl PreviewCache {
     pub fn invalidate(&mut self, path: &PathBuf) {
         self.inner.pop(path);
     }
+
+    /// Drop every cached preview. Used when a setting changes that
+    /// would render every cached entry stale — e.g. toggling hidden
+    /// files would change the contents of every cached directory.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
 }
 
 impl Default for PreviewCache {

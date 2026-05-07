@@ -5,6 +5,7 @@
 //! highlighting don't stall the run loop. A monotonic generation
 //! counter discards stale results when the user has already moved on.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -412,6 +413,14 @@ pub struct App {
     pending_editor: Option<PathBuf>,
     show_hidden: bool,
     sort: SortMode,
+    /// Per-directory cursor memory. Whenever we leave a directory we
+    /// stash the selected child's path here, keyed by the directory we
+    /// left. On re-entry we look the entry up by path and restore the
+    /// cursor to its row — so back/forward and `h`/`l` round-trips keep
+    /// you on the same file. Indexed by path (not by row index) so the
+    /// position survives sort changes, hidden-toggle, and concurrent
+    /// fs changes.
+    cursor_memory: HashMap<PathBuf, PathBuf>,
     list_viewport_h: usize,
     theme: Theme,
 
@@ -596,6 +605,7 @@ impl App {
             pending_editor: None,
             show_hidden: false,
             sort: SortMode::Name,
+            cursor_memory: HashMap::new(),
             list_viewport_h: 0,
             theme,
             rt,
@@ -893,11 +903,28 @@ impl App {
     /// navigation (which moves the pointer first, then jumps without
     /// disturbing siblings).
     fn cd_internal(&mut self, target: PathBuf) -> io::Result<()> {
+        // Stash the cursor so a future return to `old_cwd` lands back
+        // on the same entry. Skipped when the cwd has no selection
+        // (empty dir or freshly opened) — there's nothing useful to
+        // remember in that case.
+        if let Some(sel) = self.entries.get(self.nav.cursor) {
+            self.cursor_memory
+                .insert(self.cwd.clone(), sel.path.clone());
+        }
         self.cwd = target;
         self.nav = Nav::default();
         update_terminal_title(&self.cwd);
         self.rewatch();
-        self.refresh()
+        self.refresh()?;
+        // Restore cursor by looking up the remembered child path in the
+        // freshly scanned entries. Falls back to row 0 when the entry
+        // disappeared (deleted, renamed, hidden by current filter).
+        if let Some(remembered) = self.cursor_memory.get(&self.cwd).cloned() {
+            if let Some(idx) = self.entries.iter().position(|e| e.path == remembered) {
+                self.nav.cursor = idx;
+            }
+        }
+        Ok(())
     }
 
     /// (Re-)create the filesystem watcher pointed at the current cwd.
@@ -1026,9 +1053,11 @@ impl App {
         self.preview_state = PreviewState::Loading(path.clone());
         let tx = self.preview_tx.clone();
         let limits = self.preview_limits;
+        let sort = self.sort;
+        let show_hidden = self.show_hidden;
         let task_path = path.clone();
         self.rt.spawn_blocking(move || {
-            let outcome = preview::render_blocking(&task_path, limits);
+            let outcome = preview::render_blocking(&task_path, limits, sort, show_hidden);
             // If the receiver is gone, the App was dropped — that's
             // fine, we just drop the result.
             let _ = tx.send(PreviewResult {
@@ -1255,6 +1284,10 @@ impl App {
             }
             Action::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
+                // Cached directory previews list a different set of
+                // entries depending on this flag — drop them all so
+                // the next preview matches the new policy.
+                self.preview_cache.clear();
                 let _ = self.refresh();
             }
             Action::Refresh => {
@@ -1464,9 +1497,11 @@ impl App {
         self.preview_state = PreviewState::Loading(path.to_path_buf());
         let tx = self.preview_tx.clone();
         let limits = self.preview_limits;
+        let sort = self.sort;
+        let show_hidden = self.show_hidden;
         let task_path = path.to_path_buf();
         self.rt.spawn_blocking(move || {
-            let outcome = preview::render_blocking(&task_path, limits);
+            let outcome = preview::render_blocking(&task_path, limits, sort, show_hidden);
             let _ = tx.send(PreviewResult {
                 generation: gen,
                 path: task_path,

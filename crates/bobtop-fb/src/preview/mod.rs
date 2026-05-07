@@ -140,9 +140,14 @@ impl Default for PreviewLimits {
 /// later (lots of code is named `Makefile`, no extension); for now an
 /// unknown extension falls through to the text previewer, which has
 /// its own binary heuristic.
-pub fn render_blocking(path: &std::path::Path, limits: PreviewLimits) -> Result<Preview, String> {
+pub fn render_blocking(
+    path: &std::path::Path,
+    limits: PreviewLimits,
+    sort: crate::fs::scan::SortMode,
+    show_hidden: bool,
+) -> Result<Preview, String> {
     if path.is_dir() {
-        return text::render_directory(path);
+        return text::render_directory(path, sort, show_hidden);
     }
     let ext = path
         .extension()
