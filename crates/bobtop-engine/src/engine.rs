@@ -139,6 +139,20 @@ impl Engine {
                 Arc::clone(&cfg.tick_ms),
             );
         }
+        // Flow enumerator — always parses /proc/net/{tcp,tcp6} +
+        // /proc/[pid]/fd to populate the connection list, independent
+        // of which byte attributor is active. eBPF and pcap track
+        // bytes per pid but don't enumerate connections, so without
+        // this the flow panel would be empty whenever those tiers are
+        // selected. Skipped when the active byte tier *is* proc_inode
+        // (which already populates flows in the byte loop) and on
+        // non-Linux hosts where proc_inode isn't available.
+        if net_tier != AttributorTier::ProcInode {
+            spawn_flow_enumerator_loop(
+                attribution.clone(),
+                Arc::clone(&cfg.tick_ms),
+            );
+        }
 
         (
             Self {
@@ -217,6 +231,41 @@ fn spawn_attributor_loop(
             }
         }
     });
+}
+
+/// Independent loop that walks `/proc/net/{tcp,tcp6}` + `/proc/[pid]/fd`
+/// to enumerate active connections, regardless of which byte attributor
+/// is active. eBPF and pcap give us per-pid byte rates but no
+/// connection list — this loop is what makes the flow panel work on
+/// those tiers. Cheap (<1 ms per cycle on a typical host) and runs at
+/// a slower cadence (floor 1 s) since flow churn is much lower than
+/// byte-rate variation.
+fn spawn_flow_enumerator_loop(store: AttributionStore, tick_ms: Arc<AtomicU64>) {
+    #[cfg(target_os = "linux")]
+    {
+        use bobtop_pid_attr::proc_inode::ProcInodeAttributor;
+        if !ProcInodeAttributor::available() {
+            tracing::debug!("flow enumerator: /proc/net/tcp not present");
+            return;
+        }
+        let attr: Arc<dyn NetworkAttributor> = Arc::new(ProcInodeAttributor::new());
+        tokio::spawn(async move {
+            loop {
+                let dur = Duration::from_millis(
+                    tick_ms.load(Ordering::Relaxed).max(1000),
+                );
+                tokio::time::sleep(dur).await;
+                match attr.sample().await {
+                    Ok(samples) => store.set_net_flows(samples),
+                    Err(e) => tracing::debug!(error = %e, "flow enumerator sample failed"),
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (store, tick_ms);
+    }
 }
 
 fn spawn_disk_attributor_loop(

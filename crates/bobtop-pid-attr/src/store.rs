@@ -81,7 +81,13 @@ impl AttributionStore {
         Self::default()
     }
 
-    /// Replace the net snapshot. Called by the network attributor loop.
+    /// Replace the per-pid byte snapshot. Called by the active byte
+    /// attributor loop (eBPF / pcap / proc_inode). When the byte tier
+    /// also enumerates connections (proc_inode does, eBPF and pcap
+    /// don't), the flows view is updated from the same samples — that
+    /// way single-tier setups don't need a separate flow loop. When
+    /// the byte tier reports zero connections we leave the flow list
+    /// untouched so the flow enumerator can keep ownership of it.
     pub fn set_net(&self, samples: Vec<ProcessNetSample>, tier: AttributorTier) {
         // Recover from a poisoned lock instead of propagating panic.
         // A poisoned lock means a previous writer panicked mid-write,
@@ -93,12 +99,12 @@ impl AttributionStore {
             .unwrap_or_else(|p| p.into_inner());
         g.net.clear();
         g.net.reserve(samples.len());
-        g.flows.clear();
-        // Flatten all (pid, conn) pairs in one pass so the flow view
-        // gets a coherent snapshot — important when the active tier
-        // emits thousands of connections (servers under load).
         let total_conns: usize = samples.iter().map(|s| s.connections.len()).sum();
-        g.flows.reserve(total_conns);
+        let supplies_conns = total_conns > 0;
+        if supplies_conns {
+            g.flows.clear();
+            g.flows.reserve(total_conns);
+        }
         for s in samples {
             g.net.insert(
                 s.pid,
@@ -107,6 +113,32 @@ impl AttributionStore {
                     tx_bytes_per_sec: s.tx_bytes_per_sec,
                 },
             );
+            if supplies_conns {
+                for conn in s.connections {
+                    g.flows.push(FlowRow {
+                        pid: s.pid,
+                        name: s.name.clone(),
+                        conn,
+                    });
+                }
+            }
+        }
+        g.net_tier = tier;
+    }
+
+    /// Replace just the flow list — used by the dedicated flow
+    /// enumerator loop (always proc_inode when available) so the flow
+    /// panel still has data when the active byte tier is eBPF / pcap
+    /// (those don't enumerate connections — they only count bytes).
+    pub fn set_net_flows(&self, samples: Vec<ProcessNetSample>) {
+        let mut g = self
+            .inner
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        g.flows.clear();
+        let total: usize = samples.iter().map(|s| s.connections.len()).sum();
+        g.flows.reserve(total);
+        for s in samples {
             for conn in s.connections {
                 g.flows.push(FlowRow {
                     pid: s.pid,
@@ -115,7 +147,6 @@ impl AttributionStore {
                 });
             }
         }
-        g.net_tier = tier;
     }
 
     /// Replace the disk snapshot. Called by the disk attributor loop.
@@ -284,19 +315,30 @@ mod tests {
     }
 
     #[test]
-    fn set_net_drops_stale_flows_from_departed_pids() {
+    fn set_net_flows_replaces_stale_entries() {
         let s = AttributionStore::new();
-        s.set_net(
-            vec![n_with_conns(99, None, None, vec![conn_v4(1, 2)])],
-            AttributorTier::ProcInode,
-        );
+        // Seed flows via the dedicated flow path.
+        s.set_net_flows(vec![n_with_conns(99, None, None, vec![conn_v4(1, 2)])]);
         assert_eq!(s.flows().len(), 1);
         // Re-publish without pid 99 — its flow row must vanish.
-        s.set_net(
-            vec![n_with_conns(100, None, None, vec![])],
-            AttributorTier::ProcInode,
-        );
+        s.set_net_flows(vec![n_with_conns(100, None, None, vec![])]);
         assert!(s.flows().is_empty(), "stale pid's flows linger");
+    }
+
+    #[test]
+    fn set_net_preserves_flows_when_byte_tier_reports_no_connections() {
+        // Mimic the eBPF / pcap case: byte attributor publishes per-pid
+        // rates with empty `connections`. The flow list (owned by the
+        // separate flow enumerator) must not be wiped.
+        let s = AttributionStore::new();
+        s.set_net_flows(vec![n_with_conns(7, None, None, vec![conn_v4(1, 80)])]);
+        assert_eq!(s.flows().len(), 1);
+        s.set_net(
+            vec![n_with_conns(7, Some(1000.0), None, vec![])],
+            AttributorTier::EbpfKernel,
+        );
+        assert_eq!(s.flows().len(), 1, "byte tier wiped flows it doesn't own");
+        assert_eq!(s.net_for(7).unwrap().rx_bytes_per_sec, Some(1000.0));
     }
 
     #[test]

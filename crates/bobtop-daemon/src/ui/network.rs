@@ -230,33 +230,89 @@ fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, _rx_now: f6
     }
 }
 
+/// Column alignment for one cell in the flow table.
+#[derive(Debug, Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+/// One column slot in the flow table. Width is in cells; alignment
+/// only matters for short text (long text gets clipped at the right
+/// edge regardless).
+#[derive(Debug, Clone, Copy)]
+struct Col {
+    width: u16,
+    align: Align,
+}
+
+const FLOW_COLS: [Col; 6] = [
+    Col { width: 6, align: Align::Right }, // PID
+    Col { width: 14, align: Align::Left },  // PROC
+    Col { width: 26, align: Align::Left },  // REMOTE
+    Col { width: 8, align: Align::Left },   // STATE
+    Col { width: 11, align: Align::Right }, // ↓/s
+    Col { width: 11, align: Align::Right }, // ↑/s
+];
+
+const FLOW_HEADERS: [&str; 6] = ["PID", "PROC", "REMOTE", "STATE", "↓/s", "↑/s"];
+
 /// Per-flow table view of network activity. Shows every (pid, conn)
 /// pair the active attributor reported, joined with the per-pid byte
 /// rates from the same store. Bytes are pid-aggregate for v1 — true
 /// per-flow byte attribution would require extending the eBPF program
 /// to key on (pid, 5-tuple).
 fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(store) = app.attribution.as_ref() else {
+        let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
+            .with_title("net · flows".to_string());
+        frame.render_widget(&panel, area);
+        let inner = panel.inner(area);
+        if inner.height >= 1 {
+            write_str_clipped(
+                frame.buffer_mut(),
+                inner.x,
+                inner.y,
+                "(per-pid attribution unavailable)",
+                inner.width,
+                Style::default().fg(app.theme.inactive_fg),
+            );
+        }
+        return;
+    };
+
+    // Pull and filter: hide pure listening sockets (their `remote`
+    // is 0.0.0.0:0) — they don't answer any "where are bytes going"
+    // question, and on a busy server they'd dominate the view.
+    let mut flows: Vec<_> = store
+        .flows()
+        .into_iter()
+        .filter(|f| !is_unbound_listener(&f.conn))
+        .collect();
+    let visible_count = flows.len();
+
+    // Aggregate totals across all visible flows for the panel header.
+    let (rx_total, tx_total) = aggregate_rates(store, &flows);
+
+    let title = if visible_count == 0 {
+        "net · flows".to_string()
+    } else {
+        format!("net · flows ({})", visible_count)
+    };
+    let controls = if visible_count == 0 {
+        "press N to switch back".to_string()
+    } else {
+        format!("↑ {}/s   ↓ {}/s", format_rate(tx_total), format_rate(rx_total))
+    };
     let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
-        .with_title("net · flows".to_string())
-        .with_controls("press N to switch back".to_string());
+        .with_title(title)
+        .with_controls(controls);
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 20 || inner.height < 2 {
         return;
     }
 
-    let Some(store) = app.attribution.as_ref() else {
-        write_str_clipped(
-            frame.buffer_mut(),
-            inner.x,
-            inner.y,
-            "(per-pid attribution unavailable)",
-            inner.width,
-            Style::default().fg(app.theme.inactive_fg),
-        );
-        return;
-    };
-    let mut flows = store.flows();
     if flows.is_empty() {
         write_str_clipped(
             frame.buffer_mut(),
@@ -269,81 +325,195 @@ fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Established connections first; within state, by pid for stability.
+    // Sort by busiest first (rx+tx desc) — that's the "what's eating
+    // my network" answer the panel exists to give. Pid ascending as a
+    // stable tiebreaker so equal-bandwidth rows don't shuffle between
+    // ticks (HashMap iteration order in the store is otherwise free
+    // to vary).
+    let total_bytes = |pid: u32| -> f64 {
+        store
+            .net_for(pid)
+            .map(|n| n.rx_bytes_per_sec.unwrap_or(0.0) + n.tx_bytes_per_sec.unwrap_or(0.0))
+            .unwrap_or(0.0)
+    };
     flows.sort_by(|a, b| {
-        let a_est = a.conn.state == bobtop_pid_attr::SocketState::Established;
-        let b_est = b.conn.state == bobtop_pid_attr::SocketState::Established;
-        b_est.cmp(&a_est).then_with(|| a.pid.cmp(&b.pid))
+        let ta = total_bytes(a.pid);
+        let tb = total_bytes(b.pid);
+        tb.partial_cmp(&ta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.pid.cmp(&b.pid))
     });
 
-    // Header row uses the panel's title style for clarity.
+    // Render header row with title accent + a dim underline so the
+    // body rows visually anchor to it.
     let header_style = Style::default()
         .fg(app.theme.title)
         .add_modifier(Modifier::BOLD);
-    let row_style = Style::default().fg(app.theme.main_fg);
     let buf = frame.buffer_mut();
-    // Layout (chars): pid 6 · proc 14 · local 22 · remote 22 · state 6 · ↓/s 11 · ↑/s 11
-    // Total 92; we clip to whatever the panel gives us.
-    let cols: [(u16, &str); 7] = [
-        (6, "PID"),
-        (14, "PROC"),
-        (22, "LOCAL"),
-        (22, "REMOTE"),
-        (6, "ST"),
-        (11, "↓/s"),
-        (11, "↑/s"),
-    ];
-    write_columns(buf, inner.x, inner.y, inner.width, &cols, header_style);
+    let header_cells: Vec<(Col, String, Style)> = FLOW_COLS
+        .iter()
+        .zip(FLOW_HEADERS.iter())
+        .map(|(c, h)| (*c, h.to_string(), header_style))
+        .collect();
+    write_row(buf, inner.x, inner.y, inner.width, &header_cells);
 
-    let body_top = inner.y.saturating_add(1);
-    let body_h = inner.height.saturating_sub(1) as usize;
+    // Subtle horizontal rule — separates header from data without
+    // borrowing a row from the body.
+    if inner.height >= 3 {
+        let underline_y = inner.y + 1;
+        let underline_style = Style::default().fg(app.theme.div_line);
+        for x in inner.x..inner.x.saturating_add(inner.width) {
+            let cell = &mut buf[(x, underline_y)];
+            cell.set_char('─');
+            cell.set_style(underline_style);
+        }
+    }
+
+    // Pick the heatmap denominator: the biggest pid-aggregate rate
+    // currently visible. Each cell colors itself by `rate / max`.
+    // Falls back to a sensible 1 MiB/s scale when nothing is moving
+    // so the heatmap doesn't go full-bright on idle hosts.
+    let mut peak_rate = 1024.0_f64 * 1024.0;
+    for f in &flows {
+        if let Some(n) = store.net_for(f.pid) {
+            let r = n.rx_bytes_per_sec.unwrap_or(0.0).max(n.tx_bytes_per_sec.unwrap_or(0.0));
+            if r > peak_rate {
+                peak_rate = r;
+            }
+        }
+    }
+
+    let body_top = inner.y.saturating_add(2);
+    let body_h = inner.height.saturating_sub(2) as usize;
+    let main_fg_style = Style::default().fg(app.theme.main_fg);
+    let dim_style = Style::default().fg(app.theme.inactive_fg);
     for (i, flow) in flows.iter().take(body_h).enumerate() {
         let y = body_top + i as u16;
+        let active = flow.conn.state == bobtop_pid_attr::SocketState::Established;
+        // Dim non-Established rows so the eye anchors on what's
+        // actually moving bytes; LISTEN/TIME_WAIT/etc. recede.
+        let row_fg = if active { main_fg_style } else { dim_style };
         let pid = flow.pid.to_string();
         let proc_name = truncate_chars(&flow.name, 14);
-        let local = format_endpoint(&flow.conn.local);
         let remote = format_endpoint(&flow.conn.remote);
         let state = state_glyph(flow.conn.state);
         let rate = store.net_for(flow.pid);
-        let rx = rate
-            .and_then(|n| n.rx_bytes_per_sec)
-            .map(|v| format!("{}/s", format_rate(v)))
-            .unwrap_or_else(|| "—".into());
-        let tx = rate
-            .and_then(|n| n.tx_bytes_per_sec)
-            .map(|v| format!("{}/s", format_rate(v)))
-            .unwrap_or_else(|| "—".into());
-        let cells: [(u16, &str); 7] = [
-            (6, pid.as_str()),
-            (14, &proc_name),
-            (22, &local),
-            (22, &remote),
-            (6, state),
-            (11, &rx),
-            (11, &tx),
+        let rx_val = rate.and_then(|n| n.rx_bytes_per_sec);
+        let tx_val = rate.and_then(|n| n.tx_bytes_per_sec);
+        let rx = rx_val.map(|v| format!("{}/s", format_rate(v))).unwrap_or_else(|| "—".into());
+        let tx = tx_val.map(|v| format!("{}/s", format_rate(v))).unwrap_or_else(|| "—".into());
+        let rx_style = if active {
+            rate_style(&app.theme.download, rx_val.unwrap_or(0.0), peak_rate)
+        } else {
+            dim_style
+        };
+        let tx_style = if active {
+            rate_style(&app.theme.upload, tx_val.unwrap_or(0.0), peak_rate)
+        } else {
+            dim_style
+        };
+        let state_style = state_color(&app.theme, flow.conn.state);
+        let row: [(Col, String, Style); 6] = [
+            (FLOW_COLS[0], pid, row_fg),
+            (FLOW_COLS[1], proc_name, row_fg),
+            (FLOW_COLS[2], remote, row_fg),
+            (FLOW_COLS[3], state.to_string(), state_style),
+            (FLOW_COLS[4], rx, rx_style),
+            (FLOW_COLS[5], tx, tx_style),
         ];
-        write_columns(buf, inner.x, y, inner.width, &cells, row_style);
+        write_row(buf, inner.x, y, inner.width, &row);
     }
 }
 
-fn write_columns(
+/// Listening sockets that haven't accepted any peer yet have a remote
+/// of 0.0.0.0:0 (or the v6 equivalent). They contribute no useful
+/// information to a flow view focused on "where are bytes going."
+fn is_unbound_listener(conn: &bobtop_pid_attr::ConnectionInfo) -> bool {
+    use bobtop_pid_attr::AddrEndpoint as E;
+    matches!(
+        conn.remote,
+        E::V4 { port: 0, .. } | E::V6 { port: 0, .. }
+    )
+}
+
+/// Sum unique-per-pid rates across the given flows. Multiple flows
+/// share a pid's aggregate rate; we de-duplicate by inserting into a
+/// HashMap so the panel header total doesn't double-count.
+fn aggregate_rates(
+    store: &bobtop_pid_attr::AttributionStore,
+    flows: &[bobtop_pid_attr::FlowRow],
+) -> (f64, f64) {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut rx = 0.0_f64;
+    let mut tx = 0.0_f64;
+    for f in flows {
+        if !seen.insert(f.pid) {
+            continue;
+        }
+        if let Some(n) = store.net_for(f.pid) {
+            rx += n.rx_bytes_per_sec.unwrap_or(0.0);
+            tx += n.tx_bytes_per_sec.unwrap_or(0.0);
+        }
+    }
+    (rx, tx)
+}
+
+/// Sample a gradient at the position `value/peak` clamped to [0, 1].
+/// Idle rows get the gradient's start color; the busiest row hits
+/// `end`. Mirrors the way the classic graphs colour their fill.
+fn rate_style(grad: &bobtop_tui::Gradient, value: f64, peak: f64) -> Style {
+    let t = if peak > 0.0 {
+        (value / peak).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+    Style::default().fg(grad.sample(t))
+}
+
+/// Pick a colour for the STATE cell. ESTABLISHED uses the title accent
+/// (it's the "live" state); LISTEN gets `hi_fg` to flag it as a
+/// distinct mode; everything else dims into `inactive_fg`.
+fn state_color(theme: &bobtop_tui::Theme, state: bobtop_pid_attr::SocketState) -> Style {
+    use bobtop_pid_attr::SocketState as S;
+    let fg = match state {
+        S::Established => theme.title,
+        S::Listen => theme.hi_fg,
+        _ => theme.inactive_fg,
+    };
+    Style::default().fg(fg)
+}
+
+/// Render one row, applying per-cell alignment + style. Long text is
+/// clipped at the column right edge; short text is padded so right-
+/// aligned numerics line up under their headers.
+fn write_row(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
     y: u16,
     max_w: u16,
-    cols: &[(u16, &str)],
-    style: Style,
+    cells: &[(Col, String, Style)],
 ) {
     let mut cx = x;
     let right = x.saturating_add(max_w);
-    for (w, text) in cols {
+    for (col, text, style) in cells {
         if cx >= right {
             return;
         }
-        let avail = (right - cx) as usize;
-        let cell_w = (*w as usize).min(avail);
-        write_str_clipped(buf, cx, y, text, cell_w.saturating_sub(1).max(1) as u16, style);
-        cx = cx.saturating_add(*w);
+        let avail = (right - cx) as u16;
+        let cell_w = col.width.min(avail);
+        let render_w = cell_w.saturating_sub(1).max(1);
+        match col.align {
+            Align::Left => {
+                write_str_clipped(buf, cx, y, text, render_w, *style);
+            }
+            Align::Right => {
+                let text_w = bobtop_tui::display_width(text) as u16;
+                let pad = render_w.saturating_sub(text_w);
+                write_str_clipped(buf, cx + pad, y, text, render_w, *style);
+            }
+        }
+        cx = cx.saturating_add(col.width);
     }
 }
 
@@ -361,17 +531,16 @@ fn format_endpoint(ep: &bobtop_pid_attr::AddrEndpoint) -> String {
 fn state_glyph(s: bobtop_pid_attr::SocketState) -> &'static str {
     use bobtop_pid_attr::SocketState as S;
     match s {
-        S::Established => "EST",
-        S::Listen => "LSN",
-        S::SynSent => "SYN",
-        S::SynRecv => "SYN",
-        S::FinWait1 | S::FinWait2 => "FIN",
-        S::TimeWait => "TW",
-        S::CloseWait => "CW",
-        S::LastAck => "ACK",
-        S::Closing => "CLG",
-        S::Close => "CLS",
-        S::NewSynRecv => "SYN",
+        S::Established => "ESTAB",
+        S::Listen => "LISTEN",
+        S::SynSent => "SYN-S",
+        S::SynRecv | S::NewSynRecv => "SYN-R",
+        S::FinWait1 | S::FinWait2 => "FIN-W",
+        S::TimeWait => "TWAIT",
+        S::CloseWait => "CWAIT",
+        S::LastAck => "LASTAK",
+        S::Closing => "CLOSNG",
+        S::Close => "CLOSED",
     }
 }
 
