@@ -262,7 +262,14 @@ fn write_str(buf: &mut Buffer, x: u16, y: u16, s: &str, max_cols: usize, style: 
     let mut col = x;
     let right = x.saturating_add(max_cols as u16).min(buf.area.right());
     for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
+        // Control chars (tab, newline, ESC, …) and combining marks have display
+        // width 0.  Skip them entirely so the renderer stays consistent with
+        // display_width() used for column layout — writing a tab via set_char
+        // produces a terminal cursor jump that overflows the column gutter.
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if cw == 0 {
+            continue;
+        }
         if col.saturating_add(cw) > right {
             break;
         }
@@ -308,5 +315,83 @@ impl<'a> Cell<'a> {
             Some(_) => "0".into(),
             None => "-".into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui::widgets::Widget;
+
+    use crate::Theme;
+
+    use super::*;
+
+    fn make_row(label: &'static str) -> Row<'static> {
+        Row::data(vec![Cell::new(label)]).with_style(Style::default().fg(Color::White))
+    }
+
+    fn two_col_theme() -> Theme {
+        Theme::fallback()
+    }
+
+    /// The selected row — and only the selected row — must carry
+    /// `selected_bg` across its full width after rendering.
+    #[test]
+    fn selected_row_gets_full_width_highlight() {
+        let theme = two_col_theme();
+        let cols = vec![Column::new("Name", u16::MAX)];
+        let rows = vec![make_row("alpha"), make_row("beta"), make_row("gamma")];
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        let table = Table::new(&cols, &rows, &theme).with_selection(Some(1), 0);
+        (&table).render(area, &mut buf);
+        // Row 0 of area = header; row 1 = rows[0]; row 2 = rows[1] (SELECTED); row 3 = rows[2].
+        for x in 0..area.width {
+            assert_eq!(buf[(x, 2)].style().bg, Some(theme.selected_bg), "selected row col {x}");
+            assert_ne!(buf[(x, 1)].style().bg, Some(theme.selected_bg), "row above must not be highlighted col {x}");
+            assert_ne!(buf[(x, 3)].style().bg, Some(theme.selected_bg), "row below must not be highlighted col {x}");
+        }
+    }
+
+    /// When the selection index is scrolled off-screen, no row should carry
+    /// `selected_bg` (the selected row is outside the visible window).
+    #[test]
+    fn offscreen_selection_leaves_no_highlight() {
+        let theme = two_col_theme();
+        let cols = vec![Column::new("Name", u16::MAX)];
+        let rows = vec![make_row("a"), make_row("b"), make_row("c"), make_row("d"), make_row("e")];
+        // body_h = 2 (area.height=3, minus 1 header).  scroll_offset=2 shows rows[2..4].
+        // selected=0 is above the viewport.
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        let table = Table::new(&cols, &rows, &theme).with_selection(Some(0), 2);
+        (&table).render(area, &mut buf);
+        for y in 1..area.height {
+            for x in 0..area.width {
+                assert_ne!(buf[(x, y)].style().bg, Some(theme.selected_bg), "y={y} x={x} should not be highlighted");
+            }
+        }
+    }
+
+    /// Control characters in cell text must not be written to the buffer
+    /// (they'd cause terminal cursor jumps that break column alignment).
+    #[test]
+    fn control_chars_skipped_in_write_str() {
+        let theme = two_col_theme();
+        let cols = vec![Column::new("Cmd", u16::MAX)];
+        let rows = vec![Row::data(vec![Cell::new("ab\tc")])
+            .with_style(Style::default().fg(Color::White))];
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buf = Buffer::empty(area);
+        let table = Table::new(&cols, &rows, &theme);
+        (&table).render(area, &mut buf);
+        // Only 'a', 'b', 'c' should appear; the tab must be silently skipped.
+        let row: String = (0..area.width).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(row.contains('a') && row.contains('b') && row.contains('c'),
+            "printable chars missing from row: {row:?}");
+        assert!(!row.contains('\t'), "tab written to buffer: {row:?}");
     }
 }

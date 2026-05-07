@@ -36,7 +36,10 @@ pub fn write_str_clipped(
     let mut col = x;
     let right = x.saturating_add(max_cells).min(buf.area.right());
     for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0).max(1) as u16;
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if cw == 0 {
+            continue;
+        }
         if col.saturating_add(cw) > right {
             break;
         }
