@@ -39,6 +39,8 @@ pub enum Action {
     Touch,
     /// Open the recursive file finder.
     StartFind,
+    /// Promote the currently-previewed file into in-place edit mode.
+    StartEditor,
     Noop,
 }
 
@@ -72,6 +74,7 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('D') => Action::HardDelete,
         KeyCode::Char('a') => Action::Touch,
         KeyCode::Char('f') => Action::StartFind,
+        KeyCode::Char('e') => Action::StartEditor,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         _ => Action::Noop,

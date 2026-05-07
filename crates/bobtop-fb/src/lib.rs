@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod editor;
 pub mod find;
 pub mod fs;
 pub mod keys;

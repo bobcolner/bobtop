@@ -30,9 +30,9 @@ pub use text::{
 };
 pub use widgets::{
     ActionBar, BrailleGraph, BrailleText, BoxedPanel, CornerStyle, DataTable, DualMode,
-    GraphStyle, LegendStyle, Meter, MillerColumn, MillerColumns, MiniMeter, ModalShell,
-    ScrollableText, SectionHeader, SelectableList, SettingRow, SettingValue, SettingsForm,
-    Sparkline, StackedBar, StackedSegment, Cell, Column, ProcessTableGroupHeader,
+    EditableText, GraphStyle, LegendStyle, Meter, MillerColumn, MillerColumns, MiniMeter,
+    ModalShell, ScrollableText, SectionHeader, SelectableList, SettingRow, SettingValue,
+    SettingsForm, Sparkline, StackedBar, StackedSegment, Cell, Column, ProcessTableGroupHeader,
     ProcessTableRow, ProcessTableRowMeta, ProcessTableSort, Row, RowKind, Table, ToggleRow,
     Trace,
 };

@@ -8,8 +8,8 @@
 use std::time::SystemTime;
 
 use bobtop_tui::{
-    format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, MillerColumn, MillerColumns,
-    ModalShell, Row, ScrollableText, Table, Theme,
+    format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, EditableText, MillerColumn,
+    MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
 };
 use image::GenericImageView;
 use ratatui::layout::Rect;
@@ -48,7 +48,11 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
     draw_preview_pane(app, frame, theme, rects[2]);
     draw_action_bar(app, frame, theme, bottom);
     if app.is_full_preview() {
-        draw_preview_modal(app, frame, theme, area);
+        if app.editor().is_some() {
+            draw_editor_modal(app, frame, theme, area);
+        } else {
+            draw_preview_modal(app, frame, theme, area);
+        }
     }
     if let Some(modal) = app.input_modal() {
         draw_input_modal(modal, frame, theme, area);
@@ -252,6 +256,12 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // Editor takes over the preview pane when active *and* not in
+    // modal-fullscreen — the modal renderer handles that case.
+    if app.editor().is_some() && !app.is_full_preview() {
+        draw_editor_pane(app, frame, theme, area);
+        return;
+    }
     let preview_title = app
         .selected()
         .map(|e| e.name.clone())
@@ -361,6 +371,65 @@ fn render_preview_body(
 /// keeps spatial context. Body lines are sized via the same path as
 /// the normal preview pane — image bodies re-rasterize at the modal's
 /// rect for a much higher-resolution view.
+fn draw_editor_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    let Some(editor) = app.editor() else { return };
+    let bcol = theme.proc_box; // editor always has focus implicitly
+    let dirty_mark = if editor.dirty { " ●" } else { "" };
+    let title = format!("✎ {}{}", editor.name(), dirty_mark);
+    let controls = format!(
+        "Ln {}  Col {}  ·  ^S save  ^X exit",
+        editor.cursor.0 + 1,
+        editor.cursor.1 + 1
+    );
+    let panel = BoxedPanel::new(bcol, theme.title)
+        .with_title(title)
+        .with_controls(controls);
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.height == 0 {
+        return;
+    }
+    render_editor_body(app, frame, theme, inner);
+}
+
+fn render_editor_body(app: &App, frame: &mut Frame<'_>, theme: &Theme, inner: Rect) {
+    let Some(editor) = app.editor() else { return };
+    let widget = EditableText::new(&editor.lines, editor.cursor, theme)
+        .with_scroll(editor.scroll_row, editor.scroll_col)
+        .with_line_numbers(true);
+    if let Some((cx, cy)) = widget.cursor_screen_xy(inner) {
+        frame.set_cursor_position((cx, cy));
+    }
+    frame.render_widget(&widget, inner);
+}
+
+fn draw_editor_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    let Some(editor) = app.editor() else { return };
+    let dirty_mark = if editor.dirty { " ●" } else { "" };
+    let title = format!("✎ {}{}", editor.name(), dirty_mark);
+    let controls = format!(
+        "Ln {}  Col {}  ·  ^S save  ^X exit",
+        editor.cursor.0 + 1,
+        editor.cursor.1 + 1
+    );
+    let panel = BoxedPanel::new(theme.proc_box, theme.title)
+        .with_title(title)
+        .with_controls(controls)
+        .flat();
+    let modal_w = ((area.width as u32 * 9 / 10) as u16).max(20);
+    let modal_h = ((area.height as u32 * 9 / 10) as u16).max(8);
+    let bg = theme.main_bg.unwrap_or(Color::Black);
+    let shell = ModalShell::new(panel, modal_w, modal_h)
+        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
+    let Some(body) = shell.render(frame, area) else {
+        return;
+    };
+    if body.height == 0 {
+        return;
+    }
+    render_editor_body(app, frame, theme, body);
+}
+
 fn draw_preview_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     let title = app
         .selected()
@@ -577,6 +646,25 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     if area.height == 0 {
         return;
     }
+    if let Some(editor) = app.editor() {
+        // Editor-specific bar: nano-style hints. Flash overrides the
+        // hints while a status (e.g. "wrote ...") is active.
+        let bar = if let Some(msg) = editor.message.as_deref() {
+            ActionBar::new(vec![("·".into(), msg.to_string())])
+        } else {
+            ActionBar::new(vec![
+                ("^S".into(), "save".into()),
+                ("^X".into(), "exit".into()),
+                ("^Home/^End".into(), "top/bottom".into()),
+                ("PgUp/PgDn".into(), "page".into()),
+                ("Tab".into(), "indent".into()),
+                ("Space".into(), "fullscreen".into()),
+            ])
+        };
+        let bar = bar.with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+        frame.render_widget(&bar, area);
+        return;
+    }
     // Transient op-result flashes preempt the normal hint chips so
     // the user sees feedback without losing the row to a tooltip.
     if let Some(msg) = app.status_message() {
@@ -626,6 +714,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
             ("h/l".into(), "parent/open".into()),
             ("j/k".into(), move_label.into()),
             ("f".into(), "find".into()),
+            ("e".into(), "edit".into()),
             ("a".into(), "new".into()),
             ("r".into(), "rename".into()),
             ("d/D".into(), "trash/del".into()),

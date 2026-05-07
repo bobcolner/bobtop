@@ -441,6 +441,10 @@ pub struct App {
     /// finder results instead of the cwd entries; key events route
     /// through `handle_finder_key` until Esc / Enter closes it.
     finder: Option<FinderState>,
+    /// In-place editor state. While Some, the preview pane (or
+    /// preview modal, if open) renders `EditableText` against this
+    /// buffer and keystrokes route through the editor's handler.
+    editor: Option<crate::editor::EditorState>,
     /// Transient status line shown in the action bar — used to flash
     /// op results like "renamed", "trashed", or error messages.
     /// Cleared after a few ticks so it doesn't linger.
@@ -578,6 +582,7 @@ impl App {
             last_image_paint: None,
             input_modal: None,
             finder: None,
+            editor: None,
             status_message: None,
             status_message_ticks: 0,
         };
@@ -650,6 +655,14 @@ impl App {
 
     pub fn is_finder_active(&self) -> bool {
         self.finder.is_some()
+    }
+
+    pub fn editor(&self) -> Option<&crate::editor::EditorState> {
+        self.editor.as_ref()
+    }
+
+    pub fn is_editor_active(&self) -> bool {
+        self.editor.is_some()
     }
 
     pub fn status_message(&self) -> Option<&str> {
@@ -1143,6 +1156,35 @@ impl App {
             Action::StartFind => {
                 self.finder = Some(FinderState::new());
             }
+            Action::StartEditor => {
+                // Only promote text-y previews into editing — opening
+                // a 4 GB log or a binary in our buffer is a foot gun.
+                let editable = matches!(
+                    self.preview_state(),
+                    PreviewState::Ready { preview, .. }
+                        if matches!(
+                            preview.kind,
+                            crate::preview::PreviewKind::Text
+                                | crate::preview::PreviewKind::Markdown
+                                | crate::preview::PreviewKind::Empty
+                        )
+                );
+                if !editable {
+                    self.flash_status("edit: preview must be text");
+                } else if let Some(entry) = self.selected().cloned() {
+                    if entry.is_dir() {
+                        self.flash_status("edit: cannot edit a directory");
+                    } else {
+                        match crate::editor::EditorState::open(&entry.path) {
+                            Ok(state) => {
+                                self.editor = Some(state);
+                                self.focus = Focus::Preview;
+                            }
+                            Err(e) => self.flash_status(format!("edit: {}", e)),
+                        }
+                    }
+                }
+            }
             Action::ParentDir => {
                 if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
                     let _ = self.cd(&parent);
@@ -1238,6 +1280,25 @@ impl App {
 
     pub fn is_input_modal(&self) -> bool {
         self.input_modal.is_some()
+    }
+
+    /// Compute the editor's viewport (rows × cols) based on whether
+    /// the preview is currently in modal-fullscreen or side-pane.
+    /// The widget knows the gutter width itself; we subtract a
+    /// generous 6 cells for chrome (borders + gutter) so the
+    /// horizontal scroll math still has headroom.
+    pub fn editor_viewport(&self) -> (usize, usize) {
+        let rows = self.preview_viewport_h.max(1);
+        let cols = if self.full_preview {
+            let term_w = crossterm::terminal::size().map(|s| s.0).unwrap_or(80);
+            ((term_w as u32 * 9 / 10) as usize).saturating_sub(6)
+        } else {
+            (self
+                .preview_pane_x_end
+                .saturating_sub(self.preview_pane_x_start) as usize)
+                .saturating_sub(6)
+        };
+        (rows, cols.max(1))
     }
 
     /// Process a key while the finder overlay is open.
@@ -1561,6 +1622,9 @@ impl App {
     pub fn run<B: Backend + std::io::Write>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         loop {
             self.tick_status();
+            if let Some(e) = self.editor.as_mut() {
+                e.tick();
+            }
             self.drain_results();
             if self.drain_fs_events() {
                 // The 120 ms event-poll tick acts as natural debounce
@@ -1622,6 +1686,37 @@ impl App {
                                 return Ok(());
                             }
                             self.handle_input_modal_key(key);
+                        } else if self.is_editor_active() {
+                            // Ctrl-Q is the universal app-quit while
+                            // editor is open (Ctrl-C is intercepted
+                            // by the editor for bracket matching etc.
+                            // in future, but for now does nothing).
+                            if matches!(key.code, KeyCode::Char('q'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            let (rows, cols) = self.editor_viewport();
+                            let outcome = self
+                                .editor
+                                .as_mut()
+                                .map(|e| e.handle_key(key, rows, cols))
+                                .unwrap_or(crate::editor::EditorOutcome::Continue);
+                            if outcome == crate::editor::EditorOutcome::Close {
+                                let path = self
+                                    .editor
+                                    .as_ref()
+                                    .map(|e| e.path.clone());
+                                self.editor = None;
+                                if let Some(p) = path {
+                                    // The buffer may have been saved
+                                    // (or discarded). Drop the cached
+                                    // preview so the side pane reads
+                                    // from disk again.
+                                    self.preview_cache.invalidate(&p);
+                                    self.request_preview();
+                                }
+                            }
                         } else if self.is_finder_active() {
                             if matches!(key.code, KeyCode::Char('c'))
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
