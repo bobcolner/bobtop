@@ -22,14 +22,17 @@ use crate::find::FindResult;
 
 /// Three-column miller layout shared between the renderer and the
 /// run loop's mouse-routing math. Returns one rect per column.
-pub fn split_main_columns(top: Rect) -> Vec<Rect> {
+/// The preview-pane weight is parameterized so `[`/`]` can shrink
+/// or grow it (0 = collapsed entirely; the list pane absorbs).
+pub fn split_main_columns(top: Rect, preview_weight: u16) -> Vec<Rect> {
     // Weights and min widths are tuned so the parent collapses first
     // on narrow terminals (weight 1, min 16), then the preview
-    // (weight 3) — the current dir always survives.
+    // (when present) — the current dir always survives.
+    let preview_min = if preview_weight == 0 { 0 } else { 24 };
     let columns = MillerColumns::new(vec![
         MillerColumn::new(1, 16),
         MillerColumn::new(3, 24),
-        MillerColumn::new(4, 24),
+        MillerColumn::new(preview_weight, preview_min),
     ])
     .with_gap(0);
     columns.split(top)
@@ -57,7 +60,7 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
         }
     }
     let (top, bottom) = split_top_bottom(area, 1);
-    let rects = split_main_columns(top);
+    let rects = split_main_columns(top, app.preview_size().weight());
     draw_parent_pane(app, frame, theme, rects[0]);
     draw_list_pane(app, frame, theme, rects[1]);
     draw_preview_pane(app, frame, theme, rects[2]);
@@ -724,6 +727,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         vec![
             ("Tab".into(), "focus".into()),
             ("Space".into(), "full".into()),
+            ("[/]".into(), "preview size".into()),
             ("/".into(), "filter".into()),
             ("g_".into(), "jump".into()),
             ("h/l".into(), "parent/open".into()),

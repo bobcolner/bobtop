@@ -23,12 +23,17 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let (counted, total) = interface_counts(app);
     let scale = app.net_scale_bps();
     let title = presenter::network_title(app, counted, total);
+    // Live rates in the top-right slot — peaks are useful but the
+    // user almost always wants "what's happening right now". Peak
+    // values still drive the in-graph y-axis scale via
+    // `app.net_scale_bps()`, so the trend graph stays comparable
+    // across spikes.
     let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
         .with_title(title)
         .with_controls(format!(
-            "pk ↑{} ↓{}",
-            format_rate(app.net_peak_tx()),
-            format_rate(app.net_peak_rx()),
+            "↑ {}/s   ↓ {}/s",
+            format_rate(tx_now),
+            format_rate(rx_now),
         ));
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
@@ -201,7 +206,13 @@ fn current_rates(app: &App) -> (f64, f64) {
     (rx, tx)
 }
 
-fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, rx_now: f64, tx_now: f64) {
+fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, _rx_now: f64, _tx_now: f64) {
+    // Plain `─` rule across the centerline — visually marks the
+    // 0 / mirror axis where the upload trace flips into the
+    // download trace. Inline rate labels were here too; they
+    // were redundant once the live `↑/↓` numbers moved into the
+    // panel's top-right slot, so dropping them keeps the data
+    // surface from echoing itself.
     let div_y = inner.y + inner.height / 2;
     if div_y >= inner.y + inner.height {
         return;
@@ -212,25 +223,6 @@ fn overlay_center_divider(frame: &mut Frame, inner: Rect, app: &App, rx_now: f64
         let cell = &mut buf[(inner.x + x, div_y)];
         cell.set_char('─');
         cell.set_style(style);
-    }
-    let up_label = format!(" ↑ {}/s ", format_rate(tx_now));
-    let dn_label = format!(" {}/s ↓ ", format_rate(rx_now));
-    write_str_at(
-        buf,
-        inner.x + 1,
-        div_y,
-        &up_label,
-        Style::default().fg(app.theme.upload.end),
-    );
-    let dn_len = dn_label.chars().count() as u16;
-    if dn_len + 2 < inner.width {
-        write_str_at(
-            buf,
-            inner.right().saturating_sub(dn_len + 1),
-            div_y,
-            &dn_label,
-            Style::default().fg(app.theme.download.end),
-        );
     }
 }
 

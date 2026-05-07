@@ -35,6 +35,47 @@ pub enum Focus {
     Preview,
 }
 
+/// User-cyclable preview pane width. Hidden collapses the whole
+/// pane (the list takes its space); the other steps map to weight
+/// values in the miller-column split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewSize {
+    Hidden,
+    Small,
+    Medium,
+    Large,
+}
+
+impl PreviewSize {
+    /// Miller-column weight for this size. 0 collapses the pane.
+    pub fn weight(self) -> u16 {
+        match self {
+            PreviewSize::Hidden => 0,
+            PreviewSize::Small => 2,
+            PreviewSize::Medium => 4,
+            PreviewSize::Large => 8,
+        }
+    }
+
+    pub fn wider(self) -> Self {
+        match self {
+            PreviewSize::Hidden => PreviewSize::Small,
+            PreviewSize::Small => PreviewSize::Medium,
+            PreviewSize::Medium => PreviewSize::Large,
+            PreviewSize::Large => PreviewSize::Large,
+        }
+    }
+
+    pub fn narrower(self) -> Self {
+        match self {
+            PreviewSize::Large => PreviewSize::Medium,
+            PreviewSize::Medium => PreviewSize::Small,
+            PreviewSize::Small => PreviewSize::Hidden,
+            PreviewSize::Hidden => PreviewSize::Hidden,
+        }
+    }
+}
+
 /// Suspend the TUI, run `$EDITOR` (default `nano`) on `path`, and
 /// restore the TUI when the editor exits. Errors during teardown or
 /// restore propagate; spawning the editor itself is best-effort —
@@ -246,7 +287,7 @@ fn compute_native_image_rect(app: &App, area: ratatui::layout::Rect) -> Option<r
             area.width,
             area.height.saturating_sub(1),
         );
-        let rects = ui::split_main_columns(top);
+        let rects = ui::split_main_columns(top, app.preview_size().weight());
         let pane = rects.get(2).copied()?;
         if pane.width == 0 {
             return None;
@@ -400,6 +441,10 @@ pub struct App {
     /// the modal: vertical movement scrolls the preview, Esc/Space
     /// closes, other actions are ignored.
     full_preview: bool,
+    /// User-cyclable size for the side preview pane (`[` / `]`).
+    /// Default Medium; Hidden collapses the pane entirely so the
+    /// list/parent get more horizontal room.
+    preview_size: PreviewSize,
     /// Inclusive-exclusive x range of the side preview pane, recorded
     /// by the renderer. Used to dispatch mouse-wheel events to the
     /// pane the cursor is over.
@@ -565,6 +610,7 @@ impl App {
             preview_viewport_h: 0,
             focus: Focus::List,
             full_preview: false,
+            preview_size: PreviewSize::Medium,
             preview_pane_x_start: 0,
             preview_pane_x_end: 0,
             jump_pending: false,
@@ -638,6 +684,10 @@ impl App {
 
     pub fn is_full_preview(&self) -> bool {
         self.full_preview
+    }
+
+    pub fn preview_size(&self) -> PreviewSize {
+        self.preview_size
     }
 
     pub fn image_backend(&self) -> ImageBackend {
@@ -1155,6 +1205,20 @@ impl App {
             Action::StartFind => {
                 self.finder = Some(FinderState::new());
             }
+            Action::PreviewWider => {
+                let prev = self.preview_size;
+                self.preview_size = self.preview_size.wider();
+                if self.preview_size != prev {
+                    self.flash_status(format!("preview {:?}", self.preview_size));
+                }
+            }
+            Action::PreviewNarrower => {
+                let prev = self.preview_size;
+                self.preview_size = self.preview_size.narrower();
+                if self.preview_size != prev {
+                    self.flash_status(format!("preview {:?}", self.preview_size));
+                }
+            }
             Action::StartEditor => {
                 // Only promote text-y previews into editing — opening
                 // a 4 GB log or a binary in our buffer is a foot gun.
@@ -1657,7 +1721,7 @@ impl App {
                     area.width,
                     area.height.saturating_sub(1),
                 );
-                let rects = ui::split_main_columns(top);
+                let rects = ui::split_main_columns(top, self.preview_size.weight());
                 if let Some(p) = rects.get(2) {
                     self.preview_pane_x_start = p.x;
                     self.preview_pane_x_end = p.x.saturating_add(p.width);

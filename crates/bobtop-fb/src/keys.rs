@@ -41,6 +41,10 @@ pub enum Action {
     StartFind,
     /// Promote the currently-previewed file into in-place edit mode.
     StartEditor,
+    /// Shrink the preview pane one step (Large → Medium → Small → Hidden).
+    PreviewNarrower,
+    /// Grow the preview pane one step (Hidden → Small → Medium → Large).
+    PreviewWider,
     Noop,
 }
 
@@ -79,6 +83,8 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('a') => Action::Touch,
         KeyCode::Char('f') => Action::StartFind,
         KeyCode::Char('e') => Action::StartEditor,
+        KeyCode::Char('[') => Action::PreviewNarrower,
+        KeyCode::Char(']') => Action::PreviewWider,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         _ => Action::Noop,
