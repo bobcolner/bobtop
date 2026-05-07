@@ -96,13 +96,15 @@ pub(super) fn disk_label(label: &str) -> String {
     format!("{:<6}", truncate_chars(label, 6))
 }
 
+/// Fixed-width disk I/O value string. Each rate is right-aligned in a
+/// 6-cell slot so the surrounding sparkline stays a constant width
+/// regardless of whether rates jump from 0 → MiB/s → back. Always
+/// renders both directions — "idle" gets `0B/s` rather than a special
+/// case, since the special case was the source of width changes.
 pub(super) fn disk_io_value(read: Option<f64>, write: Option<f64>) -> String {
-    match (read, write) {
-        (Some(r), Some(w)) if r + w > 0.0 => {
-            format!("▼{}/s ▲{}/s", format_rate(r), format_rate(w))
-        }
-        _ => "idle".to_string(),
-    }
+    let r = format!("{}/s", format_rate(read.unwrap_or(0.0)));
+    let w = format!("{}/s", format_rate(write.unwrap_or(0.0)));
+    format!("▼{:>6} ▲{:>6}", r, w)
 }
 
 pub(super) fn network_title(app: &App, counted: usize, total: usize) -> String {

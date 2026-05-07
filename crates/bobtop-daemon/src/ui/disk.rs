@@ -1,7 +1,7 @@
 use bobtop_core::sample::FilesystemSample;
 use bobtop_tui::widgets::Meter;
 use bobtop_tui::widgets::panel as boxed_panel;
-use bobtop_tui::{format_bytes, format_rate};
+use bobtop_tui::{format_bytes_compact, format_rate};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
@@ -131,9 +131,9 @@ fn draw_swap_row(buf: &mut Buffer, area: Rect, app: &App) {
     let theme = &app.theme;
     let frac = mem.swap_used_bytes as f64 / mem.swap_total_bytes as f64;
     let value = format!(
-        "{} / {}",
-        format_bytes(mem.swap_used_bytes),
-        format_bytes(mem.swap_total_bytes)
+        "{}/{}",
+        format_bytes_compact(mem.swap_used_bytes),
+        format_bytes_compact(mem.swap_total_bytes)
     );
     let m = Meter::new("Swap:", value, frac)
         .with_gradient(theme.used)
@@ -149,9 +149,9 @@ fn build_disk_meter_used_only(fs: &FilesystemSample, theme: &bobtop_tui::Theme) 
         0.0
     };
     let value = format!(
-        "{} / {}",
-        format_bytes(fs.used_bytes),
-        format_bytes(fs.total_bytes),
+        "{}/{}",
+        format_bytes_compact(fs.used_bytes),
+        format_bytes_compact(fs.total_bytes),
     );
     let label = format!("{}:", fs.label);
     Meter::new(label, value, frac)
@@ -166,17 +166,18 @@ fn build_disk_meter(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {
     } else {
         0.0
     };
-    let io_part = match (fs.read_bytes_per_sec, fs.write_bytes_per_sec) {
-        (Some(r), Some(w)) if r + w > 0.0 => {
-            format!("▼{}/s ▲{}/s  ", format_rate(r), format_rate(w))
-        }
-        _ => String::new(),
-    };
+    // Always show both rates in fixed-width slots so the value column
+    // doesn't shift when rates fluctuate or the row goes idle.
+    let io_part = format!(
+        "▼{:>6} ▲{:>6}  ",
+        format!("{}/s", format_rate(fs.read_bytes_per_sec.unwrap_or(0.0))),
+        format!("{}/s", format_rate(fs.write_bytes_per_sec.unwrap_or(0.0))),
+    );
     let value = format!(
-        "{}{} / {}",
+        "{}{}/{}",
         io_part,
-        format_bytes(fs.used_bytes),
-        format_bytes(fs.total_bytes),
+        format_bytes_compact(fs.used_bytes),
+        format_bytes_compact(fs.total_bytes),
     );
     let label = match fs.io_utilization {
         Some(io) if io > 0.05 => format!("{}: io {:.0}%", fs.label, io * 100.0),
