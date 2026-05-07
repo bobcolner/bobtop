@@ -29,7 +29,6 @@ bobtop-tui = { workspace = true }
 bobtop-fb = { workspace = true, optional = true }
 
 tokio = { workspace = true }
-async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -60,5 +59,4 @@ harness = false
 default = ["ebpf", "fb"]
 ebpf = ["bobtop-pid-attr/ebpf"]
 pcap = ["bobtop-pid-attr/pcap"]
-nvidia = ["bobtop-collectors/nvidia"]
 fb = ["dep:bobtop-fb"]

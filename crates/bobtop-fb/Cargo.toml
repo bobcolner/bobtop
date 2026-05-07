@@ -21,9 +21,6 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 unicode-width = { workspace = true }
 serde = { workspace = true }

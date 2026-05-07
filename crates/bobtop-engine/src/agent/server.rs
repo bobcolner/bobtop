@@ -638,6 +638,8 @@ mod tests {
             buffers_bytes: 0,
             free_bytes: 12_000_000_000,
             pressure: None,
+            cpu_pressure: None,
+            io_pressure: None,
         });
         (bus, store, history)
     }

@@ -274,17 +274,12 @@ dependencies = [
 name = "bobtop-collectors"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "bobtop-core",
  "bobtop-pid-attr",
- "libc",
- "nvml-wrapper",
  "serde_json",
  "sysinfo",
- "thiserror 1.0.69",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -295,7 +290,6 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -303,7 +297,6 @@ name = "bobtop-daemon"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bobtop-collectors",
  "bobtop-core",
  "bobtop-engine",
@@ -355,11 +348,8 @@ dependencies = [
  "ratatui",
  "serde",
  "syntect",
- "thiserror 1.0.69",
  "tokio",
  "toml",
- "tracing",
- "tracing-subscriber",
  "trash",
  "unicode-width 0.2.0",
  "viuer",
@@ -369,12 +359,9 @@ dependencies = [
 name = "bobtop-pid-attr"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "async-trait",
- "bobtop-core",
  "libbpf-cargo",
  "libbpf-rs",
- "libc",
  "pcap",
  "serde",
  "thiserror 1.0.69",
@@ -386,14 +373,8 @@ dependencies = [
 name = "bobtop-tui"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "bobtop-core",
- "crossterm",
  "ratatui",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "toml",
  "tracing",
  "unicode-width 0.2.0",
 ]
@@ -747,36 +728,12 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "darling"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
-dependencies = [
- "darling_core 0.20.11",
- "darling_macro 0.20.11",
-]
-
-[[package]]
-name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
 dependencies = [
- "darling_core 0.23.0",
- "darling_macro 0.23.0",
-]
-
-[[package]]
-name = "darling_core"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
-dependencies = [
- "fnv",
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn",
+ "darling_core",
+ "darling_macro",
 ]
 
 [[package]]
@@ -794,22 +751,11 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
-version = "0.20.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
-dependencies = [
- "darling_core 0.20.11",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "darling_macro"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
 dependencies = [
- "darling_core 0.23.0",
+ "darling_core",
  "quote",
  "syn",
 ]
@@ -1220,7 +1166,7 @@ version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5eb2d60ef19920a3a9193c3e371f726ec1dafc045dac788d0fb3704272458971"
 dependencies = [
- "darling 0.23.0",
+ "darling",
  "indoc",
  "proc-macro2",
  "quote",
@@ -1688,29 +1634,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "nvml-wrapper"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9bff0aa1d48904a1385ea2a8b97576fbdcbc9a3cfccd0d31fe978e1c4038c5"
-dependencies = [
- "bitflags 2.11.1",
- "libloading",
- "nvml-wrapper-sys",
- "static_assertions",
- "thiserror 1.0.69",
- "wrapcenum-derive",
-]
-
-[[package]]
-name = "nvml-wrapper-sys"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "698d45156f28781a4e79652b6ebe2eaa0589057d588d3aec1333f6466f13fcb5"
-dependencies = [
- "libloading",
 ]
 
 [[package]]
@@ -3352,18 +3275,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wrapcenum-derive"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a76ff259533532054cfbaefb115c613203c73707017459206380f03b3b3f266e"
-dependencies = [
- "darling 0.20.11",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

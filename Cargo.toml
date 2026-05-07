@@ -40,7 +40,6 @@ futures = "0.3"
 # System data sources
 sysinfo = "0.32"
 pcap = "2.0"
-nvml-wrapper = "0.10"
 libc = "0.2"
 
 # eBPF userspace loader. We use libbpf-rs (a safe Rust wrapper around the

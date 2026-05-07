@@ -8,14 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bobtop-core = { workspace = true }
-
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 tracing = { workspace = true }
-libc = { workspace = true }
 serde = { workspace = true }
 
 # Optional: Tier 2 — userspace packet capture.

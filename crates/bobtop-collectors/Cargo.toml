@@ -13,16 +13,5 @@ bobtop-pid-attr = { workspace = true }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-tracing = { workspace = true }
 sysinfo = { workspace = true }
-libc = { workspace = true }
 serde_json = { workspace = true }
-
-# Optional: NVIDIA GPU stats via NVML.
-nvml-wrapper = { workspace = true, optional = true }
-
-[features]
-default = []
-nvidia = ["dep:nvml-wrapper"]
