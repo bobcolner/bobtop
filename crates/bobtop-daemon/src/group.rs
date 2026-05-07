@@ -11,6 +11,11 @@
 //!   is the *useful* clustering — `firefox.service`, `docker-<sha>.scope`,
 //!   `user@1000.service` — and containers / k8s pods show up as named
 //!   cgroups for free.
+//! - **ByContainer** — narrow refinement of `ByCgroup`: only Docker /
+//!   Podman / containerd / LXC groups get their own bucket (with names
+//!   resolved from runtime metadata), and everything else lumps into a
+//!   single `host` group. The right view when "what's running in my
+//!   containers?" is the question.
 //! - **ByParent** — render as a collapsible parent_pid tree with branch
 //!   glyphs (├ │ └). Each non-leaf can be collapsed to hide its subtree.
 //!
@@ -33,6 +38,7 @@ pub enum GroupMode {
     Flat,
     ByExecutable,
     ByCgroup,
+    ByContainer,
     ByParent,
 }
 
@@ -42,16 +48,18 @@ impl GroupMode {
             GroupMode::Flat => "flat",
             GroupMode::ByExecutable => "exec",
             GroupMode::ByCgroup => "cgroup",
+            GroupMode::ByContainer => "container",
             GroupMode::ByParent => "tree",
         }
     }
 
-    /// `g` cycles through the four modes in this order.
+    /// `g` cycles through the modes in this order.
     pub fn next(self) -> Self {
         match self {
             GroupMode::Flat => GroupMode::ByExecutable,
             GroupMode::ByExecutable => GroupMode::ByCgroup,
-            GroupMode::ByCgroup => GroupMode::ByParent,
+            GroupMode::ByCgroup => GroupMode::ByContainer,
+            GroupMode::ByContainer => GroupMode::ByParent,
             GroupMode::ByParent => GroupMode::Flat,
         }
     }
@@ -89,6 +97,15 @@ pub fn build_display(
         }
         GroupMode::ByCgroup => build_grouped(procs, expanded, sort, descending, |p| {
             p.cgroup.clone().unwrap_or_else(|| "(no cgroup)".into())
+        }),
+        GroupMode::ByContainer => build_grouped(procs, expanded, sort, descending, |p| {
+            // Only true containers get their own bucket; host
+            // processes share the "host" group so the user can see
+            // what's containerized at a glance.
+            p.container
+                .as_ref()
+                .map(|c| c.display())
+                .unwrap_or_else(|| "host".into())
         }),
         GroupMode::ByParent => build_tree(procs, expanded, sort, descending),
     }
@@ -419,7 +436,18 @@ mod tests {
             disk_read_bytes_per_sec: None,
             disk_write_bytes_per_sec: None,
             cgroup: cg.map(|s| s.into()),
+            container: None,
         }
+    }
+
+    fn with_container(mut info: ProcessInfo, name: &str) -> ProcessInfo {
+        use bobtop_core::sample::{Container, ContainerRuntime};
+        info.container = Some(Container {
+            runtime: ContainerRuntime::Docker,
+            id: format!("{}-id", name),
+            name: Some(name.into()),
+        });
+        info
     }
 
     fn _ignore() -> Instant { Instant::now() }
@@ -519,6 +547,39 @@ mod tests {
         assert!(matches!(rows[1], TableRow::Item(_)));
         assert!(matches!(rows[2], TableRow::Item(_)));
         assert!(matches!(rows[3], TableRow::Header(_)));
+    }
+
+    #[test]
+    fn by_container_buckets_containers_and_lumps_host_processes() {
+        let ps = vec![
+            with_container(p(1, None, "node", 0.30, 100, None), "web-app"),
+            with_container(p(2, None, "node", 0.20, 80, None), "web-app"),
+            with_container(p(3, None, "redis", 0.10, 50, None), "redis"),
+            p(4, None, "sshd", 0.01, 5, None),
+            p(5, None, "bash", 0.01, 5, Some("user-1000.slice")),
+        ];
+        let rows = build_display(&ps, GroupMode::ByContainer, &HashSet::new(), TableSort::Cpu, true);
+        let keys: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                TableRow::Header(h) => Some(h.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Three buckets total: web-app, redis, host (sshd + bash both
+        // lack container metadata). Order by CPU desc puts web-app first.
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], "web-app", "highest-cpu container goes first");
+        assert!(keys.contains(&"redis"));
+        assert!(keys.contains(&"host"));
+        // The host header must aggregate both non-container processes.
+        match rows.iter().find_map(|r| match r {
+            TableRow::Header(h) if h.key == "host" => Some(h),
+            _ => None,
+        }) {
+            Some(h) => assert_eq!(h.proc_count, 2),
+            None => panic!("missing host header"),
+        }
     }
 
     #[test]

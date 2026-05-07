@@ -196,6 +196,63 @@ pub struct ProcessInfo {
     /// view (the actually-useful clustering on modern systemd hosts).
     /// `None` on non-Linux or when the file is unreadable.
     pub cgroup: Option<String>,
+    /// Parsed container metadata when the cgroup matches a known
+    /// container runtime (Docker, Podman, containerd/CRI, LXC). `None`
+    /// for processes running on the host outside any container — the
+    /// `ByContainer` group mode lumps those into a single "host"
+    /// bucket. `name` is best-effort: filled in by reading the runtime's
+    /// metadata files (e.g. `/var/lib/docker/containers/<id>/config.v2.json`)
+    /// when readable, otherwise the truncated id stands in.
+    pub container: Option<Container>,
+}
+
+/// Container runtime identifier. Recognized at parse time from the
+/// cgroup leaf name. `Other` is reserved for runtimes we haven't
+/// taught the parser yet — they still get an id but no name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContainerRuntime {
+    Docker,
+    Podman,
+    Containerd,
+    Lxc,
+    Other,
+}
+
+impl ContainerRuntime {
+    pub fn label(self) -> &'static str {
+        match self {
+            ContainerRuntime::Docker => "docker",
+            ContainerRuntime::Podman => "podman",
+            ContainerRuntime::Containerd => "containerd",
+            ContainerRuntime::Lxc => "lxc",
+            ContainerRuntime::Other => "container",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Container {
+    pub runtime: ContainerRuntime,
+    /// Container id as the runtime knows it. Often a 64-char hex hash;
+    /// the renderer truncates to 12 chars for display.
+    pub id: String,
+    /// Friendly name when the runtime metadata was readable. Falls back
+    /// to `<runtime>:<id[..12]>` for display when `None`.
+    pub name: Option<String>,
+}
+
+impl Container {
+    /// Stable, human-readable label for grouping and display. Prefers
+    /// the resolved name; falls back to runtime-prefixed short id so
+    /// each container still gets a unique key when names are missing.
+    pub fn display(&self) -> String {
+        if let Some(n) = &self.name {
+            n.clone()
+        } else {
+            let short = self.id.chars().take(12).collect::<String>();
+            format!("{}:{}", self.runtime.label(), short)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -38,9 +38,9 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let scroll_offset = selection_scroll_offset(app.selected_proc, rows.len(), body_h);
     let layout = match app.group_mode {
         crate::group::GroupMode::Flat => bobtop_tui::widgets::TableLayout::Flat,
-        crate::group::GroupMode::ByExecutable | crate::group::GroupMode::ByCgroup => {
-            bobtop_tui::widgets::TableLayout::Grouped
-        }
+        crate::group::GroupMode::ByExecutable
+        | crate::group::GroupMode::ByCgroup
+        | crate::group::GroupMode::ByContainer => bobtop_tui::widgets::TableLayout::Grouped,
         crate::group::GroupMode::ByParent => bobtop_tui::widgets::TableLayout::Tree,
     };
     let (columns, grid_rows, sort_col) = build_table_model(app, &rows, layout);

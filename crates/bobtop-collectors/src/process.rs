@@ -26,13 +26,19 @@ struct StaticProcInfo {
     start_time: u64,
     cmdline: Option<String>,
     cgroup: Option<String>,
+    /// Parsed container metadata when the cgroup path matched a known
+    /// runtime (Docker, Podman, containerd, LXC). Resolved once per pid
+    /// (cgroups don't change after exec) and cached here.
+    container: Option<Container>,
 }
 
 use async_trait::async_trait;
-use bobtop_core::sample::{ProcessInfo, ProcessSample, ProcessState};
+use bobtop_core::sample::{Container, ProcessInfo, ProcessSample, ProcessState};
 use bobtop_core::{Collector, Result};
 use bobtop_pid_attr::AttributionStore;
 use sysinfo::{ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind, Users};
+
+use crate::container::NameResolver;
 
 const DEFAULT_INTERVAL_MS: u64 = 2000;
 
@@ -58,6 +64,11 @@ pub struct ProcessCollector {
     /// callers create one `AttributionStore`, hand it to the collector
     /// here and to the attributor sampling loops as the writer side.
     attribution: Option<AttributionStore>,
+    /// Container name cache. Resolves friendly names from runtime
+    /// metadata files (Docker / Podman) the first time we see each
+    /// container id and reuses the result for the lifetime of the
+    /// collector.
+    name_resolver: Mutex<NameResolver>,
 }
 
 impl std::fmt::Debug for ProcessCollector {
@@ -86,6 +97,7 @@ impl ProcessCollector {
             last_disk: Mutex::new(HashMap::new()),
             static_cache: Mutex::new(HashMap::new()),
             attribution: None,
+            name_resolver: Mutex::new(NameResolver::new()),
         }
     }
 
@@ -199,10 +211,20 @@ impl Collector for ProcessCollector {
                             Some(joined)
                         }
                     });
+                    let (cgroup_leaf, cgroup_full) = read_cgroup_full(pid_u32);
+                    let container = {
+                        let mut r = self.name_resolver.lock().unwrap();
+                        crate::container::detect(
+                            cgroup_leaf.as_deref(),
+                            cgroup_full.as_deref(),
+                            &mut r,
+                        )
+                    };
                     StaticProcInfo {
                         start_time,
                         cmdline,
-                        cgroup: read_cgroup(pid_u32),
+                        cgroup: cgroup_leaf,
+                        container,
                     }
                 }
             };
@@ -284,6 +306,7 @@ impl Collector for ProcessCollector {
                 disk_read_bytes_per_sec: disk_r,
                 disk_write_bytes_per_sec: disk_w,
                 cgroup: static_info.cgroup.clone(),
+                container: static_info.container.clone(),
             });
 
             next_static.insert(pid_u32, static_info);
@@ -345,27 +368,44 @@ fn thread_count(_p: &sysinfo::Process) -> u32 {
 /// at the v1 hierarchy line that has the longest path (heuristic).
 /// Returns None on non-Linux, when the file is unreadable, or when the
 /// cgroup is just `/` (the root, useless for grouping).
+/// Read `/proc/[pid]/cgroup` and return both the leaf segment (for
+/// display and the existing cgroup-grouping mode) and the full v2 path
+/// (for container detection — Docker on the cgroupfs driver and LXC
+/// put the id/name earlier in the path, not in the leaf).
 #[cfg(target_os = "linux")]
-fn read_cgroup(pid: u32) -> Option<String> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+fn read_cgroup_full(pid: u32) -> (Option<String>, Option<String>) {
+    let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return (None, None);
+    };
     // Prefer v2 (line starts with "0::"). Fall back to longest v1 path.
     let v2 = s.lines().find(|l| l.starts_with("0::")).map(|l| &l[3..]);
-    let path = v2.or_else(|| {
-        s.lines()
+    let path = match v2 {
+        Some(p) => p,
+        None => match s
+            .lines()
             .filter_map(|l| l.splitn(3, ':').nth(2))
             .max_by_key(|p| p.len())
-    })?;
-    let leaf = path.rsplit('/').find(|s| !s.is_empty())?;
-    if leaf.is_empty() || leaf == "/" {
+        {
+            Some(p) => p,
+            None => return (None, None),
+        },
+    };
+    let full = if path.is_empty() || path == "/" {
         None
     } else {
-        Some(leaf.to_string())
-    }
+        Some(path.to_string())
+    };
+    let leaf = path
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .filter(|l| !l.is_empty() && *l != "/")
+        .map(|s| s.to_string());
+    (leaf, full)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn read_cgroup(_pid: u32) -> Option<String> {
-    None
+fn read_cgroup_full(_pid: u32) -> (Option<String>, Option<String>) {
+    (None, None)
 }
 
 /// Read /proc/[pid]/cmdline and join the NUL-separated argv vector

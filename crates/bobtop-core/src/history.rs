@@ -531,6 +531,7 @@ mod tests {
             disk_read_bytes_per_sec: None,
             disk_write_bytes_per_sec: None,
             cgroup: None,
+            container: None,
         }
     }
 

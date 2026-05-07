@@ -122,6 +122,7 @@ fn populated_app() -> App {
             disk_read_bytes_per_sec: Some((i as f64 + 1.0) * 25_000.0),
             disk_write_bytes_per_sec: Some((i as f64 + 1.0) * 10_000.0),
             cgroup: Some(if i % 3 == 0 { "user.slice" } else { "system.slice" }.into()),
+            container: None,
         })
         .collect();
     app.apply_event(MetricEvent::Process(ProcessSample {
