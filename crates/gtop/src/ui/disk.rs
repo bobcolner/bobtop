@@ -1,4 +1,4 @@
-use bobtop_core::sample::FilesystemSample;
+use crate::core::sample::FilesystemSample;
 use gtui::widgets::Meter;
 use gtui::widgets::panel as boxed_panel;
 use gtui::{format_bytes_compact, format_rate};
@@ -58,7 +58,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_filesystems(
     frame: &mut Frame,
     inner: Rect,
-    disk: &bobtop_core::sample::DiskSample,
+    disk: &crate::core::sample::DiskSample,
     app: &App,
 ) {
     match app.track_chart_style {

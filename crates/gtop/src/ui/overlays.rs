@@ -1,4 +1,4 @@
-use bobtop_core::Box as BoxKind;
+use crate::core::Box as BoxKind;
 use crate::options_editor::OptionsEditor;
 use gtui::widgets::{
     panel as boxed_panel, ActionBar, BrailleText, ConfirmDialog, ModalShell, SectionHeader, ToggleRow,

@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use bobtop_core::sample::ProcessInfo;
+use crate::core::sample::ProcessInfo;
 pub use crate::widgets::{TableGroupHeader, TableRow, TableRowMeta};
 use crate::widgets::TableSort;
 
@@ -463,7 +463,7 @@ fn emit_subtree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bobtop_core::sample::ProcessState;
+    use crate::core::sample::ProcessState;
     use std::time::Instant;
 
     fn p(pid: u32, parent: Option<u32>, name: &str, cpu: f32, mem_mb: u64, cg: Option<&str>) -> ProcessInfo {
@@ -488,7 +488,7 @@ mod tests {
     }
 
     fn with_container(mut info: ProcessInfo, name: &str) -> ProcessInfo {
-        use bobtop_core::sample::{Container, ContainerRuntime};
+        use crate::core::sample::{Container, ContainerRuntime};
         info.container = Some(Container {
             runtime: ContainerRuntime::Docker,
             id: format!("{}-id", name),

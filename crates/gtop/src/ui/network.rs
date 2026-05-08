@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
-use bobtop_collectors::{classify_interface, NetInterfaceKind};
-use bobtop_core::sample::InterfaceSample;
+use crate::collectors::{classify_interface, NetInterfaceKind};
+use crate::core::sample::InterfaceSample;
 use gtui::widgets::{BrailleGraph, DualMode, GraphStyle, Trace};
 use gtui::widgets::panel as boxed_panel;
 use gtui::{format_rate, truncate_chars, write_str_at, write_str_clipped};
@@ -269,7 +269,7 @@ fn current_rates(app: &App) -> (f64, f64) {
     let mut rx = 0.0;
     let mut tx = 0.0;
     for iface in &s.interfaces {
-        if !app.show_virtual_net && bobtop_collectors::is_virtual_interface(&iface.name) {
+        if !app.show_virtual_net && crate::collectors::is_virtual_interface(&iface.name) {
             continue;
         }
         rx += iface.rx_bytes_per_sec;
@@ -457,7 +457,7 @@ fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
     let dim_style = Style::default().fg(app.theme.inactive_fg);
     for (i, flow) in flows.iter().take(body_h).enumerate() {
         let y = body_top + i as u16;
-        let active = flow.conn.state == bobtop_pid_attr::SocketState::Established;
+        let active = flow.conn.state == crate::pid_attr::SocketState::Established;
         // Dim non-Established rows so the eye anchors on what's
         // actually moving bytes; LISTEN/TIME_WAIT/etc. recede.
         let row_fg = if active { main_fg_style } else { dim_style };
@@ -496,8 +496,8 @@ fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
 /// Listening sockets that haven't accepted any peer yet have a remote
 /// of 0.0.0.0:0 (or the v6 equivalent). They contribute no useful
 /// information to a flow view focused on "where are bytes going."
-fn is_unbound_listener(conn: &bobtop_pid_attr::ConnectionInfo) -> bool {
-    use bobtop_pid_attr::AddrEndpoint as E;
+fn is_unbound_listener(conn: &crate::pid_attr::ConnectionInfo) -> bool {
+    use crate::pid_attr::AddrEndpoint as E;
     matches!(
         conn.remote,
         E::V4 { port: 0, .. } | E::V6 { port: 0, .. }
@@ -508,8 +508,8 @@ fn is_unbound_listener(conn: &bobtop_pid_attr::ConnectionInfo) -> bool {
 /// share a pid's aggregate rate; we de-duplicate by inserting into a
 /// HashMap so the panel header total doesn't double-count.
 fn aggregate_rates(
-    store: &bobtop_pid_attr::AttributionStore,
-    flows: &[bobtop_pid_attr::FlowRow],
+    store: &crate::pid_attr::AttributionStore,
+    flows: &[crate::pid_attr::FlowRow],
 ) -> (f64, f64) {
     use std::collections::HashSet;
     let mut seen = HashSet::new();
@@ -542,8 +542,8 @@ fn rate_style(grad: &gtui::Gradient, value: f64, peak: f64) -> Style {
 /// Pick a colour for the STATE cell. ESTABLISHED uses the title accent
 /// (it's the "live" state); LISTEN gets `hi_fg` to flag it as a
 /// distinct mode; everything else dims into `inactive_fg`.
-fn state_color(theme: &crate::monitor_theme::MonitorTheme, state: bobtop_pid_attr::SocketState) -> Style {
-    use bobtop_pid_attr::SocketState as S;
+fn state_color(theme: &crate::monitor_theme::MonitorTheme, state: crate::pid_attr::SocketState) -> Style {
+    use crate::pid_attr::SocketState as S;
     let fg = match state {
         S::Established => theme.title,
         S::Listen => theme.hi_fg,
@@ -585,10 +585,10 @@ fn write_row(
     }
 }
 
-fn format_endpoint(ep: &bobtop_pid_attr::AddrEndpoint) -> String {
+fn format_endpoint(ep: &crate::pid_attr::AddrEndpoint) -> String {
     match ep {
-        bobtop_pid_attr::AddrEndpoint::V4 { addr, port } => format!("{addr}:{port}"),
-        bobtop_pid_attr::AddrEndpoint::V6 { addr, port } => {
+        crate::pid_attr::AddrEndpoint::V4 { addr, port } => format!("{addr}:{port}"),
+        crate::pid_attr::AddrEndpoint::V6 { addr, port } => {
             // Bracket IPv6 so the colon-port is unambiguous; the table
             // column will clip if it overflows.
             format!("[{addr}]:{port}")
@@ -596,8 +596,8 @@ fn format_endpoint(ep: &bobtop_pid_attr::AddrEndpoint) -> String {
     }
 }
 
-fn state_glyph(s: bobtop_pid_attr::SocketState) -> &'static str {
-    use bobtop_pid_attr::SocketState as S;
+fn state_glyph(s: crate::pid_attr::SocketState) -> &'static str {
+    use crate::pid_attr::SocketState as S;
     match s {
         S::Established => "ESTAB",
         S::Listen => "LISTEN",
@@ -622,7 +622,7 @@ fn interface_counts(app: &App) -> (usize, usize) {
     } else {
         s.interfaces
             .iter()
-            .filter(|i| !bobtop_collectors::is_virtual_interface(&i.name))
+            .filter(|i| !crate::collectors::is_virtual_interface(&i.name))
             .count()
     };
     (counted, total)

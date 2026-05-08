@@ -1,10 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bobtop-core",
-    "crates/bobtop-collectors",
-    "crates/bobtop-pid-attr",
-    "crates/bobtop-engine",
     "crates/gtui",
     "crates/gtop",
     "crates/bobtop-db",
@@ -21,10 +17,6 @@ authors = ["bobtop contributors"]
 
 [workspace.dependencies]
 # First-party crates (path-resolved within the workspace)
-bobtop-core = { path = "crates/bobtop-core" }
-bobtop-collectors = { path = "crates/bobtop-collectors" }
-bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
-bobtop-engine = { path = "crates/bobtop-engine" }
 gtui = { path = "crates/gtui" }
 bobtop-db = { path = "crates/bobtop-db" }
 gfb = { path = "crates/gfb" }

@@ -1,10 +1,10 @@
 //! `gtop agent <subcommand>` — CLI glue around the engine's agent
 //! client primitives. Argv parsing lives here; the wire protocol and
-//! socket I/O live in `bobtop_engine::agent::client`.
+//! socket I/O live in `crate::engine::agent::client`.
 
 use std::time::Duration;
 
-use bobtop_engine::agent::client::{auto_query, socket_path_buf};
+use crate::engine::agent::client::{auto_query, socket_path_buf};
 use serde_json::json;
 
 /// Top-level dispatch for `gtop agent ...`. Called from `main.rs`

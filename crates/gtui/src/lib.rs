@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod boxes;
 pub mod color;
 pub mod keymap;
 pub mod layout;
@@ -17,6 +18,7 @@ pub mod text;
 pub mod util;
 pub mod widgets;
 
+pub use boxes::{Box, BoxesEnabled};
 pub use color::{dim, lerp_color, parse_btop_color, Gradient};
 pub use layout::{
     compute as compute_layout, compute_from_enabled, LayoutAreas, LayoutPreset, PanelSize,

@@ -7,7 +7,7 @@ pub struct UiState {
     pub show_help: bool,
     /// `B` toggles the boxes overlay — show/hide individual panels (B5).
     pub show_boxes_overlay: bool,
-    /// Cursor row inside the boxes overlay (index into `bobtop_core::Box::ALL`).
+    /// Cursor row inside the boxes overlay (index into `crate::core::Box::ALL`).
     pub boxes_overlay_cursor: usize,
 
     /// `f` opens the process filter input (B3b). While `filter_active`,

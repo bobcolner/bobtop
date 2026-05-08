@@ -8,8 +8,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bobtop-core = { workspace = true }
-
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }

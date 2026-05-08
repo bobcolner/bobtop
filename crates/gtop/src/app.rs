@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 
-use bobtop_core::sample::{
+use crate::core::sample::{
     CpuSample, DiskSample, MemorySample, NetworkSample, ProcessInfo, ProcessSample,
 };
-use bobtop_core::{BoxesEnabled, MetricEvent};
-use bobtop_pid_attr::{AttributorTier, DiskAttributorTier};
+use crate::core::{BoxesEnabled, MetricEvent};
+use crate::pid_attr::{AttributorTier, DiskAttributorTier};
 use gtui::widgets::CornerStyle;
 use gtui::LayoutPreset;
 use crate::monitor_theme::MonitorTheme;
@@ -219,7 +219,7 @@ pub struct App {
     /// daemon at startup; left `None` in tests so the headless tests
     /// don't need an attributor. The flow panel reads through this
     /// when active; the classic panel ignores it.
-    pub attribution: Option<bobtop_pid_attr::AttributionStore>,
+    pub attribution: Option<crate::pid_attr::AttributionStore>,
     /// Expand/collapse state. For grouped modes (exec/cgroup), entries
     /// are header keys that are EXPANDED (default = collapsed). For tree
     /// mode, entries are pids stringified that are COLLAPSED (default =
@@ -302,7 +302,7 @@ impl App {
     /// Builder-style hook for the daemon to share its `AttributionStore`
     /// handle with the App. Kept optional so headless tests don't need
     /// to construct an attributor.
-    pub fn with_attribution(mut self, store: bobtop_pid_attr::AttributionStore) -> Self {
+    pub fn with_attribution(mut self, store: crate::pid_attr::AttributionStore) -> Self {
         self.attribution = Some(store);
         self
     }
@@ -557,11 +557,11 @@ impl App {
     /// `panel_sizes` is the layout-side source of truth.
     fn sync_boxes_from_sizes(&mut self) {
         for b in [
-            bobtop_core::Box::Cpu,
-            bobtop_core::Box::Memory,
-            bobtop_core::Box::Disk,
-            bobtop_core::Box::Network,
-            bobtop_core::Box::Process,
+            crate::core::Box::Cpu,
+            crate::core::Box::Memory,
+            crate::core::Box::Disk,
+            crate::core::Box::Network,
+            crate::core::Box::Process,
         ] {
             self.boxes.set(b, self.panel_sizes.enabled(b));
         }
@@ -677,8 +677,8 @@ impl App {
             .filter(|i| {
                 self.show_virtual_net
                     || matches!(
-                        bobtop_collectors::classify_interface(&i.name),
-                        bobtop_collectors::NetInterfaceKind::External
+                        crate::collectors::classify_interface(&i.name),
+                        crate::collectors::NetInterfaceKind::External
                     )
             })
             .map(|i| i.name.clone())
@@ -1010,11 +1010,11 @@ impl App {
             // is kept in sync via sync_boxes_from_sizes().
             KeyCode::Char(c @ ('1' | '2' | '3' | '4' | '5')) => {
                 let target = match c {
-                    '1' => bobtop_core::Box::Cpu,
-                    '2' => bobtop_core::Box::Memory,
-                    '3' => bobtop_core::Box::Network,
-                    '4' => bobtop_core::Box::Process,
-                    '5' => bobtop_core::Box::Disk,
+                    '1' => crate::core::Box::Cpu,
+                    '2' => crate::core::Box::Memory,
+                    '3' => crate::core::Box::Network,
+                    '4' => crate::core::Box::Process,
+                    '5' => crate::core::Box::Disk,
                     _ => unreachable!(),
                 };
                 self.panel_sizes.cycle(target);
@@ -1275,7 +1275,7 @@ impl App {
         if !self.ui.show_boxes_overlay {
             return None;
         }
-        use bobtop_core::Box as BoxKind;
+        use crate::core::Box as BoxKind;
         let n = BoxKind::ALL.len();
         match k.code {
             KeyCode::Char('B') | KeyCode::Char('b') | KeyCode::Esc => {
@@ -1331,7 +1331,7 @@ fn aggregate_net_rates(s: &NetworkSample, include_virtual: bool) -> (f64, f64) {
     let mut rx = 0.0;
     let mut tx = 0.0;
     for iface in &s.interfaces {
-        if !include_virtual && bobtop_collectors::is_virtual_interface(&iface.name) {
+        if !include_virtual && crate::collectors::is_virtual_interface(&iface.name) {
             continue;
         }
         rx += iface.rx_bytes_per_sec;
@@ -1344,7 +1344,7 @@ fn aggregate_net_rates(s: &NetworkSample, include_virtual: bool) -> (f64, f64) {
 mod tests {
     use std::time::Instant;
 
-    use bobtop_core::sample::{CpuSample, ProcessState};
+    use crate::core::sample::{CpuSample, ProcessState};
 
     use super::*;
 
@@ -1425,7 +1425,7 @@ mod tests {
 
     #[test]
     fn boxes_overlay_toggles_a_box_and_closes() {
-        use bobtop_core::Box as BoxKind;
+        use crate::core::Box as BoxKind;
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         // All boxes start enabled in Full.
         assert!(app.boxes.is_enabled(BoxKind::Cpu));
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn box_size_keys_cycle_through_states() {
-        use bobtop_core::Box as BoxKind;
+        use crate::core::Box as BoxKind;
         use gtui::PanelSize;
         // Each panel cycles Default → Large → Off → Default per keypress.
         // 1=CPU, 2=Mem, 3=Net, 4=Proc, 5=Disk.
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn shifted_number_keys_swap_layout_and_sort() {
-        use bobtop_core::Box as BoxKind;
+        use crate::core::Box as BoxKind;
         // Shift+1-4 ('!', '@', '#', '$' on US layout) apply the named
         // presets. Direct number keys are reserved for box toggles per
         // btop convention.
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn layout_switch_updates_boxes_enabled() {
-        use bobtop_core::Box as BoxKind;
+        use crate::core::Box as BoxKind;
         let mut app = App::new(theme(), LayoutPreset::Full, Arc::new(AtomicU64::new(500)), false, false);
         for b in BoxKind::ALL {
             assert!(app.boxes.is_enabled(b), "{b:?} should start enabled in Full");

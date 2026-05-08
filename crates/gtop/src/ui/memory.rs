@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use bobtop_core::sample::{MemoryPressure, MemorySample};
+use crate::core::sample::{MemoryPressure, MemorySample};
 use gtui::widgets::{BrailleGraph, GraphStyle, LegendStyle, Sparkline, StackedBar, StackedSegment};
 use gtui::widgets::panel as boxed_panel;
 use gtui::{format_bytes, write_str_at, Gradient};

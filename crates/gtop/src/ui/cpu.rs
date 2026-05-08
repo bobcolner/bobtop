@@ -1,4 +1,4 @@
-use bobtop_core::sample::CpuSample;
+use crate::core::sample::CpuSample;
 use gtui::widgets::{BrailleGraph, GraphStyle, MiniMeter, StackedBar, StackedSegment};
 use gtui::widgets::panel as boxed_panel;
 use gtui::{display_width, write_str_at};

@@ -14,7 +14,7 @@ use std::io::{self, Stdout, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bobtop_core::{Box as BoxKind, DataBus};
+use crate::core::{Box as BoxKind, DataBus};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, DisableFocusChange, EnableFocusChange, Event};
 use crossterm::execute;
@@ -347,7 +347,7 @@ pub async fn run(
 }
 
 fn drain_bus(
-    rx: &mut tokio::sync::broadcast::Receiver<bobtop_core::MetricEvent>,
+    rx: &mut tokio::sync::broadcast::Receiver<crate::core::MetricEvent>,
     app: &mut App,
 ) {
     loop {

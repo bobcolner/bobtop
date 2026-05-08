@@ -1,4 +1,4 @@
-use bobtop_core::sample::CpuSample;
+use crate::core::sample::CpuSample;
 use gtui::{format_bytes, format_rate, truncate_chars};
 
 use crate::app::{App, KillRequest, ProcessDetail};

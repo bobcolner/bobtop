@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 
-use bobtop_core::sample::ProcessInfo;
+use crate::core::sample::ProcessInfo;
 use crate::widgets::TableSort as TableSort;
 
 pub fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {

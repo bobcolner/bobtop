@@ -498,28 +498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bobtop-collectors"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "bobtop-core",
- "bobtop-pid-attr",
- "serde_json",
- "sysinfo",
- "tokio",
-]
-
-[[package]]
-name = "bobtop-core"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "bobtop-db"
 version = "0.2.0"
 dependencies = [
@@ -534,36 +512,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "bobtop-engine"
-version = "0.2.0"
-dependencies = [
- "bobtop-collectors",
- "bobtop-core",
- "bobtop-pid-attr",
- "globset",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "bobtop-pid-attr"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "libbpf-cargo",
- "libbpf-rs",
- "pcap",
- "serde",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1479,19 +1427,23 @@ name = "gtop"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bobtop-collectors",
- "bobtop-core",
- "bobtop-engine",
- "bobtop-pid-attr",
+ "async-trait",
  "clap",
  "criterion",
  "crossterm",
  "gfb",
+ "globset",
  "gtui",
+ "libbpf-cargo",
+ "libbpf-rs",
  "libc",
+ "pcap",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
+ "sysinfo",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
@@ -1503,7 +1455,6 @@ dependencies = [
 name = "gtui"
 version = "0.2.0"
 dependencies = [
- "bobtop-core",
  "crossterm",
  "ratatui",
  "tracing",

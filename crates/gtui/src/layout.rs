@@ -31,7 +31,7 @@
 //! used at startup (Full = all 5, Minimal = CPU + PROC). After init the
 //! daemon's `BoxesEnabled` is the source of truth.
 
-use bobtop_core::{Box as BoxKind, BoxesEnabled};
+use crate::boxes::{Box as BoxKind, BoxesEnabled};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

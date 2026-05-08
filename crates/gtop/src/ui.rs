@@ -144,7 +144,7 @@ fn draw_toast(frame: &mut Frame, area: Rect, app: &App, msg: &str) {
 }
 
 #[cfg(test)]
-fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &bobtop_core::sample::CpuSample, app: &App) {
+fn draw_core_meters(frame: &mut Frame, area: Rect, sample: &crate::core::sample::CpuSample, app: &App) {
     cpu::draw_core_meters(frame, area, sample, app);
 }
 #[cfg(test)]
@@ -159,16 +159,16 @@ mod tests {
         assert!(format_bytes(2_500_000_000).contains("GiB"));
     }
 
-    fn fake_sample(n: u32) -> bobtop_core::sample::CpuSample {
+    fn fake_sample(n: u32) -> crate::core::sample::CpuSample {
         let cores = (0..n)
-            .map(|i| bobtop_core::sample::CoreSample {
+            .map(|i| crate::core::sample::CoreSample {
                 id: i,
                 utilization: 0.5,
                 frequency_mhz: None,
                 temperature_c: None,
             })
             .collect();
-        bobtop_core::sample::CpuSample {
+        crate::core::sample::CpuSample {
             timestamp: std::time::Instant::now(),
             aggregate_utilization: 0.5,
             cores,

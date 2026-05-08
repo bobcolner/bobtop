@@ -16,15 +16,15 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bobtop_core::sample::{
+use gtop::app::App;
+use gtop::core::sample::{
     CoreSample, CpuSample, DiskDeviceSample, DiskSample, FilesystemSample, InterfaceSample,
     LoadAverage, MemorySample, NetworkSample, ProcessInfo, ProcessSample, ProcessState,
 };
-use bobtop_core::MetricEvent;
-use gtop::app::App;
+use gtop::core::MetricEvent;
 use gtop::monitor_theme;
+use gtop::pid_attr::AttributorTier;
 use gtop::ui;
-use bobtop_pid_attr::AttributorTier;
 use gtui::LayoutPreset;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ratatui::backend::TestBackend;

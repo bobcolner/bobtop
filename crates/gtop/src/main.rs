@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 
-use bobtop_core::BoxesEnabled;
 use gtop::cli::CornerChoice;
 use gtop::config::Config;
-use bobtop_engine::{Engine, EngineConfig};
+use gtop::core::BoxesEnabled;
+use gtop::engine::{Engine, EngineConfig};
 use gtui::{builtin_names, LayoutPreset};
 
 use gtop::app::App;

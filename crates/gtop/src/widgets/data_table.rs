@@ -18,7 +18,7 @@
 //!    underlying `LiveTable` with `fade=false` to preserve the existing
 //!    flat-list visual.
 
-use bobtop_core::sample::ProcessInfo;
+use crate::core::sample::ProcessInfo;
 use gtui::color::Gradient;
 use gtui::text::{format_bytes_compact, format_rate};
 use gtui::widgets::live_table::{
@@ -603,7 +603,7 @@ impl<'a> GroupAggregate<ProcCol> for GroupView<'a> {
 mod tests {
     use std::time::Instant;
 
-    use bobtop_core::sample::ProcessState;
+    use crate::core::sample::ProcessState;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::widgets::Widget;
