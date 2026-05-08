@@ -59,7 +59,19 @@ fn draw_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let style = Style::default().fg(app.theme.title);
     let label = match &app.status {
         Some(msg) => format!(" ⚠ {msg}"),
-        None => format!(" {}", app.conn.endpoint_label()),
+        None => match app.conns.len() {
+            0 => " (no connections)".to_string(),
+            1 => format!(" {}", app.conns[0].endpoint_label()),
+            n => format!(
+                " {} connections — {}",
+                n,
+                app.conns
+                    .iter()
+                    .map(|c| c.endpoint_label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
     };
     write_str_clipped(buf, area.x, area.y, &label, area.width, style);
 }

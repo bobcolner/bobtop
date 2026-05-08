@@ -29,7 +29,7 @@ pub struct PreviewData {
 }
 
 pub struct App {
-    pub conn: Box<dyn Connection>,
+    pub conns: Vec<Box<dyn Connection>>,
     pub theme: Theme,
     pub tree: CatalogTree,
     pub tree_nav: Nav,
@@ -41,16 +41,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(conn: Box<dyn Connection>, theme: Theme) -> Self {
-        // Endpoint auto-expands on construction so the user lands on
-        // a visible database list, not a single collapsed node.
-        let tree = CatalogTree::new(conn.as_ref()).unwrap_or_else(|_| {
+    pub fn new(conns: Vec<Box<dyn Connection>>, theme: Theme) -> Self {
+        // All endpoints auto-expand on construction so the user lands
+        // on visible database lists rather than a stack of collapsed
+        // chevrons.
+        let tree = CatalogTree::new(&conns).unwrap_or_else(|_| {
             // Recoverable: present an empty tree if the initial
-            // catalog query fails. Status line shows the error.
+            // catalog query fails. Status line surfaces the error.
             CatalogTree::empty()
         });
         Self {
-            conn,
+            conns,
             theme,
             tree,
             tree_nav: Nav::default(),
@@ -141,7 +142,7 @@ impl App {
             return;
         }
         let was_expanded = node.expanded;
-        match self.tree.toggle(self.conn.as_ref(), self.tree_nav.cursor) {
+        match self.tree.toggle(&self.conns, self.tree_nav.cursor) {
             Ok(new_len) => {
                 // After expanding a parent the cursor would otherwise stay
                 // on the parent — pressing Enter again would collapse it,
@@ -180,14 +181,11 @@ impl App {
             return;
         };
         if node.expandable && node.expanded {
-            // Collapse this node in place.
-            if let Err(e) = self.tree.toggle(self.conn.as_ref(), self.tree_nav.cursor) {
+            if let Err(e) = self.tree.toggle(&self.conns, self.tree_nav.cursor) {
                 self.status = Some(format!("collapse failed: {e}"));
             }
             return;
         }
-        // Already collapsed (or a leaf): jump cursor to the parent
-        // node by walking back to the first row at depth - 1.
         if node.depth == 0 {
             return;
         }
@@ -206,9 +204,13 @@ impl App {
         else {
             return;
         };
+        let Some(conn) = self.conns.get(path.conn) else {
+            self.status = Some(format!("preview: missing connection #{}", path.conn));
+            return;
+        };
         match (
-            self.conn.columns(&db, &schema, &table),
-            self.conn.preview_rows(&db, &schema, &table, PREVIEW_LIMIT),
+            conn.columns(&db, &schema, &table),
+            conn.preview_rows(&db, &schema, &table, PREVIEW_LIMIT),
         ) {
             (Ok(columns), Ok(rows)) => {
                 self.preview = Some(PreviewData { path, columns, rows });
@@ -224,32 +226,10 @@ impl App {
 }
 
 impl CatalogTree {
+    /// Empty fallback for when the initial catalog load fails — the
+    /// App keeps running so the status line can surface the error.
     fn empty() -> Self {
-        // Used only when initial catalog load fails — the App keeps
-        // running so the status line can surface the error.
-        Self::new_unchecked()
-    }
-}
-
-// `CatalogTree::new_unchecked` lives here (not in tree.rs) so it stays
-// out of the public-ish module API — it's a fallback that should never
-// be reached except via App::new's error branch.
-impl CatalogTree {
-    fn new_unchecked() -> Self {
-        // SAFETY: zero-sized state; serves as a "tree failed to load"
-        // sentinel so the rest of the App can render an error.
-        // Equivalent to `CatalogTree { nodes: vec![], expanded: HashSet::new() }`
-        // but we can't construct it directly because the fields are
-        // private. Use a no-op connection instead.
-        struct NullConn;
-        impl Connection for NullConn {
-            fn endpoint_label(&self) -> &str { "(disconnected)" }
-            fn databases(&self) -> Result<Vec<crate::conn::Database>> { Ok(vec![]) }
-            fn schemas(&self, _: &str) -> Result<Vec<crate::conn::Schema>> { Ok(vec![]) }
-            fn tables(&self, _: &str, _: &str) -> Result<Vec<crate::conn::Table>> { Ok(vec![]) }
-            fn columns(&self, _: &str, _: &str, _: &str) -> Result<Vec<ColumnSpec>> { Ok(vec![]) }
-            fn preview_rows(&self, _: &str, _: &str, _: &str, _: usize) -> Result<Vec<Row>> { Ok(vec![]) }
-        }
-        CatalogTree::new(&NullConn).expect("null connection cannot fail")
+        let conns: Vec<Box<dyn Connection>> = Vec::new();
+        CatalogTree::new(&conns).expect("empty conn list cannot fail")
     }
 }

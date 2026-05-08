@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use bobtop_tui::{load_theme, DEFAULT_THEME_NAME};
 
 use crate::app::App;
-use crate::conn::{self, DuckLakeAttach};
+use crate::conn::{self, Connection, DuckLakeAttach};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,13 +24,16 @@ use crate::conn::{self, DuckLakeAttach};
     about = "TUI database browser (Postgres + DuckDB / DuckLake)"
 )]
 pub struct Cli {
-    /// Connection target. Examples:
+    /// Connection target. Repeat the flag to browse multiple
+    /// endpoints in one session — they appear as siblings at the
+    /// top of the tree pane. Examples:
     ///   `postgres://user:pass@host:5432/dbname`
     ///   `duckdb:///path/to/file.db`
     ///   `duckdb://memory` (in-memory; useful with --ducklake-*)
-    ///   `mock` (built-in demo, default)
-    #[arg(long, default_value = "mock")]
-    pub connect: String,
+    ///   `mock` (built-in demo)
+    /// Defaults to a single `mock` connection when omitted.
+    #[arg(long)]
+    pub connect: Vec<String>,
 
     /// Theme name from the bundled bobtop registry.
     #[arg(long, default_value = DEFAULT_THEME_NAME)]
@@ -38,8 +41,9 @@ pub struct Cli {
 
     /// DuckLake catalog Postgres URL. When set together with
     /// `--ducklake-path`, runs `ATTACH 'ducklake:postgres:URL' AS
-    /// <name> (DATA_PATH '...')` after opening the DuckDB connection.
-    /// Only valid with `--connect duckdb://...`.
+    /// <name> (DATA_PATH '...')` on the *first* `--connect duckdb://...`
+    /// endpoint after it opens. Errors clearly if no duckdb endpoint
+    /// is present.
     #[arg(long)]
     pub ducklake_catalog: Option<String>,
 
@@ -77,8 +81,31 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         (None, None) => None,
     };
-    let connection = conn::open(&cli.connect, ducklake, !cli.write)?;
-    let mut app = App::new(connection, theme);
+
+    // No `--connect` → single mock connection (the demo). Otherwise
+    // open every target in order. The `ducklake` attach goes on the
+    // first duckdb:// target we encounter so users don't have to
+    // remember which slot owns the lake.
+    let targets: Vec<String> = if cli.connect.is_empty() {
+        vec!["mock".into()]
+    } else {
+        cli.connect.clone()
+    };
+    let mut conns: Vec<Box<dyn Connection>> = Vec::with_capacity(targets.len());
+    let mut ducklake_used = false;
+    for target in &targets {
+        let attach = if !ducklake_used && target.starts_with("duckdb://") {
+            ducklake_used = true;
+            ducklake.clone()
+        } else {
+            None
+        };
+        conns.push(conn::open(target, attach, !cli.write)?);
+    }
+    if ducklake.is_some() && !ducklake_used {
+        anyhow::bail!("--ducklake-* requires at least one --connect duckdb://... target");
+    }
+    let mut app = App::new(conns, theme);
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
