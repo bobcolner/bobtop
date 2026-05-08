@@ -1,25 +1,29 @@
-//! Data table — sortable row list for dense, structured tabular data.
+//! Process table — the system-monitor adapter on top of the generic
+//! [`LiveTable`](bobtop_tui::widgets::LiveTable).
 //!
-//! Columns: PID, Program, User, Threads, MEM (RSS), CPU%. Optional NET RX /
-//! NET TX columns appear when the active [`bobtop_pid_attr::AttributorTier`]
-//! provides per-process bandwidth (Tiers 2 and 3).
+//! The widget itself is in `bobtop-tui`; this module provides:
 //!
-//! Selection state is owned by the caller — pass `selected: Some(idx)` and
-//! `scroll_offset` so this widget stays render-only.
+//! 1. The column-id enum ([`ProcCol`]) and column defs for the three
+//!    layouts (Flat / Grouped / Tree) the monitor uses.
+//! 2. [`TableRowExt`] / [`GroupAggregate`] impls on internal view types
+//!    that pre-sample CPU and memory gradients before passing through.
+//! 3. [`TableSort`] — the closed sort enum daemon code (`group.rs`,
+//!    `presets.rs`, `proc_sort.rs`) matches on. Wraps `ProcCol`.
+//! 4. [`DataTable`] — a thin builder that materializes the view rows and
+//!    column defs, then renders the wrapped `LiveTable`.
 
 use bobtop_core::sample::ProcessInfo;
-use bobtop_tui::text;
+use bobtop_tui::text::{format_bytes_compact, format_rate};
+use bobtop_tui::widgets::live_table::{
+    Align, Cell, ColumnDef, GroupAggregate, LiveTable, TableEntry, TableRowExt, WidthSpec,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Color;
 use ratatui::widgets::Widget;
-use unicode_width::UnicodeWidthChar;
 
 use crate::monitor_theme::MonitorTheme;
 
-/// One row the renderer paints. Headers carry aggregates (group total
-/// CPU/MEM/etc); processes carry their own info plus depth/branch info
-/// for tree-mode indentation. Built by `bobtop_daemon::group::build_display`.
 #[derive(Debug, Clone)]
 pub enum TableRow {
     Header(TableGroupHeader),
@@ -31,9 +35,6 @@ pub struct TableGroupHeader {
     pub key: String,
     pub label: String,
     pub proc_count: usize,
-    /// Sum of `ProcessInfo.threads` across the group. Surfaced in the
-    /// "Th" column of the header row so users can see "firefox.service:
-    /// 47 procs / 312 threads" at a glance.
     pub threads_total: u32,
     pub cpu_fraction_total: f32,
     pub mem_rss_total: u64,
@@ -41,11 +42,6 @@ pub struct TableGroupHeader {
     pub net_tx_total: Option<f64>,
     pub disk_read_total: Option<f64>,
     pub disk_write_total: Option<f64>,
-    /// Most-common owning user across the group's processes; "—" when
-    /// the group is mixed-user (e.g. a parent-process tree spanning
-    /// privilege boundaries). Surfaced in the "User" column of the
-    /// header row so groups carry the same per-user context as flat
-    /// rows do.
     pub dominant_user: String,
     pub expanded: bool,
 }
@@ -53,20 +49,28 @@ pub struct TableGroupHeader {
 #[derive(Debug, Clone)]
 pub struct TableRowMeta {
     pub info: ProcessInfo,
-    /// 0 = top-level. 1+ = nested under a group header or a tree parent.
     pub depth: u8,
-    /// True when this row is the last sibling at its depth (drives └ vs ├).
     pub is_last_sibling: bool,
-    /// Per-ancestor-depth, true if that ancestor has a continuing sibling
-    /// (drives │ vs space at column d).
     pub ancestor_continues: Vec<bool>,
 }
 
-/// How aggressively rows fade toward `inactive_fg` as their visible index
-/// grows. `0.0` = no fade (matches old behavior); `1.0` = bottom row fully
-/// at `inactive_fg`. btop uses a similar darkening pass for visual depth —
-/// keeping it modest so contrast on long lists doesn't get unreadable.
-const FADE_END: f32 = 0.55;
+/// Column id — every render-time decision the widget makes keys off
+/// this. `ProcCol::Program` is the "label column" (chevron + tree
+/// glyphs go here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcCol {
+    Pid,
+    Program,
+    Command,
+    User,
+    Threads,
+    Mem,
+    Cpu,
+    NetRx,
+    NetTx,
+    DiskRead,
+    DiskWrite,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSort {
@@ -83,10 +87,8 @@ pub enum TableSort {
 }
 
 impl TableSort {
-    /// Cycle order for the `←` / `→` keybinds — left-to-right display order
-    /// so the selection visually tracks the arrow direction. Always includes
-    /// every sortable column so users can reach net/disk sort even at Tier 1
-    /// (rows just compare on `0.0` then).
+    /// Cycle order for the `←` / `→` keybinds — left-to-right display
+    /// order so selection visually tracks the arrow direction.
     pub fn cycle() -> &'static [TableSort] {
         &[
             TableSort::Pid,
@@ -117,82 +119,63 @@ impl TableSort {
             TableSort::DiskWrite => "dw",
         }
     }
+
+    fn col(self) -> ProcCol {
+        match self {
+            TableSort::Pid => ProcCol::Pid,
+            TableSort::Name => ProcCol::Program,
+            TableSort::User => ProcCol::User,
+            TableSort::Threads => ProcCol::Threads,
+            TableSort::Mem => ProcCol::Mem,
+            TableSort::Cpu => ProcCol::Cpu,
+            TableSort::NetRx => ProcCol::NetRx,
+            TableSort::NetTx => ProcCol::NetTx,
+            TableSort::DiskRead => ProcCol::DiskRead,
+            TableSort::DiskWrite => ProcCol::DiskWrite,
+        }
+    }
 }
 
-/// Per-mode column-width preset. Picks which column is the flex slot
-/// (`width = u16::MAX`, soaks up the leftover horizontal space) and how
-/// wide the fixed columns are. Selected from `ui.rs` based on the
-/// active GroupMode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableLayout {
-    /// Every row is a real process. Program is fixed-width (12);
-    /// Command flexes so long argv strings fill the panel before the
-    /// right-anchored metrics.
     #[default]
     Flat,
-    /// ByExecutable / ByCgroup. Program flexes so long group keys
-    /// ("docker-<sha>.scope", "user@1000.service (47)") aren't cut off.
-    /// Command shrinks to a fixed narrow width — child cmdline still
-    /// visible after expand, but doesn't dominate the layout.
     Grouped,
-    /// ByParent tree view. Program is wider (24) to accommodate tree
-    /// branch glyphs (│ ├ └) plus deep indentation. Command flexes so
-    /// argv has room after the tree prefix.
     Tree,
 }
 
 impl TableLayout {
-    /// True when this layout draws tree branch glyphs in the Program
-    /// column.
     pub fn draws_tree_glyphs(self) -> bool {
         matches!(self, TableLayout::Tree)
     }
 
-    /// Whether the Pid column is rendered. Dropped in Grouped because
-    /// a group header has no single pid; child rows in expanded groups
-    /// would benefit from one but the user's call: a clustering view
-    /// is for clustering, not pid spotting.
     pub fn includes_pid(self) -> bool {
         matches!(self, TableLayout::Flat | TableLayout::Tree)
     }
 
-    /// Whether the Command column is rendered. Dropped in Grouped
-    /// (Program already shows the executable name aggregating the
-    /// group) and in Tree (Program with branch glyphs is enough; saves
-    /// width for deep indentation).
     pub fn includes_command(self) -> bool {
         matches!(self, TableLayout::Flat)
     }
 
-    /// Whether the User column is rendered. All layouts now include
-    /// it — Grouped surfaces the dominant user via
-    /// `TableGroupHeader::dominant_user`, child rows under the header
-    /// keep their own user. Earlier the column was dropped in Grouped
-    /// because "no single user across a group" felt true; in practice
-    /// most groups (a service unit, a cgroup, a parent tree) have a
-    /// dominant owner and dropping the column made it impossible to
-    /// answer "who started this?" in clustering view.
     pub fn includes_user(self) -> bool {
         true
     }
 
+    /// Width preset for the `Program` column. Used by the `ui::processes`
+    /// render path that still drives the simpler `bobtop_tui::Table`
+    /// widget directly (not yet migrated to [`DataTable`] / [`LiveTable`]).
     pub fn program_width(self) -> u16 {
         match self {
             TableLayout::Flat => 12,
-            // Grouped: Program is the group label ("▼ firefox.service (47)")
-            // and Command is gone — Program absorbs the leftover space.
-            TableLayout::Grouped => u16::MAX,
-            // Tree: Program holds the indent + branch glyphs + name and
-            // Command is gone — flex so deep trees get room.
-            TableLayout::Tree => u16::MAX,
+            TableLayout::Grouped | TableLayout::Tree => u16::MAX,
         }
     }
 
+    /// Width preset for the `Command` column. `0` is a sentinel — only
+    /// the `Flat` layout renders Command at all.
     pub fn command_width(self) -> u16 {
         match self {
-            TableLayout::Flat => u16::MAX, // flex — full argv visibility
-            // Unused for Grouped/Tree (Command not rendered) but the
-            // method must return something. Keep at 0 as a sentinel.
+            TableLayout::Flat => u16::MAX,
             _ => 0,
         }
     }
@@ -206,8 +189,6 @@ pub struct DataTable<'a> {
     pub show_net_columns: bool,
     pub sort: TableSort,
     pub sort_descending: bool,
-    /// Column-width preset — picks the flex column and per-column widths
-    /// based on what each GroupMode benefits from.
     pub layout: TableLayout,
 }
 
@@ -252,340 +233,147 @@ impl<'a> DataTable<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ColSpec {
-    title: &'static str,
-    sort: Option<TableSort>,
-    width: u16,
-    right_align: bool,
-}
-
 impl<'a> Widget for &DataTable<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
+        let columns = build_columns(self.layout, self.show_net_columns);
 
-        // 11-column layout, btop-style ordering: identifier columns
-        // (pid, program, command, user) on the left, metric columns
-        // (threads, mem, cpu, net, disk) on the right. Command sits in
-        // the flex slot — long argv lists fill the gap before the
-        // right-anchored metrics. Cells render `-` when data is
-        // unavailable so columns stay discoverable even at Tier 1.
-        // Column set varies by layout (the includes_* methods on
-        // TableLayout dictate which appear). Cells emitted per row by
-        // build_row_cells / header-row cells MUST follow the same
-        // include order — they share the include predicates.
-        let cols: Vec<ColSpec> = build_cols(self.layout, self.show_net_columns);
-
-        // Header row. Active sort column gets bracketed + arrow indicator.
-        let header_style = Style::default().fg(self.theme.title).add_modifier(Modifier::BOLD);
-        let active_style = Style::default().fg(self.theme.hi_fg).add_modifier(Modifier::BOLD | Modifier::REVERSED);
-        let arrow = if self.sort_descending { '↓' } else { '↑' };
-        render_row(
-            buf,
-            area.x,
-            area.y,
-            area.width,
-            &cols,
-            |idx| {
-                let c = &cols[idx];
-                let is_active = c.sort.map(|s| s == self.sort).unwrap_or(false);
-                let tag = if is_active {
-                    format!("{}{}", c.title, arrow)
-                } else {
-                    c.title.to_string()
-                };
-                let style = if is_active { active_style } else { header_style };
-                (tag, style, c.right_align)
-            },
-        );
-
-        // Data rows.
-        let body_top = area.y + 1;
-        let body_h = area.height.saturating_sub(1) as usize;
-        let visible = self
+        let entries: Vec<TableEntry<ProcessRowView<'_>, GroupView<'_>>> = self
             .rows
             .iter()
-            .enumerate()
-            .skip(self.scroll_offset)
-            .take(body_h);
+            .map(|row| match row {
+                TableRow::Header(h) => TableEntry::Header(GroupView { h, show_net: self.show_net_columns }),
+                TableRow::Item(meta) => TableEntry::Item(ProcessRowView::new(meta, self.theme, self.show_net_columns)),
+            })
+            .collect();
 
-        let max_visible = body_h.max(1);
-        for (i, (row_idx, row)) in visible.enumerate() {
-            let y = body_top + i as u16;
-            let is_selected = self.selected == Some(row_idx);
-            let fade_t = (i as f32 / max_visible as f32) * FADE_END;
-
-            // Selection background fill applies to either kind.
-            if is_selected {
-                for x in area.x..area.x + area.width {
-                    buf[(x, y)].set_style(Style::default().bg(self.theme.selected_bg));
-                }
-            }
-
-            match row {
-                TableRow::Header(h) => {
-                    self.render_header_row(buf, area, y, h, is_selected, &cols);
-                }
-                TableRow::Item(p) => {
-                    self.render_process_row(
-                        buf,
-                        area,
-                        y,
-                        p,
-                        is_selected,
-                        fade_t,
-                        &cols,
-                    );
-                }
-            }
-        }
+        let table = LiveTable::new(&entries, &columns, &self.theme.base, ProcCol::Program)
+            .with_selection(self.selected, self.scroll_offset)
+            .with_sort(Some(self.sort.col()), self.sort_descending)
+            .with_tree_glyphs(self.layout.draws_tree_glyphs());
+        (&table).render(area, buf);
     }
 }
 
-impl<'a> DataTable<'a> {
-    fn render_header_row(
-        &self,
-        buf: &mut Buffer,
-        area: Rect,
-        y: u16,
-        h: &TableGroupHeader,
-        is_selected: bool,
-        cols: &[ColSpec],
-    ) {
-        let glyph = if h.expanded { '▼' } else { '▶' };
-        let label = format!("{glyph} {}", h.label);
-        // Build cells matching the active layout's column set. Identifier
-        // columns are blank for headers (no aggregate); metrics columns
-        // carry the group totals.
-        let mut cells: Vec<String> = Vec::with_capacity(cols.len());
-        if self.layout.includes_pid() {
-            cells.push(String::new());                       // Pid (blank for headers)
-        }
-        cells.push(String::new());                           // Program — overlaid below
-        if self.layout.includes_command() {
-            cells.push(String::new());                       // Command (blank)
-        }
-        if self.layout.includes_user() {
-            cells.push(String::new());                       // User (blank)
-        }
-        cells.push(h.threads_total.to_string());             // Th — sum across group
-        cells.push(format_bytes(h.mem_rss_total));           // MEM
-        cells.push(format!("{:.1}", h.cpu_fraction_total * 100.0)); // CPU%
-        cells.push(opt_rate(h.net_rx_total));
-        cells.push(opt_rate(h.net_tx_total));
-        cells.push(opt_rate(h.disk_read_total));
-        cells.push(opt_rate(h.disk_write_total));
-
-        let bg = if is_selected { Some(self.theme.selected_bg) } else { None };
-        let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
-        let style = match bg {
-            Some(b) => Style::default().bg(b).fg(fg).add_modifier(Modifier::BOLD),
-            None => Style::default().fg(fg).add_modifier(Modifier::BOLD),
-        };
-        render_row(buf, area.x, y, area.width, cols, |idx| {
-            let s = cells[idx].clone();
-            (s, style, cols[idx].right_align)
-        });
-        // Overwrite the Program column with the chevron + label. Find
-        // Program dynamically because Pid may be absent in Grouped
-        // layout — Program is at index 0 then. Sum widths of preceding
-        // columns + their gutters to get Program's x offset.
-        let prog_idx = cols
-            .iter()
-            .position(|c| c.title == "Program")
-            .expect("Program column always present");
-        let prog_x_offset: u16 = (0..prog_idx)
-            .map(|i| col_actual_width(cols, area.width, i).saturating_add(1))
-            .sum();
-        let prog_w = col_actual_width(cols, area.width, prog_idx);
-        write_str(
-            buf,
-            area.x + prog_x_offset,
-            y,
-            &label,
-            prog_w as usize,
-            style,
-        );
-    }
-
-    fn render_process_row(
-        &self,
-        buf: &mut Buffer,
-        area: Rect,
-        y: u16,
-        meta: &TableRowMeta,
-        is_selected: bool,
-        fade_t: f32,
-        cols: &[ColSpec],
-    ) {
-        let p = &meta.info;
-        let row_fg = lerp_color(self.theme.main_fg, self.theme.inactive_fg, fade_t);
-        let base_style = if is_selected {
-            Style::default()
-                .bg(self.theme.selected_bg)
-                .fg(self.theme.selected_fg)
-        } else {
-            Style::default().fg(row_fg)
-        };
-
-        let cpu_color = self.theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0));
-        let mem_color = self.theme.used.sample(
-            (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).min(1.0) as f32,
-        );
-
-        // Build the indent prefix. Tree layout draws branch glyphs;
-        // grouped layouts use a flat 2-space-per-depth indent.
-        let prefix = if self.layout.draws_tree_glyphs() {
-            tree_prefix(meta)
-        } else {
-            "  ".repeat(meta.depth as usize)
-        };
-
-        let mut cells = build_row_cells(p, self.layout, self.show_net_columns);
-        // Replace the Program cell with prefix + name. Program's index
-        // depends on layout (Pid is dropped in Grouped) — look it up.
-        // Use resolved width so flex Program (u16::MAX) doesn't truncate
-        // to 65535 chars.
-        let prog_idx = cols
-            .iter()
-            .position(|c| c.title == "Program")
-            .expect("Program column always present");
-        let prog_w = col_actual_width(cols, area.width, prog_idx);
-        let prog_avail = (prog_w as usize).saturating_sub(prefix.chars().count());
-        cells[prog_idx] = format!("{prefix}{}", truncate(&p.name, prog_avail.max(1)));
-
-        render_row(buf, area.x, y, area.width, cols, |idx| {
-            let s = cells[idx].clone();
-            let mut style = base_style;
-            if !is_selected {
-                if cols[idx].title == "CPU%" {
-                    style = style.fg(lerp_color(cpu_color, self.theme.inactive_fg, fade_t));
-                } else if cols[idx].title == "MEM" {
-                    style = style.fg(lerp_color(mem_color, self.theme.inactive_fg, fade_t));
-                } else if cols[idx].title == "Pid" {
-                    style = style.fg(self.theme.inactive_fg);
-                }
-            }
-            (s, style, cols[idx].right_align)
-        });
-
-        // Tree branch glyphs (`├ │ └ ─`) get the dedicated `proc_misc` accent
-        // so the tree structure reads as chrome rather than blending into the
-        // program name. btop colors its tree the same way. Done as a second
-        // pass to avoid splitting the Program cell into two strings.
-        if !is_selected && self.layout.draws_tree_glyphs() && !prefix.is_empty() {
-            let prog_x_offset: u16 = (0..prog_idx)
-                .map(|i| col_actual_width(cols, area.width, i).saturating_add(1))
-                .sum();
-            let mut x = area.x + prog_x_offset;
-            for _ in prefix.chars() {
-                if x >= area.x + area.width {
-                    break;
-                }
-                buf[(x, y)].set_style(
-                    Style::default()
-                        .fg(lerp_color(self.theme.accent_subtle, self.theme.inactive_fg, fade_t)),
-                );
-                x = x.saturating_add(1);
-            }
-        }
-    }
-}
-
-/// Build a tree branch prefix for a process row using its
-/// ancestor-continues bitmap and last-sibling flag. Examples:
-///   depth=0:           ""
-///   depth=1, last:     "└─ "
-///   depth=1, mid:      "├─ "
-///   depth=2, last,
-///     parent had more: "│  └─ "
-fn tree_prefix(meta: &TableRowMeta) -> String {
-    if meta.depth == 0 {
-        return String::new();
-    }
-    let mut out = String::new();
-    for &cont in &meta.ancestor_continues {
-        out.push_str(if cont { "│  " } else { "   " });
-    }
-    out.push_str(if meta.is_last_sibling { "└─ " } else { "├─ " });
-    out
-}
-
-/// Linear interpolate between two terminal colors at `t ∈ [0,1]`.
-/// Operates on RGB; falls back to `a` for non-RGB enum variants so
-/// 256-color / named themes degrade gracefully (no fade, but no panic).
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    match (a, b) {
-        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
-            let r = (ar as f32 + (br as f32 - ar as f32) * t).round() as u8;
-            let g = (ag as f32 + (bg as f32 - ag as f32) * t).round() as u8;
-            let b = (ab as f32 + (bb as f32 - ab as f32) * t).round() as u8;
-            Color::Rgb(r, g, b)
-        }
-        _ => a,
-    }
-}
-
-/// Build the column descriptors for the given layout. Order:
-///   [Pid] · Program · [Command] · [User] · Th · MEM · CPU% · [RX · TX] · DR · DW
-/// Bracketed columns are filtered by layout.includes_* predicates;
-/// RX/TX additionally drop when `show_net` is false (active net tier
-/// doesn't provide bandwidth — proc_inode shows only connections).
-fn build_cols(layout: TableLayout, show_net: bool) -> Vec<ColSpec> {
+fn build_columns(layout: TableLayout, show_net: bool) -> Vec<ColumnDef<ProcCol>> {
+    // Order: [Pid] · Program · [Command] · User · Th · MEM · CPU% · [RX · TX] · DR · DW
+    // Program flexes for Grouped/Tree (group label / tree glyphs); Command flexes for Flat (full argv).
     let mut cols = Vec::with_capacity(11);
     if layout.includes_pid() {
-        cols.push(ColSpec { title: "Pid", sort: Some(TableSort::Pid), width: 6, right_align: true });
+        cols.push(ColumnDef { id: ProcCol::Pid, label: "Pid", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
     }
-    cols.push(ColSpec { title: "Program", sort: Some(TableSort::Name), width: layout.program_width(), right_align: false });
+    let program_width = match layout {
+        TableLayout::Flat => WidthSpec::Fixed(12),
+        TableLayout::Grouped | TableLayout::Tree => WidthSpec::Flex,
+    };
+    cols.push(ColumnDef { id: ProcCol::Program, label: "Program", width: program_width, align: Align::Left, sortable: true });
     if layout.includes_command() {
-        cols.push(ColSpec { title: "Command", sort: None, width: layout.command_width(), right_align: false });
+        cols.push(ColumnDef { id: ProcCol::Command, label: "Command", width: WidthSpec::Flex, align: Align::Left, sortable: false });
     }
-    if layout.includes_user() {
-        cols.push(ColSpec { title: "User", sort: Some(TableSort::User), width: 6, right_align: false });
-    }
-    cols.push(ColSpec { title: "Th",   sort: Some(TableSort::Threads),   width: 3, right_align: true });
-    cols.push(ColSpec { title: "MEM",  sort: Some(TableSort::Mem),       width: 6, right_align: true });
-    cols.push(ColSpec { title: "CPU%", sort: Some(TableSort::Cpu),       width: 5, right_align: true });
+    cols.push(ColumnDef { id: ProcCol::User,    label: "User", width: WidthSpec::Fixed(6), align: Align::Left,  sortable: true });
+    cols.push(ColumnDef { id: ProcCol::Threads, label: "Th",   width: WidthSpec::Fixed(3), align: Align::Right, sortable: true });
+    cols.push(ColumnDef { id: ProcCol::Mem,     label: "MEM",  width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
+    cols.push(ColumnDef { id: ProcCol::Cpu,     label: "CPU%", width: WidthSpec::Fixed(5), align: Align::Right, sortable: true });
     if show_net {
-        cols.push(ColSpec { title: "RX/s", sort: Some(TableSort::NetRx), width: 6, right_align: true });
-        cols.push(ColSpec { title: "TX/s", sort: Some(TableSort::NetTx), width: 6, right_align: true });
+        cols.push(ColumnDef { id: ProcCol::NetRx, label: "RX/s", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
+        cols.push(ColumnDef { id: ProcCol::NetTx, label: "TX/s", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
     }
-    cols.push(ColSpec { title: "DR/s", sort: Some(TableSort::DiskRead),  width: 6, right_align: true });
-    cols.push(ColSpec { title: "DW/s", sort: Some(TableSort::DiskWrite), width: 6, right_align: true });
+    cols.push(ColumnDef { id: ProcCol::DiskRead,  label: "DR/s", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
+    cols.push(ColumnDef { id: ProcCol::DiskWrite, label: "DW/s", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
     cols
 }
 
-fn build_row_cells(p: &ProcessInfo, layout: TableLayout, show_net: bool) -> Vec<String> {
-    // Order MUST match build_cols(layout, show_net). Same conditional includes.
-    let mut out = Vec::with_capacity(11);
-    if layout.includes_pid() {
-        out.push(p.pid.to_string());
+/// View of a process row that pre-samples gradient colors at construction
+/// so `cell()` is cheap and self-contained.
+struct ProcessRowView<'a> {
+    meta: &'a TableRowMeta,
+    show_net: bool,
+    cpu_color: Color,
+    mem_color: Color,
+    inactive_fg: Color,
+}
+
+impl<'a> ProcessRowView<'a> {
+    fn new(meta: &'a TableRowMeta, theme: &MonitorTheme, show_net: bool) -> Self {
+        let p = &meta.info;
+        let cpu_color = theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0));
+        let mem_color = theme.used.sample(
+            (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).min(1.0) as f32,
+        );
+        Self { meta, show_net, cpu_color, mem_color, inactive_fg: theme.inactive_fg }
     }
-    out.push(truncate(&p.name, 12));
-    if layout.includes_command() {
-        let cmd = if p.cmdline.is_empty() {
-            p.name.clone()
-        } else {
-            p.cmdline.clone()
-        };
-        out.push(cmd);
+}
+
+impl<'a> TableRowExt<ProcCol> for ProcessRowView<'a> {
+    fn cell(&self, col: ProcCol) -> Cell {
+        let p = &self.meta.info;
+        match col {
+            ProcCol::Pid => Cell::styled(p.pid.to_string(), self.inactive_fg),
+            // Program is the "label column" — LiveTable overlays the
+            // tree prefix here. Just supply the program name; the
+            // widget handles the prefix overlay and width truncation.
+            ProcCol::Program => Cell::plain(p.name.clone()),
+            ProcCol::Command => {
+                let cmd = if p.cmdline.is_empty() {
+                    p.name.clone()
+                } else {
+                    p.cmdline.clone()
+                };
+                Cell::plain(cmd)
+            }
+            ProcCol::User => Cell::plain(p.user.clone()),
+            ProcCol::Threads => Cell::plain(p.threads.to_string()),
+            ProcCol::Mem => Cell::styled(format_bytes_compact(p.mem_rss_bytes), self.mem_color),
+            ProcCol::Cpu => Cell::styled(format!("{:.1}", p.cpu_fraction * 100.0), self.cpu_color),
+            ProcCol::NetRx => Cell::plain(opt_rate(if self.show_net { p.net_rx_bytes_per_sec } else { None })),
+            ProcCol::NetTx => Cell::plain(opt_rate(if self.show_net { p.net_tx_bytes_per_sec } else { None })),
+            ProcCol::DiskRead => Cell::plain(opt_rate(p.disk_read_bytes_per_sec)),
+            ProcCol::DiskWrite => Cell::plain(opt_rate(p.disk_write_bytes_per_sec)),
+        }
     }
-    if layout.includes_user() {
-        out.push(truncate(&p.user, 6));
+
+    fn tree_depth(&self) -> u8 {
+        self.meta.depth
     }
-    out.push(p.threads.to_string());
-    out.push(format_bytes(p.mem_rss_bytes));
-    out.push(format!("{:.1}", p.cpu_fraction * 100.0));
-    if show_net {
-        out.push(opt_rate(p.net_rx_bytes_per_sec));
-        out.push(opt_rate(p.net_tx_bytes_per_sec));
+
+    fn ancestor_continues(&self) -> &[bool] {
+        &self.meta.ancestor_continues
     }
-    out.push(opt_rate(p.disk_read_bytes_per_sec));
-    out.push(opt_rate(p.disk_write_bytes_per_sec));
-    out
+
+    fn is_last_sibling(&self) -> bool {
+        self.meta.is_last_sibling
+    }
+}
+
+/// View over a group header that emits aggregate cells for the metric
+/// columns. The `Program` column is left blank — LiveTable overlays the
+/// chevron + group label there.
+struct GroupView<'a> {
+    h: &'a TableGroupHeader,
+    show_net: bool,
+}
+
+impl<'a> GroupAggregate<ProcCol> for GroupView<'a> {
+    fn label(&self) -> &str {
+        &self.h.label
+    }
+
+    fn expanded(&self) -> bool {
+        self.h.expanded
+    }
+
+    fn cell(&self, col: ProcCol) -> Cell {
+        match col {
+            ProcCol::Pid | ProcCol::Program | ProcCol::Command => Cell::plain(""),
+            ProcCol::User => Cell::plain(self.h.dominant_user.clone()),
+            ProcCol::Threads => Cell::plain(self.h.threads_total.to_string()),
+            ProcCol::Mem => Cell::plain(format_bytes_compact(self.h.mem_rss_total)),
+            ProcCol::Cpu => Cell::plain(format!("{:.1}", self.h.cpu_fraction_total * 100.0)),
+            ProcCol::NetRx => Cell::plain(opt_rate(if self.show_net { self.h.net_rx_total } else { None })),
+            ProcCol::NetTx => Cell::plain(opt_rate(if self.show_net { self.h.net_tx_total } else { None })),
+            ProcCol::DiskRead => Cell::plain(opt_rate(self.h.disk_read_total)),
+            ProcCol::DiskWrite => Cell::plain(opt_rate(self.h.disk_write_total)),
+        }
+    }
 }
 
 fn opt_rate(v: Option<f64>) -> String {
@@ -596,135 +384,14 @@ fn opt_rate(v: Option<f64>) -> String {
     }
 }
 
-/// Resolve a column spec's actual rendered width given the total
-/// available width. `u16::MAX` (flex) gets replaced with leftover
-/// space after fixed columns + gutters. Fixed columns return as-is.
-/// Used by render-time helpers that need to know real widths
-/// (e.g. truncating Program for the prefix overlay) without
-/// re-implementing the math `render_row` does.
-fn col_actual_width(cols: &[ColSpec], total_width: u16, idx: usize) -> u16 {
-    let n = cols.len() as u16;
-    let fixed_total: u16 = cols
-        .iter()
-        .filter(|c| c.width != u16::MAX)
-        .map(|c| c.width)
-        .sum::<u16>()
-        .saturating_add(n.saturating_sub(1));
-    let flex_remaining = total_width.saturating_sub(fixed_total);
-    if cols[idx].width == u16::MAX {
-        flex_remaining
-    } else {
-        cols[idx].width
-    }
-}
-
-fn render_row<F>(buf: &mut Buffer, x0: u16, y: u16, total_width: u16, cols: &[ColSpec], mut cell_fn: F)
-where
-    F: FnMut(usize) -> (String, Style, bool),
-{
-    if total_width == 0 || cols.is_empty() {
-        return;
-    }
-    let right_limit = x0.saturating_add(total_width);
-    // Sum the *fixed* column widths (Command uses u16::MAX as a sentinel that
-    // means "soak up the remainder"). One-cell gutter between columns.
-    let n = cols.len() as u16;
-    let fixed_total: u16 = cols
-        .iter()
-        .filter(|c| c.width != u16::MAX)
-        .map(|c| c.width)
-        .sum::<u16>()
-        .saturating_add(n.saturating_sub(1));
-    let flex_remaining = total_width.saturating_sub(fixed_total);
-
-    let mut cursor = x0;
-    for (i, col) in cols.iter().enumerate() {
-        if cursor >= right_limit {
-            break;
-        }
-        let col_width = if col.width == u16::MAX {
-            flex_remaining
-        } else {
-            col.width
-        };
-        let avail = right_limit.saturating_sub(cursor).min(col_width);
-        if avail == 0 {
-            break;
-        }
-        let (text, style, right_align) = cell_fn(i);
-        let len = text::display_width(&text) as u16;
-        let (text_x, text) = if right_align && len < avail {
-            (cursor + (avail - len), text)
-        } else if len > avail {
-            (cursor, truncate(&text, avail as usize))
-        } else {
-            (cursor, text)
-        };
-        write_str(buf, text_x, y, &text, avail as usize, style);
-        cursor = cursor.saturating_add(col_width).saturating_add(1);
-    }
-}
-
-fn write_str(buf: &mut Buffer, x: u16, y: u16, s: &str, max_cols: usize, style: Style) {
-    let mut col = x;
-    let right = x.saturating_add(max_cols as u16).min(buf.area.right());
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-        if cw == 0 {
-            continue;
-        }
-        if col.saturating_add(cw) > right {
-            break;
-        }
-        let c = &mut buf[(col, y)];
-        c.set_char(ch);
-        c.set_style(c.style().patch(style));
-        col = col.saturating_add(cw);
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else if max_chars == 0 {
-        String::new()
-    } else {
-        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
-fn format_bytes(b: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if b >= GIB {
-        format!("{:.1}G", b as f64 / GIB as f64)
-    } else if b >= MIB {
-        format!("{:.0}M", b as f64 / MIB as f64)
-    } else if b >= KIB {
-        format!("{:.0}K", b as f64 / KIB as f64)
-    } else {
-        format!("{b}B")
-    }
-}
-
-fn format_rate(bps: f64) -> String {
-    if bps >= 1024.0 * 1024.0 {
-        format!("{:.1}M", bps / (1024.0 * 1024.0))
-    } else if bps >= 1024.0 {
-        format!("{:.1}K", bps / 1024.0)
-    } else {
-        format!("{:.0}B", bps)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use bobtop_core::sample::ProcessState;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Widget;
 
     use super::*;
 
@@ -762,6 +429,12 @@ mod tests {
             .collect()
     }
 
+    fn read_text(buf: &Buffer, y: u16, x_start: u16, len: u16) -> String {
+        (x_start..x_start + len)
+            .filter_map(|x| buf[(x, y)].symbol().chars().next())
+            .collect()
+    }
+
     #[test]
     fn header_renders_at_first_row() {
         let theme = MonitorTheme::fallback();
@@ -771,114 +444,65 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let _ = Instant::now();
         (&table).render(area, &mut buf);
-        // First column header is "Pid" right-aligned in 8-cell column.
-        // (After sort indicator, on the active "Cpu" column.)
-        // We assert "P" appears somewhere on row 0.
-        let row0: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect::<Vec<_>>().join("");
-        assert!(row0.contains("Pid"), "header missing Pid: {row0}");
-        assert!(row0.contains("CPU"), "header missing CPU: {row0}");
+        let header = read_text(&buf, 0, 0, 80);
+        assert!(header.contains("Pid"), "got {header:?}");
+        assert!(header.contains("Program"), "got {header:?}");
+        assert!(header.contains("CPU%"), "got {header:?}");
     }
 
     #[test]
     fn data_row_shows_pid_name_cpu() {
         let theme = MonitorTheme::fallback();
-        let rows = flat_rows(vec![proc(12345, "cargo", 0.42, 256)]);
+        let rows = flat_rows(vec![proc(12345, "firefox", 0.42, 256)]);
         let table = DataTable::new(&rows, &theme);
-        let area = Rect::new(0, 0, 80, 3);
+        let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);
-        let row1: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect::<Vec<_>>().join("");
+        let row1 = read_text(&buf, 1, 0, 80);
         assert!(row1.contains("12345"), "missing pid: {row1}");
-        assert!(row1.contains("cargo"), "missing name: {row1}");
+        assert!(row1.contains("firefox"), "missing name: {row1}");
         assert!(row1.contains("42.0"), "missing cpu%: {row1}");
     }
 
     #[test]
-    fn selected_row_gets_background_fill() {
+    fn selected_row_gets_full_width_highlight() {
         let theme = MonitorTheme::fallback();
-        let rows = flat_rows(vec![proc(1, "a", 0.1, 1), proc(2, "b", 0.1, 1)]);
-        let table = DataTable::new(&rows, &theme).with_selection(Some(1), 0);
+        let rows = flat_rows(vec![proc(1, "init", 0.01, 5)]);
+        let table = DataTable::new(&rows, &theme).with_selection(Some(0), 0);
         let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);
-        // Row at y=2 corresponds to rows[1]. Every cell should have the
-        // selected_bg as its background color.
-        for x in 0..area.width {
-            let style = buf[(x, 2)].style();
+        for x in 0..80 {
+            let style = buf[(x, 1)].style();
             assert_eq!(style.bg, Some(theme.selected_bg), "col {x}");
         }
     }
 
     #[test]
-    fn net_columns_appear_when_enabled() {
+    fn group_header_renders_chevron_and_aggregates() {
         let theme = MonitorTheme::fallback();
-        let mut p = proc(1, "x", 0.0, 0);
-        p.net_rx_bytes_per_sec = Some(2048.0);
-        p.net_tx_bytes_per_sec = Some(512.0);
-        let rows = flat_rows(vec![p]);
-        let table = DataTable::new(&rows, &theme).with_net_columns(true);
-        let area = Rect::new(0, 0, 100, 3);
+        let rows = vec![TableRow::Header(TableGroupHeader {
+            key: "g1".into(),
+            label: "firefox.service".into(),
+            proc_count: 47,
+            threads_total: 312,
+            cpu_fraction_total: 0.18,
+            mem_rss_total: 2 * 1024 * 1024 * 1024,
+            net_rx_total: None,
+            net_tx_total: None,
+            disk_read_total: None,
+            disk_write_total: None,
+            dominant_user: "alice".into(),
+            expanded: true,
+        })];
+        let table = DataTable::new(&rows, &theme).with_layout(TableLayout::Grouped);
+        let area = Rect::new(0, 0, 80, 4);
         let mut buf = Buffer::empty(area);
         (&table).render(area, &mut buf);
-        let header: String = (0..area.width).map(|x| buf[(x, 0)].symbol()).collect::<Vec<_>>().join("");
-        assert!(header.contains("RX/s"));
-        assert!(header.contains("TX/s"));
-        let row1: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect::<Vec<_>>().join("");
-        assert!(row1.contains("2.0K"), "rx missing: {row1}");
-    }
-
-    #[test]
-    fn table_layout_drops_columns_per_mode() {
-        let total = 120u16;
-
-        // Flat with net: all 11 columns. Program fixed 12, Command flex.
-        let flat = build_cols(TableLayout::Flat, true);
-        assert_eq!(flat.len(), 11);
-        let prog = flat.iter().position(|c| c.title == "Program").unwrap();
-        let cmd = flat.iter().position(|c| c.title == "Command").unwrap();
-        assert_eq!(col_actual_width(&flat, total, prog), 12);
-        assert!(col_actual_width(&flat, total, cmd) > 20, "Flat Command should flex");
-        assert!(flat.iter().any(|c| c.title == "Pid"));
-        assert!(flat.iter().any(|c| c.title == "User"));
-
-        // Grouped: Pid + Command dropped. User now stays so grouped
-        // headers can show their dominant owner. 9 columns total.
-        // Program flexes.
-        let grouped = build_cols(TableLayout::Grouped, true);
-        assert_eq!(grouped.len(), 9);
-        assert!(!grouped.iter().any(|c| c.title == "Pid"));
-        assert!(!grouped.iter().any(|c| c.title == "Command"));
-        assert!(grouped.iter().any(|c| c.title == "User"));
-        let prog = grouped.iter().position(|c| c.title == "Program").unwrap();
-        assert!(col_actual_width(&grouped, total, prog) > 20, "Grouped Program should flex");
-
-        // Tree: Command dropped. 10 columns. Program flexes.
-        let tree = build_cols(TableLayout::Tree, true);
-        assert_eq!(tree.len(), 10);
-        assert!(!tree.iter().any(|c| c.title == "Command"));
-        assert!(tree.iter().any(|c| c.title == "Pid"));
-        assert!(tree.iter().any(|c| c.title == "User"));
-        let prog = tree.iter().position(|c| c.title == "Program").unwrap();
-        assert!(col_actual_width(&tree, total, prog) > 20, "Tree Program should flex");
-    }
-
-    #[test]
-    fn show_net_false_drops_rx_and_tx_columns() {
-        // Flat with net=false drops 2 columns (RX/s + TX/s).
-        let flat_with = build_cols(TableLayout::Flat, true);
-        let flat_without = build_cols(TableLayout::Flat, false);
-        assert_eq!(flat_with.len() - flat_without.len(), 2);
-        assert!(!flat_without.iter().any(|c| c.title == "RX/s"));
-        assert!(!flat_without.iter().any(|c| c.title == "TX/s"));
-        // DR/s + DW/s still present — only the net-bandwidth columns drop.
-        assert!(flat_without.iter().any(|c| c.title == "DR/s"));
-        assert!(flat_without.iter().any(|c| c.title == "DW/s"));
-    }
-
-    #[test]
-    fn truncate_respects_char_count() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 5), "hell…");
-        assert_eq!(truncate("anything", 0), "");
+        let row1 = read_text(&buf, 1, 0, 80);
+        assert!(row1.contains('▼'), "missing expanded chevron: {row1:?}");
+        assert!(row1.contains("firefox.service"), "missing group label: {row1:?}");
+        assert!(row1.contains("312"), "missing threads total: {row1:?}");
+        assert!(row1.contains("18.0"), "missing cpu total: {row1:?}");
     }
 }
