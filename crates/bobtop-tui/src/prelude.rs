@@ -9,6 +9,7 @@ pub use crate::text::{
     bool_label, display_width, format_bytes, format_bytes_compact, format_rate, sanitize_for_display,
     truncate_chars, write_str_at,
 };
+pub use crate::keymap::{Scope, ScopeResult, ScopeStack};
 pub use crate::util::{middle_anchor_scroll, Nav};
 pub use crate::theme::{
     builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, RawTheme, Theme,

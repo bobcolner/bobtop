@@ -619,6 +619,7 @@ name = "bobtop-tui"
 version = "0.2.0"
 dependencies = [
  "bobtop-core",
+ "crossterm",
  "ratatui",
  "tracing",
  "unicode-width 0.2.0",

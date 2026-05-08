@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod color;
+pub mod keymap;
 pub mod layout;
 pub mod prelude;
 pub mod theme;
@@ -29,6 +30,7 @@ pub use text::{
     bool_label, display_width, format_bytes, format_bytes_compact, format_rate, sanitize_for_display,
     truncate_chars, write_str_at, write_str_clipped,
 };
+pub use keymap::{Scope, ScopeResult, ScopeStack};
 pub use util::{middle_anchor_scroll, Nav};
 pub use widgets::{
     ActionBar, BrailleGraph, BrailleText, BoxedPanel, ColumnDef, ConfirmDialog, CornerStyle,

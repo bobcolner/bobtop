@@ -3,13 +3,13 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bobtop_tui::{Nav, Theme};
+use bobtop_tui::{Nav, ScopeStack, Theme};
 use crossterm::event::{self, Event};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
 
 use crate::conn::{ColumnSpec, Connection, Row};
-use crate::keys::{map as map_key, Action};
+use crate::keys::{Action, BaseScope};
 use crate::tree::{CatalogTree, NodeKind, NodePath};
 use crate::ui;
 
@@ -38,18 +38,17 @@ pub struct App {
     pub focus: Focus,
     pub status: Option<String>,
     pub should_quit: bool,
+    /// Stack of key-handling scopes. Base is always present; modal
+    /// scopes get pushed and popped as they open/close. The
+    /// abstraction lives in `bobtop_tui::keymap` so daemon and fb can
+    /// share the same dispatch shape (and so a stuck modal can't
+    /// silently swallow keys for the rest of the session).
+    pub scopes: ScopeStack<Action>,
 }
 
 impl App {
     pub fn new(conns: Vec<Box<dyn Connection>>, theme: Theme) -> Self {
-        // All endpoints auto-expand on construction so the user lands
-        // on visible database lists rather than a stack of collapsed
-        // chevrons.
-        let tree = CatalogTree::new(&conns).unwrap_or_else(|_| {
-            // Recoverable: present an empty tree if the initial
-            // catalog query fails. Status line surfaces the error.
-            CatalogTree::empty()
-        });
+        let tree = CatalogTree::new(&conns).unwrap_or_else(|_| CatalogTree::empty());
         Self {
             conns,
             theme,
@@ -60,6 +59,7 @@ impl App {
             focus: Focus::Tree,
             status: None,
             should_quit: false,
+            scopes: ScopeStack::new(Box::new(BaseScope)),
         }
     }
 
@@ -69,7 +69,9 @@ impl App {
             if event::poll(Duration::from_millis(120))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == event::KeyEventKind::Press {
-                        self.handle_action(map_key(key));
+                        if let Some(action) = self.scopes.dispatch(&key) {
+                            self.handle_action(action);
+                        }
                     }
                 }
             }
@@ -79,7 +81,6 @@ impl App {
 
     fn handle_action(&mut self, action: Action) {
         match action {
-            Action::None => {}
             Action::Quit => self.should_quit = true,
             Action::CycleFocus => {
                 self.focus = match self.focus {
