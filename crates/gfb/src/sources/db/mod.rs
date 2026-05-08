@@ -7,9 +7,7 @@
 //! `.await`. Volume per call is bounded by `LIMIT` clauses, so the
 //! latency hit is acceptable for browse-only access.
 
-pub mod duck;
 pub mod mock;
-pub mod pg;
 
 use anyhow::Result;
 
@@ -118,15 +116,35 @@ pub fn open(
             if ducklake.is_some() {
                 anyhow::bail!("--ducklake-* flags only apply with --connect duckdb://...");
             }
-            Ok(Box::new(pg::PgConnection::open(s)?))
+            #[cfg(feature = "postgres")]
+            {
+                Ok(Box::new(super::pg::PgConnection::open(s)?))
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = s;
+                anyhow::bail!(
+                    "postgres backend not compiled in — rebuild gfb with --features postgres"
+                )
+            }
         }
         s if s.starts_with("duckdb://") => {
             let path = s.strip_prefix("duckdb://").unwrap_or("");
-            let mut conn = duck::DuckConnection::open_with(path, read_only)?;
-            if let Some(attach) = ducklake {
-                conn.attach_ducklake(&attach.name, &attach.catalog_pg_url, &attach.data_path)?;
+            #[cfg(feature = "duckdb")]
+            {
+                let mut conn = super::duckdb::DuckConnection::open_with(path, read_only)?;
+                if let Some(attach) = ducklake {
+                    conn.attach_ducklake(&attach.name, &attach.catalog_pg_url, &attach.data_path)?;
+                }
+                Ok(Box::new(conn))
             }
-            Ok(Box::new(conn))
+            #[cfg(not(feature = "duckdb"))]
+            {
+                let _ = (path, ducklake, read_only);
+                anyhow::bail!(
+                    "duckdb backend not compiled in — rebuild gfb with --features duckdb"
+                )
+            }
         }
         other => anyhow::bail!("unrecognized connection target: {other}"),
     }

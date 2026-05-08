@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use tokio::runtime::Runtime;
 use tokio_postgres::{Client, NoTls};
 
-use super::{ColumnSpec, Connection, Database, Row, Schema, Table};
+use super::db::{ColumnSpec, Connection, Database, Row, Schema, Table};
 
 /// Holds a single-threaded Tokio runtime alongside the wire client.
 /// Trait methods are sync; each call `block_on`s the appropriate

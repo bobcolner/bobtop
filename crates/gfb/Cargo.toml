@@ -21,6 +21,7 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 clap = { workspace = true }
 unicode-width = { workspace = true }
 serde = { workspace = true }
@@ -50,3 +51,15 @@ trash = "5"
 # is available — otherwise we keep our sextant-block path, which
 # looks better than viuer's own half-block fallback.
 viuer = { version = "0.9", default-features = false, features = ["print-file"] }
+
+# Optional DB backends — feature-gated so a default `cargo install gfb`
+# doesn't pull tokio-postgres / duckdb (and ~30 MB of build cost).
+# `cargo build --features all-sources` enables both.
+tokio-postgres = { workspace = true, optional = true }
+duckdb = { workspace = true, optional = true }
+
+[features]
+default = []
+postgres = ["dep:tokio-postgres"]
+duckdb = ["dep:duckdb"]
+all-sources = ["postgres", "duckdb"]

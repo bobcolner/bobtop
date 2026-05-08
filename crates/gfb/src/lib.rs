@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod sources;
 
 pub(crate) mod app;
 pub(crate) mod editor;

@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 use duckdb::{params, AccessMode, Config, Connection as DuckConn};
 
-use super::{ColumnSpec, Connection, Database, Row, Schema, Table};
+use super::db::{ColumnSpec, Connection, Database, Row, Schema, Table};
 
 pub struct DuckConnection {
     conn: DuckConn,
