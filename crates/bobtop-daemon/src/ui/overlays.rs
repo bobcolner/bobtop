@@ -1,11 +1,12 @@
 use bobtop_core::Box as BoxKind;
 use crate::options_editor::OptionsEditor;
 use bobtop_tui::widgets::{
-    panel as boxed_panel, ActionBar, BrailleText, ModalShell, SectionHeader, ToggleRow,
+    panel as boxed_panel, ActionBar, BrailleText, ConfirmDialog, ModalShell, SectionHeader, ToggleRow,
 };
 use bobtop_tui::write_str_clipped;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::Frame;
 
 use crate::app::App;
@@ -221,28 +222,13 @@ pub(super) fn draw_detail_modal(frame: &mut Frame, area: Rect, app: &App) {
 pub(super) fn draw_kill_dialog(frame: &mut Frame, area: Rect, app: &App) {
     let Some(req) = &app.ui.pending_kill else { return };
     let line1 = format!(" Send {} to pid {} ({})?", req.signal.label(), req.pid, req.name);
-    let line2 = " [Enter / y]  confirm    [Esc / n]  cancel ";
-    let want_w = (line1.chars().count().max(line2.chars().count()) + 4) as u16;
-    let want_h: u16 = 6;
     let title = presenter::kill_title(req);
-    let panel = boxed_panel(app.theme.proc_box(), app.theme.title, app.corner_style)
-        .flat()
-        .with_title(title);
-    let bg = app.theme.main_bg.unwrap_or(app.theme.meter_bg);
-    let Some(body) = ModalShell::new(panel, want_w, want_h)
-        .with_fill(Style::default().bg(bg).fg(app.theme.main_fg))
-        .render(frame, area) else {
-        return;
-    };
-    let buf = frame.buffer_mut();
-    let inner_w = body.width.saturating_sub(2);
-    write_str_clipped(buf, body.x + 1, body.y + 1, &line1, inner_w, Style::default().bg(bg).fg(app.theme.hi_fg));
-    write_str_clipped(buf, body.x + 1, body.y + 3, line2, inner_w, Style::default().bg(bg).fg(app.theme.inactive_fg));
-    if body.height > 4 {
-        let footer = ActionBar::new(vec![("Enter / y".into(), "confirm".into()), ("Esc / n".into(), "cancel".into())])
-            .with_colors(app.theme.div_line, app.theme.hi_fg, app.theme.main_fg, app.theme.selected_bg);
-        frame.render_widget(&footer, Rect::new(body.x + 2, body.bottom().saturating_sub(1), body.width.saturating_sub(4), 1));
-    }
+    ConfirmDialog::new(&app.theme.base, &title)
+        .with_accent(app.theme.proc_box())
+        .with_corner(app.corner_style)
+        .with_body(vec![Line::from(line1), Line::from("")])
+        .with_actions([("Enter / y", "confirm"), ("Esc / n", "cancel")])
+        .render(frame, area);
 }
 
 pub const HELP_LINES: &[(&str, &str)] = &[

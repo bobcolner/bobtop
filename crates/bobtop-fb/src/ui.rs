@@ -8,8 +8,8 @@
 use std::time::SystemTime;
 
 use bobtop_tui::{
-    format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, EditableText, MillerColumn,
-    MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
+    format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, ConfirmDialog, EditableText,
+    MillerColumn, MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
 };
 use image::GenericImageView;
 use ratatui::layout::Rect;
@@ -83,12 +83,10 @@ fn target_name(p: &std::path::Path) -> String {
         .unwrap_or_else(|| p.display().to_string())
 }
 
-/// Centered input/confirm modal for rename / touch / hard-delete.
-/// Smaller than the preview modal — just a single-line input or a
-/// short prompt — but uses the same `ModalShell` chrome so themes
-/// stay consistent.
+/// Centered input/confirm modal for rename / touch / soft-delete /
+/// hard-delete. Wraps the toolkit [`ConfirmDialog`].
 fn draw_input_modal(modal: &InputModal, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
-    let (title, body_lines, controls) = match modal {
+    let (title, body_lines, controls): (&str, Vec<Line>, &str) = match modal {
         InputModal::Rename { buffer, .. } => (
             "rename",
             vec![Line::from(format!("→ {}▏", buffer))],
@@ -118,23 +116,10 @@ fn draw_input_modal(modal: &InputModal, frame: &mut Frame<'_>, theme: &Theme, ar
             "y delete  •  any other key cancel",
         ),
     };
-    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
-        .with_title(title.to_string())
-        .with_controls(controls.to_string())
-        .flat();
-    let modal_w = ((area.width as u32 * 6 / 10) as u16).clamp(32, 80);
-    let modal_h = (body_lines.len() as u16 + 4).max(6);
-    let bg = theme.main_bg.unwrap_or(Color::Black);
-    let shell = ModalShell::new(panel, modal_w, modal_h)
-        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
-    let Some(body) = shell.render(frame, area) else {
-        return;
-    };
-    if body.height == 0 {
-        return;
-    }
-    let preview = ScrollableText::new(&body_lines, theme).with_line_numbers(false);
-    frame.render_widget(&preview, body);
+    ConfirmDialog::new(theme, title)
+        .with_body(body_lines)
+        .with_hint(controls)
+        .render(frame, area);
 }
 
 /// Border color for a pane based on focus. Active pane uses its

@@ -15,9 +15,9 @@ pub use crate::theme::{
     DEFAULT_THEME_NAME,
 };
 pub use crate::widgets::{
-    ActionBar, BrailleGraph, BoxedPanel, ColumnDef, CornerStyle, DualMode, GraphStyle,
-    GroupAggregate, LegendStyle, LiveTable, Meter, MiniMeter, ModalShell, SectionHeader,
-    SelectableList, SettingRow, SettingValue, SettingsForm, Sparkline, StackedBar,
-    StackedSegment, TableAlign, TableCell, TableEntry, TableRowExt, WidthSpec, Cell, Column,
-    Row, RowKind, Table, ToggleRow, Trace,
+    ActionBar, BrailleGraph, BoxedPanel, ColumnDef, ConfirmDialog, CornerStyle, DialogFooter,
+    DualMode, GraphStyle, GroupAggregate, LegendStyle, LiveTable, Meter, MiniMeter, ModalShell,
+    SectionHeader, SelectableList, SettingRow, SettingValue, SettingsForm, Sparkline,
+    StackedBar, StackedSegment, TableAlign, TableCell, TableEntry, TableRowExt, WidthSpec,
+    Cell, Column, Row, RowKind, Table, ToggleRow, Trace,
 };

@@ -31,10 +31,10 @@ pub use text::{
 };
 pub use util::{middle_anchor_scroll, Nav};
 pub use widgets::{
-    ActionBar, BrailleGraph, BrailleText, BoxedPanel, ColumnDef, CornerStyle, DualMode,
-    EditableText, GraphStyle, GroupAggregate, LegendStyle, LiveTable, Meter, MillerColumn,
-    MillerColumns, MiniMeter, ModalShell, ScrollableText, SectionHeader, SelectableList,
-    SettingRow, SettingValue, SettingsForm, Sparkline, StackedBar, StackedSegment,
-    TableAlign, TableCell, TableEntry, TableRowExt, WidthSpec, Cell, Column, Row, RowKind,
-    Table, ToggleRow, Trace,
+    ActionBar, BrailleGraph, BrailleText, BoxedPanel, ColumnDef, ConfirmDialog, CornerStyle,
+    DialogFooter, DualMode, EditableText, GraphStyle, GroupAggregate, LegendStyle, LiveTable,
+    Meter, MillerColumn, MillerColumns, MiniMeter, ModalShell, ScrollableText, SectionHeader,
+    SelectableList, SettingRow, SettingValue, SettingsForm, Sparkline, StackedBar,
+    StackedSegment, TableAlign, TableCell, TableEntry, TableRowExt, WidthSpec, Cell, Column,
+    Row, RowKind, Table, ToggleRow, Trace,
 };
