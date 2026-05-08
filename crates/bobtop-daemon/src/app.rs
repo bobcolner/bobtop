@@ -846,6 +846,15 @@ impl App {
         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c')) {
             return ControlFlow::Quit;
         }
+        // Dismiss the transient error toast on the *next* keypress so
+        // it doesn't linger forever. Toast-then-act would consume the
+        // key just for the dismissal, which surprises users — let the
+        // key still hit `handle_key` below so the action runs and the
+        // toast goes away in the same press.
+        if self.ui.last_options_msg.is_some() {
+            self.ui.last_options_msg = None;
+            self.ui.dirty = true;
+        }
         // Every recognized key either quits or mutates rendered state
         // (selection, sort, layout, tick). Cheaper to mark unconditionally
         // here than to thread `mark_dirty()` through each branch.

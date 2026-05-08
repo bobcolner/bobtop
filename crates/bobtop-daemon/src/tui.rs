@@ -282,6 +282,11 @@ pub async fn run(
                                 // restored terminal, ran child, re-init,
                                 // resumed thread.
                                 if let Err(e) = launch_file_browser(term, &_start, &theme_name) {
+                                    // Log AND surface to the user — this
+                                    // is the path that historically
+                                    // black-holed errors and made `b`
+                                    // appear "stuck."
+                                    tracing::warn!(error = %e, "file-browser launch failed");
                                     let mut g = lock(&app);
                                     g.ui.last_options_msg =
                                         Some(format!("file browser: {}", e));

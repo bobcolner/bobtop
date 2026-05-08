@@ -2,11 +2,9 @@
 //! the TUI loop on every frame.
 
 use bobtop_tui::compute_layout;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::Frame;
-
-#[cfg(test)]
-use ratatui::layout::Rect;
 
 use crate::app::App;
 
@@ -79,6 +77,40 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.ui.show_help {
         overlays::draw_help_overlay(frame, area, app);
     }
+    // Transient error / status banner. Painted *last* so it sits on top
+    // of every panel and modal — these are the messages that have been
+    // silently black-holed historically (file-browser launch failures
+    // were the canonical example).
+    if let Some(msg) = &app.ui.last_options_msg {
+        draw_toast(frame, area, app, msg);
+    }
+}
+
+fn draw_toast(frame: &mut Frame, area: Rect, app: &App, msg: &str) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let y = area.bottom().saturating_sub(1);
+    // Paint the full bottom row with a high-contrast background so the
+    // toast is unmissable. Using `selected_bg` because every theme
+    // tunes it to be a noisy accent.
+    let bg = app.theme.selected_bg;
+    let fg = app.theme.selected_fg;
+    for x in area.x..area.right() {
+        let cell = &mut buf[(x, y)];
+        cell.set_char(' ');
+        cell.set_style(Style::default().bg(bg).fg(fg));
+    }
+    let body = format!(" ⚠ {msg}  —  press any key to dismiss ");
+    bobtop_tui::write_str_clipped(
+        buf,
+        area.x,
+        y,
+        &body,
+        area.width,
+        Style::default().bg(bg).fg(fg).add_modifier(ratatui::style::Modifier::BOLD),
+    );
 }
 
 #[cfg(test)]
