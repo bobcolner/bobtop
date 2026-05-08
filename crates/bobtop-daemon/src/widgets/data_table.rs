@@ -1,18 +1,25 @@
 //! Process table — the system-monitor adapter on top of the generic
 //! [`LiveTable`](bobtop_tui::widgets::LiveTable).
 //!
-//! The widget itself is in `bobtop-tui`; this module provides:
+//! The widget itself lives in `bobtop-tui`; this module owns:
 //!
-//! 1. The column-id enum ([`ProcCol`]) and column defs for the three
-//!    layouts (Flat / Grouped / Tree) the monitor uses.
-//! 2. [`TableRowExt`] / [`GroupAggregate`] impls on internal view types
-//!    that pre-sample CPU and memory gradients before passing through.
-//! 3. [`TableSort`] — the closed sort enum daemon code (`group.rs`,
-//!    `presets.rs`, `proc_sort.rs`) matches on. Wraps `ProcCol`.
-//! 4. [`DataTable`] — a thin builder that materializes the view rows and
-//!    column defs, then renders the wrapped `LiveTable`.
+//! 1. Row/header types ([`TableRow`], [`TableRowMeta`], [`TableGroupHeader`])
+//!    that the daemon's grouping pipeline produces.
+//! 2. The column id ([`ProcCol`]) and layout ([`TableLayout`]) that
+//!    parameterize column-set selection per group mode.
+//! 3. The closed sort enum ([`TableSort`]) daemon code matches on, plus
+//!    the `col()` mapping into `ProcCol` for the live-table indicator.
+//! 4. [`MetricScales`] + per-metric color helpers — every gradient choice
+//!    the process panel makes (cpu/mem/threads/rates/user_color) lives
+//!    here so [`ProcessRowView`] / [`GroupView`] can pre-resolve cell
+//!    colors before passing through `TableRowExt`/`GroupAggregate`.
+//! 5. [`DataTable`] — the public widget. Builds column defs + view rows
+//!    from the inputs the panel render path supplies and renders the
+//!    underlying `LiveTable` with `fade=false` to preserve the existing
+//!    flat-list visual.
 
 use bobtop_core::sample::ProcessInfo;
+use bobtop_tui::color::Gradient;
 use bobtop_tui::text::{format_bytes_compact, format_rate};
 use bobtop_tui::widgets::live_table::{
     Align, Cell, ColumnDef, GroupAggregate, LiveTable, TableEntry, TableRowExt, WidthSpec,
@@ -160,24 +167,123 @@ impl TableLayout {
     pub fn includes_user(self) -> bool {
         true
     }
+}
 
-    /// Width preset for the `Program` column. Used by the `ui::processes`
-    /// render path that still drives the simpler `bobtop_tui::Table`
-    /// widget directly (not yet migrated to [`DataTable`] / [`LiveTable`]).
-    pub fn program_width(self) -> u16 {
-        match self {
-            TableLayout::Flat => 12,
-            TableLayout::Grouped | TableLayout::Tree => u16::MAX,
+/// Per-tick maxima used to scale gradient colors for the rate columns.
+/// CPU and Mem have natural ceilings (a single core / a fixed GiB
+/// reference) so they aren't tracked here — net and disk rates are
+/// open-ended and look uniform unless we normalize against the most
+/// active row in this frame.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MetricScales {
+    pub threads: u32,
+    pub net_rx: f64,
+    pub net_tx: f64,
+    pub disk_r: f64,
+    pub disk_w: f64,
+}
+
+impl MetricScales {
+    pub fn from_rows(rows: &[TableRow]) -> Self {
+        let mut s = MetricScales::default();
+        for row in rows {
+            if let TableRow::Item(meta) = row {
+                let p = &meta.info;
+                s.threads = s.threads.max(p.threads);
+                if let Some(v) = p.net_rx_bytes_per_sec {
+                    if v > s.net_rx {
+                        s.net_rx = v;
+                    }
+                }
+                if let Some(v) = p.net_tx_bytes_per_sec {
+                    if v > s.net_tx {
+                        s.net_tx = v;
+                    }
+                }
+                if let Some(v) = p.disk_read_bytes_per_sec {
+                    if v > s.disk_r {
+                        s.disk_r = v;
+                    }
+                }
+                if let Some(v) = p.disk_write_bytes_per_sec {
+                    if v > s.disk_w {
+                        s.disk_w = v;
+                    }
+                }
+            }
+        }
+        s
+    }
+}
+
+/// Hash-based stable color picker for the User column. Non-root users
+/// get a deterministic hue from the theme's process gradient (so multi-
+/// user hosts read at a glance — same uid is the same color across
+/// sessions). Root highlights with `hi_fg`. `—` (mixed-user group)
+/// renders dim.
+fn user_color(user: &str, theme: &MonitorTheme) -> Color {
+    if user == "—" || user.is_empty() {
+        return theme.inactive_fg;
+    }
+    if user == "root" {
+        return theme.hi_fg;
+    }
+    let mut h: u32 = 5381;
+    for b in user.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    let slot = (h % 256) as f32 / 255.0;
+    theme.process.sample(slot)
+}
+
+fn cpu_color(fraction: f32, theme: &MonitorTheme) -> Color {
+    theme.cpu.sample(fraction.clamp(0.0, 1.0))
+}
+
+fn mem_color(bytes: u64, theme: &MonitorTheme) -> Color {
+    // 32 GiB reference matches btop's heuristic — proxy for "this
+    // process is using a meaningful slice of system memory."
+    let r = if bytes == 0 {
+        0.0
+    } else {
+        (bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).clamp(0.0, 1.0) as f32
+    };
+    theme.used.sample(r)
+}
+
+fn threads_color(n: u32, max: u32, theme: &MonitorTheme) -> Color {
+    if max == 0 {
+        return theme.inactive_fg;
+    }
+    let r = (n as f32 / max as f32).clamp(0.0, 1.0);
+    if r < 0.10 {
+        // Most processes have a handful of threads; don't make them
+        // shout. Reserve color for the outliers.
+        theme.inactive_fg
+    } else {
+        theme.process.sample(r)
+    }
+}
+
+fn rate_color(value: Option<f64>, max: f64, gradient: Gradient, theme: &MonitorTheme) -> Color {
+    match value {
+        None => theme.inactive_fg,
+        Some(v) if v <= 0.0 || max <= 0.0 => theme.inactive_fg,
+        Some(v) => {
+            // Normalize against the largest value in the column this
+            // tick. Floors at 5 % so a single noisy process doesn't
+            // wash everything else into the cool end of the gradient.
+            let r = (v / max).clamp(0.05, 1.0) as f32;
+            gradient.sample(r)
         }
     }
+}
 
-    /// Width preset for the `Command` column. `0` is a sentinel — only
-    /// the `Flat` layout renders Command at all.
-    pub fn command_width(self) -> u16 {
-        match self {
-            TableLayout::Flat => u16::MAX,
-            _ => 0,
-        }
+fn opt_rate_text(v: Option<f64>) -> String {
+    match v {
+        Some(r) if r > 0.5 => format_rate(r),
+        Some(_) => "0".into(),
+        None => "-".into(),
     }
 }
 
@@ -236,27 +342,42 @@ impl<'a> DataTable<'a> {
 impl<'a> Widget for &DataTable<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let columns = build_columns(self.layout, self.show_net_columns);
+        let scales = MetricScales::from_rows(self.rows);
+        let draws_tree = self.layout.draws_tree_glyphs();
 
         let entries: Vec<TableEntry<ProcessRowView<'_>, GroupView<'_>>> = self
             .rows
             .iter()
             .map(|row| match row {
-                TableRow::Header(h) => TableEntry::Header(GroupView { h, show_net: self.show_net_columns }),
-                TableRow::Item(meta) => TableEntry::Item(ProcessRowView::new(meta, self.theme, self.show_net_columns)),
+                TableRow::Header(h) => TableEntry::Header(GroupView::new(
+                    h,
+                    self.theme,
+                    self.show_net_columns,
+                    &scales,
+                )),
+                TableRow::Item(meta) => TableEntry::Item(ProcessRowView::new(
+                    meta,
+                    self.theme,
+                    self.show_net_columns,
+                    &scales,
+                    draws_tree,
+                )),
             })
             .collect();
 
         let table = LiveTable::new(&entries, &columns, &self.theme.base, ProcCol::Program)
             .with_selection(self.selected, self.scroll_offset)
             .with_sort(Some(self.sort.col()), self.sort_descending)
-            .with_tree_glyphs(self.layout.draws_tree_glyphs());
+            .with_tree_glyphs(draws_tree)
+            .with_fade(false);
         (&table).render(area, buf);
     }
 }
 
 fn build_columns(layout: TableLayout, show_net: bool) -> Vec<ColumnDef<ProcCol>> {
     // Order: [Pid] · Program · [Command] · User · Th · MEM · CPU% · [RX · TX] · DR · DW
-    // Program flexes for Grouped/Tree (group label / tree glyphs); Command flexes for Flat (full argv).
+    // Program flexes for Grouped/Tree (group label / tree glyphs);
+    // Command flexes for Flat (full argv).
     let mut cols = Vec::with_capacity(11);
     if layout.includes_pid() {
         cols.push(ColumnDef { id: ProcCol::Pid, label: "Pid", width: WidthSpec::Fixed(6), align: Align::Right, sortable: true });
@@ -282,24 +403,51 @@ fn build_columns(layout: TableLayout, show_net: bool) -> Vec<ColumnDef<ProcCol>>
     cols
 }
 
-/// View of a process row that pre-samples gradient colors at construction
-/// so `cell()` is cheap and self-contained.
-struct ProcessRowView<'a> {
+/// Per-process view that pre-resolves every cell's color so the
+/// generic [`LiveTable`] only sees text + final fg per cell.
+pub(crate) struct ProcessRowView<'a> {
     meta: &'a TableRowMeta,
     show_net: bool,
-    cpu_color: Color,
-    mem_color: Color,
+    /// Tree-mode flag — controls whether the Program cell's color is
+    /// `accent_subtle` (matching the existing render path's tree-mode
+    /// look) or unset (default `main_fg`).
+    draws_tree_glyphs: bool,
+    cpu: Color,
+    mem: Color,
+    threads: Color,
+    user: Color,
+    net_rx: Color,
+    net_tx: Color,
+    disk_r: Color,
+    disk_w: Color,
     inactive_fg: Color,
+    accent_subtle: Color,
 }
 
 impl<'a> ProcessRowView<'a> {
-    fn new(meta: &'a TableRowMeta, theme: &MonitorTheme, show_net: bool) -> Self {
+    fn new(
+        meta: &'a TableRowMeta,
+        theme: &MonitorTheme,
+        show_net: bool,
+        scales: &MetricScales,
+        draws_tree_glyphs: bool,
+    ) -> Self {
         let p = &meta.info;
-        let cpu_color = theme.cpu.sample(p.cpu_fraction.clamp(0.0, 1.0));
-        let mem_color = theme.used.sample(
-            (p.mem_rss_bytes as f64 / (32.0 * 1024.0 * 1024.0 * 1024.0)).min(1.0) as f32,
-        );
-        Self { meta, show_net, cpu_color, mem_color, inactive_fg: theme.inactive_fg }
+        Self {
+            meta,
+            show_net,
+            draws_tree_glyphs,
+            cpu: cpu_color(p.cpu_fraction, theme),
+            mem: mem_color(p.mem_rss_bytes, theme),
+            threads: threads_color(p.threads, scales.threads, theme),
+            user: user_color(&p.user, theme),
+            net_rx: rate_color(p.net_rx_bytes_per_sec, scales.net_rx, theme.download, theme),
+            net_tx: rate_color(p.net_tx_bytes_per_sec, scales.net_tx, theme.upload, theme),
+            disk_r: rate_color(p.disk_read_bytes_per_sec, scales.disk_r, theme.used, theme),
+            disk_w: rate_color(p.disk_write_bytes_per_sec, scales.disk_w, theme.used, theme),
+            inactive_fg: theme.inactive_fg,
+            accent_subtle: theme.accent_subtle,
+        }
     }
 }
 
@@ -308,26 +456,38 @@ impl<'a> TableRowExt<ProcCol> for ProcessRowView<'a> {
         let p = &self.meta.info;
         match col {
             ProcCol::Pid => Cell::styled(p.pid.to_string(), self.inactive_fg),
-            // Program is the "label column" — LiveTable overlays the
-            // tree prefix here. Just supply the program name; the
-            // widget handles the prefix overlay and width truncation.
-            ProcCol::Program => Cell::plain(p.name.clone()),
+            ProcCol::Program => {
+                // Tree mode: existing render path colored the entire
+                // Program cell (prefix + name) `accent_subtle`. Match
+                // that here so the migration is a visual no-op.
+                if self.draws_tree_glyphs {
+                    Cell::styled(p.name.clone(), self.accent_subtle)
+                } else {
+                    Cell::plain(p.name.clone())
+                }
+            }
             ProcCol::Command => {
                 let cmd = if p.cmdline.is_empty() {
                     p.name.clone()
                 } else {
                     p.cmdline.clone()
                 };
-                Cell::plain(cmd)
+                Cell::styled(cmd, self.inactive_fg)
             }
-            ProcCol::User => Cell::plain(p.user.clone()),
-            ProcCol::Threads => Cell::plain(p.threads.to_string()),
-            ProcCol::Mem => Cell::styled(format_bytes_compact(p.mem_rss_bytes), self.mem_color),
-            ProcCol::Cpu => Cell::styled(format!("{:.1}", p.cpu_fraction * 100.0), self.cpu_color),
-            ProcCol::NetRx => Cell::plain(opt_rate(if self.show_net { p.net_rx_bytes_per_sec } else { None })),
-            ProcCol::NetTx => Cell::plain(opt_rate(if self.show_net { p.net_tx_bytes_per_sec } else { None })),
-            ProcCol::DiskRead => Cell::plain(opt_rate(p.disk_read_bytes_per_sec)),
-            ProcCol::DiskWrite => Cell::plain(opt_rate(p.disk_write_bytes_per_sec)),
+            ProcCol::User => Cell::styled(p.user.clone(), self.user),
+            ProcCol::Threads => Cell::styled(p.threads.to_string(), self.threads),
+            ProcCol::Mem => Cell::styled(format_bytes_compact(p.mem_rss_bytes), self.mem),
+            ProcCol::Cpu => Cell::styled(format!("{:.1}", p.cpu_fraction * 100.0), self.cpu),
+            ProcCol::NetRx => Cell::styled(
+                opt_rate_text(if self.show_net { p.net_rx_bytes_per_sec } else { None }),
+                self.net_rx,
+            ),
+            ProcCol::NetTx => Cell::styled(
+                opt_rate_text(if self.show_net { p.net_tx_bytes_per_sec } else { None }),
+                self.net_tx,
+            ),
+            ProcCol::DiskRead => Cell::styled(opt_rate_text(p.disk_read_bytes_per_sec), self.disk_r),
+            ProcCol::DiskWrite => Cell::styled(opt_rate_text(p.disk_write_bytes_per_sec), self.disk_w),
         }
     }
 
@@ -344,12 +504,37 @@ impl<'a> TableRowExt<ProcCol> for ProcessRowView<'a> {
     }
 }
 
-/// View over a group header that emits aggregate cells for the metric
-/// columns. The `Program` column is left blank — LiveTable overlays the
-/// chevron + group label there.
-struct GroupView<'a> {
+/// View over a group header that pre-resolves aggregate-cell colors
+/// using the same gradients as data rows. The widget overlays the
+/// chevron + group label on the `Program` column itself.
+pub(crate) struct GroupView<'a> {
     h: &'a TableGroupHeader,
     show_net: bool,
+    user: Color,
+    threads: Color,
+    mem: Color,
+    cpu: Color,
+    net_rx: Color,
+    net_tx: Color,
+    disk_r: Color,
+    disk_w: Color,
+}
+
+impl<'a> GroupView<'a> {
+    fn new(h: &'a TableGroupHeader, theme: &MonitorTheme, show_net: bool, scales: &MetricScales) -> Self {
+        Self {
+            h,
+            show_net,
+            user: user_color(&h.dominant_user, theme),
+            threads: threads_color(h.threads_total, scales.threads, theme),
+            mem: mem_color(h.mem_rss_total, theme),
+            cpu: cpu_color(h.cpu_fraction_total, theme),
+            net_rx: rate_color(h.net_rx_total, scales.net_rx, theme.download, theme),
+            net_tx: rate_color(h.net_tx_total, scales.net_tx, theme.upload, theme),
+            disk_r: rate_color(h.disk_read_total, scales.disk_r, theme.used, theme),
+            disk_w: rate_color(h.disk_write_total, scales.disk_w, theme.used, theme),
+        }
+    }
 }
 
 impl<'a> GroupAggregate<ProcCol> for GroupView<'a> {
@@ -363,24 +548,24 @@ impl<'a> GroupAggregate<ProcCol> for GroupView<'a> {
 
     fn cell(&self, col: ProcCol) -> Cell {
         match col {
+            // Pid / Program / Command stay blank for headers; the widget
+            // overlays the chevron + group label in the Program column.
             ProcCol::Pid | ProcCol::Program | ProcCol::Command => Cell::plain(""),
-            ProcCol::User => Cell::plain(self.h.dominant_user.clone()),
-            ProcCol::Threads => Cell::plain(self.h.threads_total.to_string()),
-            ProcCol::Mem => Cell::plain(format_bytes_compact(self.h.mem_rss_total)),
-            ProcCol::Cpu => Cell::plain(format!("{:.1}", self.h.cpu_fraction_total * 100.0)),
-            ProcCol::NetRx => Cell::plain(opt_rate(if self.show_net { self.h.net_rx_total } else { None })),
-            ProcCol::NetTx => Cell::plain(opt_rate(if self.show_net { self.h.net_tx_total } else { None })),
-            ProcCol::DiskRead => Cell::plain(opt_rate(self.h.disk_read_total)),
-            ProcCol::DiskWrite => Cell::plain(opt_rate(self.h.disk_write_total)),
+            ProcCol::User => Cell::styled(self.h.dominant_user.clone(), self.user),
+            ProcCol::Threads => Cell::styled(self.h.threads_total.to_string(), self.threads),
+            ProcCol::Mem => Cell::styled(format_bytes_compact(self.h.mem_rss_total), self.mem),
+            ProcCol::Cpu => Cell::styled(format!("{:.1}", self.h.cpu_fraction_total * 100.0), self.cpu),
+            ProcCol::NetRx => Cell::styled(
+                opt_rate_text(if self.show_net { self.h.net_rx_total } else { None }),
+                self.net_rx,
+            ),
+            ProcCol::NetTx => Cell::styled(
+                opt_rate_text(if self.show_net { self.h.net_tx_total } else { None }),
+                self.net_tx,
+            ),
+            ProcCol::DiskRead => Cell::styled(opt_rate_text(self.h.disk_read_total), self.disk_r),
+            ProcCol::DiskWrite => Cell::styled(opt_rate_text(self.h.disk_write_total), self.disk_w),
         }
-    }
-}
-
-fn opt_rate(v: Option<f64>) -> String {
-    match v {
-        Some(r) if r > 0.5 => format_rate(r),
-        Some(_) => "0".into(),
-        None => "-".into(),
     }
 }
 
@@ -504,5 +689,29 @@ mod tests {
         assert!(row1.contains("firefox.service"), "missing group label: {row1:?}");
         assert!(row1.contains("312"), "missing threads total: {row1:?}");
         assert!(row1.contains("18.0"), "missing cpu total: {row1:?}");
+    }
+
+    #[test]
+    fn root_user_uses_hi_fg() {
+        let theme = MonitorTheme::fallback();
+        assert_eq!(user_color("root", &theme), theme.hi_fg);
+        assert_eq!(user_color("—", &theme), theme.inactive_fg);
+        assert_eq!(user_color("", &theme), theme.inactive_fg);
+        // Same input → same output (deterministic hash)
+        assert_eq!(user_color("alice", &theme), user_color("alice", &theme));
+    }
+
+    #[test]
+    fn metric_scales_pick_max_across_rows() {
+        let mut p1 = proc(1, "a", 0.0, 0);
+        p1.threads = 5;
+        p1.net_rx_bytes_per_sec = Some(100.0);
+        let mut p2 = proc(2, "b", 0.0, 0);
+        p2.threads = 12;
+        p2.net_rx_bytes_per_sec = Some(80.0);
+        let rows = flat_rows(vec![p1, p2]);
+        let scales = MetricScales::from_rows(&rows);
+        assert_eq!(scales.threads, 12);
+        assert_eq!(scales.net_rx, 100.0);
     }
 }

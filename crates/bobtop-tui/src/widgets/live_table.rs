@@ -149,6 +149,10 @@ pub struct LiveTable<'a, R, G, Cid: Copy + PartialEq> {
     /// branch glyphs (`├ │ └`). Usually the leftmost text column.
     pub label_column: Cid,
     pub draws_tree_glyphs: bool,
+    /// Vertical-position fade. When on, rows toward the bottom lerp
+    /// toward `inactive_fg` (btop's depth cue). Off preserves exact
+    /// per-cell colors — useful for apps that want a flat list look.
+    pub fade: bool,
 }
 
 impl<'a, R, G, Cid> LiveTable<'a, R, G, Cid>
@@ -168,6 +172,7 @@ where
             sort_descending: true,
             label_column,
             draws_tree_glyphs: false,
+            fade: true,
         }
     }
 
@@ -185,6 +190,11 @@ where
 
     pub fn with_tree_glyphs(mut self, on: bool) -> Self {
         self.draws_tree_glyphs = on;
+        self
+    }
+
+    pub fn with_fade(mut self, on: bool) -> Self {
+        self.fade = on;
         self
     }
 }
@@ -240,7 +250,11 @@ where
         {
             let y = body_top + i as u16;
             let is_selected = self.selected == Some(row_idx);
-            let fade_t = (i as f32 / max_visible as f32) * FADE_END;
+            let fade_t = if self.fade {
+                (i as f32 / max_visible as f32) * FADE_END
+            } else {
+                0.0
+            };
 
             if is_selected {
                 for x in area.x..area.x + area.width {
@@ -279,11 +293,24 @@ where
         let glyph = if h.expanded() { '▼' } else { '▶' };
         let label_text = format!("{glyph} {}", h.label());
 
-        let fg = if is_selected { self.theme.selected_fg } else { self.theme.hi_fg };
-        let style = if is_selected {
-            Style::default().bg(self.theme.selected_bg).fg(fg).add_modifier(Modifier::BOLD)
+        // Default fg for a header row: hi_fg when expanded (active), title
+        // when collapsed (chrome). Cells with explicit `fg` (from the
+        // app's GroupAggregate impl — e.g. dominant_user color, metric
+        // gradients) take precedence.
+        let group_fg = if is_selected {
+            self.theme.selected_fg
+        } else if h.expanded() {
+            self.theme.hi_fg
         } else {
-            Style::default().fg(fg).add_modifier(Modifier::BOLD)
+            self.theme.title
+        };
+        let label_style = if is_selected {
+            Style::default()
+                .bg(self.theme.selected_bg)
+                .fg(group_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(group_fg).add_modifier(Modifier::BOLD)
         };
 
         render_row(buf, area.x, y, area.width, self.columns, widths, |idx| {
@@ -292,12 +319,21 @@ where
             } else {
                 h.cell(self.columns[idx].id)
             };
+            let cell_fg = if is_selected {
+                self.theme.selected_fg
+            } else {
+                cell.fg.unwrap_or(group_fg)
+            };
+            let mut style = Style::default().fg(cell_fg).add_modifier(Modifier::BOLD);
+            if is_selected {
+                style = style.bg(self.theme.selected_bg);
+            }
             (cell.text, style, self.columns[idx].align)
         });
 
         let label_x = column_x(widths, area.x, label_idx);
         let label_w = widths[label_idx];
-        write_str(buf, label_x, y, &label_text, label_w as usize, style);
+        write_str(buf, label_x, y, &label_text, label_w as usize, label_style);
     }
 
     fn render_item_entry(
