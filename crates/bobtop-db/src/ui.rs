@@ -2,10 +2,11 @@
 //! a status row and an action bar. Both panes use [`LiveTable`] from
 //! the toolkit; this is the marquee demo of LiveTable's tree mode.
 
-use gtui::widgets::{panel as boxed_panel, ActionBar};
+use gtui::browser::BrowserShell;
 use gtui::widgets::live_table::{
     Align, Cell, ColumnDef, LiveTable, TableEntry, TableRowExt, WidthSpec,
 };
+use gtui::widgets::{panel as boxed_panel, ActionBar};
 use gtui::write_str_clipped;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -41,12 +42,8 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
 
     draw_status(app, frame, chunks[0]);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Min(0)])
-        .split(chunks[1]);
-    draw_tree_pane(app, frame, panes[0]);
-    draw_preview_pane(app, frame, panes[1]);
+    let preview_rect = draw_tree_pane(app, frame, chunks[1]);
+    draw_preview_pane(app, frame, preview_rect);
 
     draw_action_bar(app, frame, chunks[2]);
 }
@@ -76,17 +73,7 @@ fn draw_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
     write_str_clipped(buf, area.x, area.y, &label, area.width, style);
 }
 
-fn draw_tree_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let focused = matches!(app.focus, Focus::Tree);
-    let panel = boxed_panel(border_color(&app.theme, focused, app.theme.panel_accents[0]), app.theme.title, Default::default())
-        .with_title("catalog")
-        .with_keybinds("Tab focus  •  ↑↓ move  •  Space expand/load  •  q quit");
-    frame.render_widget(&panel, area);
-    let inner = panel.inner(area);
-    if inner.width < 6 || inner.height < 2 {
-        return;
-    }
-
+fn draw_tree_pane(app: &App, frame: &mut Frame<'_>, area: Rect) -> Rect {
     let nodes = app.tree.nodes();
     let entries: Vec<TableEntry<TreeRowView<'_>, ()>> = nodes
         .iter()
@@ -99,13 +86,21 @@ fn draw_tree_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         align: Align::Left,
         sortable: false,
     }];
-    let body_h = inner.height.saturating_sub(1) as usize;
-    let scroll = gtui::middle_anchor_scroll(app.tree_nav.cursor, nodes.len(), body_h);
-    let table = LiveTable::new(&entries, &columns, &app.theme, TreeCol::Name)
-        .with_selection(Some(app.tree_nav.cursor), scroll)
-        .with_tree_glyphs(true)
-        .with_fade(false);
-    frame.render_widget(&table, inner);
+    BrowserShell::<TreeCol>::new()
+        .with_title("catalog")
+        .with_keybinds("Tab focus  •  ↑↓ move  •  Space expand/load  •  q quit")
+        .with_accent(app.theme.panel_accents[0])
+        .with_focused(matches!(app.focus, Focus::Tree))
+        .with_tree_percent(38)
+        .render(
+            frame,
+            area,
+            &entries,
+            &columns,
+            &app.theme,
+            TreeCol::Name,
+            app.tree_nav.cursor,
+        )
 }
 
 fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {

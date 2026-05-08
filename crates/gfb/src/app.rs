@@ -516,18 +516,15 @@ pub struct App {
     /// dominant preview on the right). State below the line is only
     /// used in tree mode; toggling between modes preserves it.
     pub(crate) view_mode: ViewMode,
-    /// Set of directories the user has expanded in tree mode. Tree
-    /// view recursively walks every expanded subdir under cwd to
+    /// Tree-mode state: the expanded-directories set + cursor / scroll.
+    /// Tree view recursively walks every expanded subdir under cwd to
     /// build its flattened row list.
-    pub(crate) tree_expanded: std::collections::HashSet<PathBuf>,
+    pub(crate) tree_state: gtui::tree::TreeState<PathBuf>,
     /// Sort column for tree mode. Independent of `sort` (which is
     /// the miller-mode sort) so toggling between modes doesn't
     /// disrupt either.
     pub(crate) tree_sort: crate::tree::FbCol,
     pub(crate) tree_sort_descending: bool,
-    /// Cursor + scroll for tree mode, separate from the miller-mode
-    /// `nav` so each mode keeps its own selection.
-    pub(crate) tree_nav: gtui::Nav,
 }
 
 /// Top-level view mode. Switched with `T`.
@@ -683,10 +680,9 @@ impl App {
             status_message_ticks: 0,
             scopes: gtui::ScopeStack::new(Box::new(BaseScope)),
             view_mode: ViewMode::Miller,
-            tree_expanded: std::collections::HashSet::new(),
+            tree_state: gtui::tree::TreeState::default(),
             tree_sort: crate::tree::FbCol::Name,
             tree_sort_descending: false,
-            tree_nav: gtui::Nav::default(),
         };
         app.start_watcher();
         app.refresh()?;
@@ -1099,18 +1095,18 @@ impl App {
     fn request_tree_preview(&mut self) {
         let rows = crate::tree::flatten_tree(
             &self.cwd,
-            &self.tree_expanded,
+            &self.tree_state.expanded,
             self.tree_sort,
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
         );
-        let Some(row) = rows.get(self.tree_nav.cursor).cloned() else {
+        let Some(row) = rows.get(self.tree_state.nav.cursor).cloned() else {
             self.preview_state = PreviewState::None;
             self.preview_scroll = 0;
             return;
         };
-        let path = row.entry.path;
+        let path = row.row.path;
         if matches!(&self.preview_state, PreviewState::Ready { path: p, .. } | PreviewState::Loading(p) | PreviewState::Error { path: p, .. } if *p == path)
         {
             return;
@@ -1146,14 +1142,14 @@ impl App {
         // clamp without re-flattening.
         let total = crate::tree::flatten_tree(
             &self.cwd,
-            &self.tree_expanded,
+            &self.tree_state.expanded,
             self.tree_sort,
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
         )
         .len();
-        let prior_cursor = self.tree_nav.cursor;
+        let prior_cursor = self.tree_state.nav.cursor;
         match action {
             Action::Quit => return true,
             Action::Cancel => {
@@ -1165,44 +1161,43 @@ impl App {
                 }
             }
             Action::MoveUp => {
-                self.tree_nav.move_by(-1, total);
+                self.tree_state.nav.move_by(-1, total);
             }
             Action::MoveDown => {
-                self.tree_nav.move_by(1, total);
+                self.tree_state.nav.move_by(1, total);
             }
             Action::PageUp => {
-                self.tree_nav.move_by(-10, total);
+                self.tree_state.nav.move_by(-10, total);
             }
             Action::PageDown => {
-                self.tree_nav.move_by(10, total);
+                self.tree_state.nav.move_by(10, total);
             }
             Action::Top => {
-                self.tree_nav.home();
+                self.tree_state.nav.home();
             }
             Action::Bottom => {
-                self.tree_nav.end(total);
+                self.tree_state.nav.end(total);
             }
             Action::EnterDir => {
-                // On a directory: expand it and step cursor into the
-                // first child. On a file: leave the cursor where it
-                // is (the preview already shows the file's contents).
+                // On a directory: expand it and step the cursor into
+                // the first child. On a file: leave the cursor where
+                // it is (the preview already shows the file's
+                // contents). The toolkit's `toggle_at` returns the
+                // expanded NodeId so we can detect a fresh expansion
+                // and step in only on that path.
                 let rows = crate::tree::flatten_tree(
                     &self.cwd,
-                    &self.tree_expanded,
+                    &self.tree_state.expanded,
                     self.tree_sort,
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
                 );
-                if let Some(row) = rows.get(self.tree_nav.cursor) {
-                    if row.entry.is_dir() {
-                        let already_expanded = self.tree_expanded.contains(&row.entry.path);
-                        if !already_expanded {
-                            self.tree_expanded.insert(row.entry.path.clone());
-                            // Step into the first child.
-                            self.tree_nav.move_by(1, total + 1);
-                        }
-                    }
+                let cursor = self.tree_state.nav.cursor;
+                if let gtui::tree::ToggleOutcome::Expanded(_) =
+                    self.tree_state.toggle_at(&rows, cursor)
+                {
+                    self.tree_state.nav.move_by(1, total + 1);
                 }
             }
             Action::ParentDir => {
@@ -1211,38 +1206,25 @@ impl App {
                 // or `cd ..` when at the root.
                 let rows = crate::tree::flatten_tree(
                     &self.cwd,
-                    &self.tree_expanded,
+                    &self.tree_state.expanded,
                     self.tree_sort,
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
                 );
-                if let Some(row) = rows.get(self.tree_nav.cursor) {
-                    if row.entry.is_dir() && self.tree_expanded.contains(&row.entry.path) {
-                        self.tree_expanded.remove(&row.entry.path);
-                    } else if row.depth > 0 {
-                        // Walk back up the rows to the first one at
-                        // strictly lower depth — that's the parent
-                        // directory.
-                        let target = row.depth - 1;
-                        for i in (0..self.tree_nav.cursor).rev() {
-                            if rows[i].depth == target {
-                                self.tree_nav.cursor = i;
-                                break;
-                            }
-                        }
-                    } else {
-                        // Root-level: cd to the parent of cwd.
+                match self.tree_state.collapse_or_parent(&rows) {
+                    gtui::tree::ParentOutcome::Collapsed(_)
+                    | gtui::tree::ParentOutcome::JumpedToParent(_) => {}
+                    gtui::tree::ParentOutcome::AtRoot
+                    | gtui::tree::ParentOutcome::OutOfRange => {
+                        // Depth-0 row (or empty list) — interpret as
+                        // "cd to the parent of cwd."
                         if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
-                            self.tree_expanded.clear();
-                            self.tree_nav = Nav::default();
+                            self.tree_state.expanded.clear();
+                            self.tree_state.nav = Nav::default();
                             let _ = self.cd(&parent);
                         }
                     }
-                } else if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
-                    self.tree_expanded.clear();
-                    self.tree_nav = Nav::default();
-                    let _ = self.cd(&parent);
                 }
             }
             Action::ToggleHidden => {
@@ -1265,15 +1247,15 @@ impl App {
             Action::StartEditor => {
                 let rows = crate::tree::flatten_tree(
                     &self.cwd,
-                    &self.tree_expanded,
+                    &self.tree_state.expanded,
                     self.tree_sort,
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
                 );
-                if let Some(row) = rows.get(self.tree_nav.cursor) {
-                    if !row.entry.is_dir() {
-                        self.pending_editor = Some(row.entry.path.clone());
+                if let Some(row) = rows.get(self.tree_state.nav.cursor) {
+                    if !row.row.is_dir() {
+                        self.pending_editor = Some(row.row.path.clone());
                     }
                 }
             }
@@ -1313,7 +1295,7 @@ impl App {
             }
             Action::Noop => {}
         }
-        if self.tree_nav.cursor != prior_cursor {
+        if self.tree_state.nav.cursor != prior_cursor {
             self.request_tree_preview();
         }
         false

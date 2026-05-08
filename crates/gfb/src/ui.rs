@@ -90,26 +90,16 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
 /// in tree-glyph mode; preview pane reuses the same renderer the
 /// miller-mode side preview uses, just with a much bigger area.
 fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
-    use gtui::widgets::live_table::LiveTable;
+    use crate::tree::{build_rows_for_app, FbCol};
+    use gtui::browser::BrowserShell;
     use gtui::widgets::live_table::{Align, ColumnDef, WidthSpec};
-    use gtui::CornerStyle;
-    use crate::tree::{build_rows_for_app, FbCol, TreeRow};
-
-    let weights = [
-        ratatui::layout::Constraint::Percentage(35),
-        ratatui::layout::Constraint::Min(0),
-    ];
-    let rects = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Horizontal)
-        .constraints(weights)
-        .split(area);
 
     let rows = build_rows_for_app(
         app.cwd(),
         app.tree_sort,
         app.tree_sort_descending,
         app.show_hidden(),
-        &app.tree_expanded,
+        &app.tree_state.expanded,
         app.filter(),
     );
 
@@ -137,33 +127,23 @@ fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         },
     ];
 
-    let panel = gtui::widgets::panel(
-        theme.panel_accents[3],
-        theme.title,
-        CornerStyle::default(),
-    )
-    .with_title(format!("tree · {}", app.cwd_display()));
-    frame.render_widget(&panel, rects[0]);
-    let inner = panel.inner(rects[0]);
-    if inner.height >= 1 && inner.width >= 4 {
-        let body_h = inner.height.saturating_sub(1) as usize;
-        let scroll = gtui::middle_anchor_scroll(
-            app.tree_nav.cursor,
-            rows.len(),
-            body_h,
+    let preview_rect = BrowserShell::<FbCol>::new()
+        .with_title(format!("tree · {}", app.cwd_display()))
+        .with_accent(theme.panel_accents[3])
+        .with_sort_state(app.tree_sort, app.tree_sort_descending)
+        .render(
+            frame,
+            area,
+            &rows,
+            &columns,
+            theme,
+            FbCol::Name,
+            app.tree_state.nav.cursor,
         );
-        let table: LiveTable<TreeRow, (), FbCol> =
-            LiveTable::new(&rows, &columns, theme, FbCol::Name)
-                .with_selection(Some(app.tree_nav.cursor), scroll)
-                .with_sort(Some(app.tree_sort), app.tree_sort_descending)
-                .with_tree_glyphs(true)
-                .with_fade(false);
-        frame.render_widget(&table, inner);
-    }
 
     // Preview pane — reuse the miller-mode preview renderer against
     // the bigger right-hand rect.
-    draw_preview_pane(app, frame, theme, rects[1]);
+    draw_preview_pane(app, frame, theme, preview_rect);
 }
 
 fn target_name(p: &std::path::Path) -> String {

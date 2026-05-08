@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod boxes;
+pub mod browser;
 pub mod color;
 pub mod keymap;
 pub mod layout;

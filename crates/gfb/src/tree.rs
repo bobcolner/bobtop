@@ -7,16 +7,18 @@
 //!
 //! As of the Phase 2 refactor the depth / ancestor-continues / last-
 //! sibling computation lives in [`gtui::tree`]. This module supplies
-//! the filesystem-specific [`gtui::tree::Catalog`] impl and a thin
-//! adapter that converts toolkit rows into the [`TreeRow`] shape
-//! `LiveTable` consumes via [`TableRowExt`].
+//! the filesystem-specific [`gtui::tree::Catalog`] impl. Phase 3 went
+//! further and dropped gfb's wrapper `TreeRow` — the toolkit's
+//! [`gtui::tree::TreeRow<PathBuf, FsEntry>`] is the rendering shape
+//! directly, with [`TableRowExt`] implemented on it (orphan rule
+//! satisfied via the local [`FbCol`] trait parameter).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use gtui::format_bytes_compact;
-use gtui::tree::{flatten, Catalog};
+use gtui::tree::{flatten, Catalog, TreeRow as GtuiTreeRow};
 use gtui::widgets::live_table::{Cell, TableEntry, TableRowExt};
 
 use crate::fs::entry::{EntryKind, FsEntry};
@@ -32,16 +34,12 @@ pub enum FbCol {
     Modified,
 }
 
-/// One row the tree view renders. Wraps an [`FsEntry`] with the
-/// per-row tree metadata `LiveTable` needs (depth, ancestor
-/// continuity, last-sibling marker).
-#[derive(Debug, Clone)]
-pub struct TreeRow {
-    pub entry: FsEntry,
-    pub depth: u8,
-    pub ancestor_continues: Vec<bool>,
-    pub is_last_sibling: bool,
-}
+/// Concrete row type for the tree view: the toolkit's
+/// [`gtui::tree::TreeRow`] specialised to filesystem entries.
+/// Re-exported as a type alias so callers don't have to spell the
+/// generics every time and so the [`TableRowExt`] impl below has a
+/// stable, local-feeling identifier.
+pub type TreeRow = GtuiTreeRow<PathBuf, FsEntry>;
 
 /// Sort + group: directories first, then alphabetical-or-metric per
 /// the active column. Honours `descending` for the comparable
@@ -186,35 +184,27 @@ pub fn flatten_tree(
 ) -> Vec<TreeRow> {
     let catalog = FsCatalog::new(cwd, expanded, sort, descending, show_hidden, filter);
     flatten(&catalog, expanded)
-        .into_iter()
-        .map(|tr| TreeRow {
-            entry: tr.row,
-            depth: tr.depth,
-            ancestor_continues: tr.ancestor_continues,
-            is_last_sibling: tr.is_last_sibling,
-        })
-        .collect()
 }
 
 impl TableRowExt<FbCol> for TreeRow {
     fn cell(&self, col: FbCol) -> Cell {
         match col {
             FbCol::Name => {
-                let glyph = match self.entry.kind {
+                let glyph = match self.row.kind {
                     EntryKind::Dir => "📁",
                     EntryKind::Symlink => "↪",
                     _ => " ",
                 };
-                Cell::plain(format!("{} {}", glyph, self.entry.name))
+                Cell::plain(format!("{} {}", glyph, self.row.name))
             }
             FbCol::Size => {
-                if self.entry.is_dir() {
+                if self.row.is_dir() {
                     Cell::plain("")
                 } else {
-                    Cell::plain(format_bytes_compact(self.entry.size))
+                    Cell::plain(format_bytes_compact(self.row.size))
                 }
             }
-            FbCol::Modified => Cell::plain(format_mtime(self.entry.mtime)),
+            FbCol::Modified => Cell::plain(format_mtime(self.row.mtime)),
         }
     }
 
@@ -235,14 +225,14 @@ impl TableRowExt<FbCol> for TreeRow {
         // re-sort / filter toggles. djb2 — same shape used elsewhere
         // in the suite for stringly-typed keys.
         let mut h: u64 = 5381;
-        for b in self.entry.path.as_os_str().as_encoded_bytes() {
+        for b in self.id.as_os_str().as_encoded_bytes() {
             h = h.wrapping_mul(33).wrapping_add(*b as u64);
         }
         Some(h)
     }
 
     fn matches_filter(&self, q: &str) -> bool {
-        self.entry.name.to_lowercase().contains(&q.to_lowercase())
+        self.row.name.to_lowercase().contains(&q.to_lowercase())
     }
 }
 
