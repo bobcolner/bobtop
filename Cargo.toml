@@ -45,6 +45,10 @@ tokio-postgres = "0.7"
 # DuckDB client (used by bobtop-db). `bundled` builds libduckdb from
 # source so we don't depend on a system install — first compile is
 # slow (~2-3 min) but every subsequent build is incremental.
+#
+# We tried `default-features = false` to drop Arrow; arrow turned
+# out to be a hard dep of the duckdb-rs crate (not feature-gated),
+# so disabling defaults was a no-op. Leaving on the defaults.
 duckdb = { version = "1.4", features = ["bundled"] }
 
 # System data sources

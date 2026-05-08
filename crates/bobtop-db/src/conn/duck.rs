@@ -13,7 +13,7 @@
 //! whose catalog lives in Postgres and whose data lives in Parquet.
 
 use anyhow::{Context, Result};
-use duckdb::{params, Connection as DuckConn};
+use duckdb::{params, AccessMode, Config, Connection as DuckConn};
 
 use super::{ColumnSpec, Connection, Database, Row, Schema, Table};
 
@@ -23,15 +23,38 @@ pub struct DuckConnection {
 }
 
 impl DuckConnection {
-    /// Open a DuckDB file (or `:memory:`).
+    /// Open a DuckDB file (or `:memory:`) in read-only mode.
+    /// In-memory paths fall back to default access — they're RAM-only,
+    /// so the access-mode distinction doesn't matter and read-only
+    /// would block the ATTACH path.
     pub fn open(path: &str) -> Result<Self> {
-        let conn = if path.is_empty() || path == ":memory:" || path == "memory" {
+        Self::open_with(path, true)
+    }
+
+    /// Open with explicit read-only / read-write choice. The CLI's
+    /// `--write` flag routes here so users who actually want to mutate
+    /// can opt in; everything else (browser access, lake attach via an
+    /// already-busy file) sticks with the read-only default.
+    pub fn open_with(path: &str, read_only: bool) -> Result<Self> {
+        let in_memory = path.is_empty() || path == ":memory:" || path == "memory";
+        let conn = if in_memory {
+            // In-memory: read-only would block the ATTACH path that
+            // makes this connection useful (DuckLake mounting the lake
+            // catalog). Always read-write for `:memory:`.
             DuckConn::open_in_memory().context("open in-memory duckdb")?
+        } else if read_only {
+            let cfg = Config::default()
+                .access_mode(AccessMode::ReadOnly)
+                .context("set read-only access mode")?;
+            DuckConn::open_with_flags(path, cfg)
+                .with_context(|| format!("open duckdb (read-only): {path}"))?
         } else {
             DuckConn::open(path).with_context(|| format!("open duckdb: {path}"))?
         };
-        let label = if path.is_empty() || path == ":memory:" || path == "memory" {
+        let label = if in_memory {
             "duckdb://memory".to_string()
+        } else if read_only {
+            format!("duckdb://{path} [ro]")
         } else {
             format!("duckdb://{path}")
         };

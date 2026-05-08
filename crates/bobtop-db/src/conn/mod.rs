@@ -107,7 +107,11 @@ pub struct DuckLakeAttach {
     pub data_path: String,
 }
 
-pub fn open(target: &str, ducklake: Option<DuckLakeAttach>) -> Result<Box<dyn Connection>> {
+pub fn open(
+    target: &str,
+    ducklake: Option<DuckLakeAttach>,
+    read_only: bool,
+) -> Result<Box<dyn Connection>> {
     match target {
         "mock" => Ok(Box::new(mock::MockConnection::demo())),
         s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
@@ -118,7 +122,7 @@ pub fn open(target: &str, ducklake: Option<DuckLakeAttach>) -> Result<Box<dyn Co
         }
         s if s.starts_with("duckdb://") => {
             let path = s.strip_prefix("duckdb://").unwrap_or("");
-            let mut conn = duck::DuckConnection::open(path)?;
+            let mut conn = duck::DuckConnection::open_with(path, read_only)?;
             if let Some(attach) = ducklake {
                 conn.attach_ducklake(&attach.name, &attach.catalog_pg_url, &attach.data_path)?;
             }

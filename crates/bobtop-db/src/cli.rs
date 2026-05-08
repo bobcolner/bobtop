@@ -51,6 +51,13 @@ pub struct Cli {
     /// the tree pane. Defaults to `lake`.
     #[arg(long, default_value = "lake")]
     pub ducklake_name: String,
+
+    /// Open the DuckDB file read-write. Default is read-only so
+    /// bobtop-db can browse a file that another process (your
+    /// ingest pipeline, an interactive `duckdb` shell, …) is
+    /// currently writing. Only applies to `--connect duckdb://...`.
+    #[arg(long)]
+    pub write: bool,
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
@@ -70,7 +77,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         (None, None) => None,
     };
-    let connection = conn::open(&cli.connect, ducklake)?;
+    let connection = conn::open(&cli.connect, ducklake, !cli.write)?;
     let mut app = App::new(connection, theme);
 
     let mut stdout = io::stdout();
