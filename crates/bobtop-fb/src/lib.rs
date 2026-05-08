@@ -17,4 +17,5 @@ pub(crate) mod fs;
 pub(crate) mod keys;
 pub(crate) mod preview;
 pub(crate) mod state;
+pub(crate) mod tree;
 pub(crate) mod ui;

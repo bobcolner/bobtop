@@ -509,6 +509,37 @@ pub struct App {
     /// As each modal is migrated, it'll push a real `Scope` here so
     /// the cascade collapses into a single dispatch site.
     scopes: bobtop_tui::ScopeStack<Action>,
+
+    /// Active view mode. Default [`ViewMode::Miller`] preserves the
+    /// existing yazi-style three-pane layout exactly. Press `T` to
+    /// flip into [`ViewMode::Tree`] (single tree pane on the left,
+    /// dominant preview on the right). State below the line is only
+    /// used in tree mode; toggling between modes preserves it.
+    pub(crate) view_mode: ViewMode,
+    /// Set of directories the user has expanded in tree mode. Tree
+    /// view recursively walks every expanded subdir under cwd to
+    /// build its flattened row list.
+    pub(crate) tree_expanded: std::collections::HashSet<PathBuf>,
+    /// Sort column for tree mode. Independent of `sort` (which is
+    /// the miller-mode sort) so toggling between modes doesn't
+    /// disrupt either.
+    pub(crate) tree_sort: crate::tree::FbCol,
+    pub(crate) tree_sort_descending: bool,
+    /// Cursor + scroll for tree mode, separate from the miller-mode
+    /// `nav` so each mode keeps its own selection.
+    pub(crate) tree_nav: bobtop_tui::Nav,
+}
+
+/// Top-level view mode. Switched with `T`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The original yazi-flavored layout: parent / current / preview
+    /// miller columns plus the optional full-screen preview modal.
+    Miller,
+    /// Single tree pane on the left, dominant preview on the right.
+    /// Tree expands inline; no full-screen preview because the side
+    /// preview is already most of the screen.
+    Tree,
 }
 
 #[derive(Debug, Clone)]
@@ -651,6 +682,11 @@ impl App {
             status_message: None,
             status_message_ticks: 0,
             scopes: bobtop_tui::ScopeStack::new(Box::new(BaseScope)),
+            view_mode: ViewMode::Miller,
+            tree_expanded: std::collections::HashSet::new(),
+            tree_sort: crate::tree::FbCol::Name,
+            tree_sort_descending: false,
+            tree_nav: bobtop_tui::Nav::default(),
         };
         app.start_watcher();
         app.refresh()?;
@@ -677,6 +713,14 @@ impl App {
 
     pub fn cwd_display(&self) -> String {
         self.cwd.display().to_string()
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
     }
 
     pub fn selected(&self) -> Option<&FsEntry> {
@@ -1039,6 +1083,242 @@ impl App {
     /// - Cache miss → bump `preview_gen`, mark Loading, spawn a blocking
     ///   tokio task whose result lands on `preview_rx`. Stale results
     ///   are discarded by `drain_results()` via the generation counter.
+    /// Preview the right thing for whichever view mode is active.
+    /// Called from action handlers and the mode-toggle path.
+    pub(crate) fn request_preview_for_active_mode(&mut self) {
+        match self.view_mode {
+            ViewMode::Miller => self.request_preview(),
+            ViewMode::Tree => self.request_tree_preview(),
+        }
+    }
+
+    /// Tree-mode preview: look up the entry at `tree_nav.cursor` in a
+    /// freshly-flattened tree and queue a preview for its path. The
+    /// flatten cost is bounded — only `cwd` plus expanded subdirs are
+    /// scanned — and only fires when the cursor moves.
+    fn request_tree_preview(&mut self) {
+        let rows = crate::tree::flatten_tree(
+            &self.cwd,
+            &self.tree_expanded,
+            self.tree_sort,
+            self.tree_sort_descending,
+            self.show_hidden,
+            self.filter.as_deref(),
+        );
+        let Some(row) = rows.get(self.tree_nav.cursor).cloned() else {
+            self.preview_state = PreviewState::None;
+            self.preview_scroll = 0;
+            return;
+        };
+        let path = row.entry.path;
+        if matches!(&self.preview_state, PreviewState::Ready { path: p, .. } | PreviewState::Loading(p) | PreviewState::Error { path: p, .. } if *p == path)
+        {
+            return;
+        }
+        self.preview_scroll = 0;
+        if let Some(cached) = self.preview_cache.get(&path) {
+            self.preview_state = PreviewState::Ready { path, preview: cached };
+            return;
+        }
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        let gen = self.preview_gen;
+        self.preview_state = PreviewState::Loading(path.clone());
+        let tx = self.preview_tx.clone();
+        let limits = self.preview_limits;
+        let sort = self.sort;
+        let show_hidden = self.show_hidden;
+        let task_path = path.clone();
+        self.rt.spawn_blocking(move || {
+            let outcome = preview::render_blocking(&task_path, limits, sort, show_hidden);
+            let _ = tx.send(PreviewResult { generation: gen, path: task_path, outcome });
+        });
+    }
+
+    /// Tree-mode action dispatch — minimal v1 covering navigation,
+    /// expand/collapse, sort cycling, and the modals that work
+    /// without per-mode special-casing (filter, find, editor open).
+    /// File ops (rename / trash / delete / touch) currently route
+    /// through the miller-mode entry list and are best done from
+    /// `Miller` mode for now — extending them to tree mode is a
+    /// follow-up.
+    fn handle_tree(&mut self, action: Action) -> bool {
+        // Compute total visible rows once so movement actions can
+        // clamp without re-flattening.
+        let total = crate::tree::flatten_tree(
+            &self.cwd,
+            &self.tree_expanded,
+            self.tree_sort,
+            self.tree_sort_descending,
+            self.show_hidden,
+            self.filter.as_deref(),
+        )
+        .len();
+        let prior_cursor = self.tree_nav.cursor;
+        match action {
+            Action::Quit => return true,
+            Action::Cancel => {
+                if self.filter.is_some() {
+                    self.filter = None;
+                    self.apply_filter();
+                } else {
+                    return true;
+                }
+            }
+            Action::MoveUp => {
+                self.tree_nav.move_by(-1, total);
+            }
+            Action::MoveDown => {
+                self.tree_nav.move_by(1, total);
+            }
+            Action::PageUp => {
+                self.tree_nav.move_by(-10, total);
+            }
+            Action::PageDown => {
+                self.tree_nav.move_by(10, total);
+            }
+            Action::Top => {
+                self.tree_nav.home();
+            }
+            Action::Bottom => {
+                self.tree_nav.end(total);
+            }
+            Action::EnterDir => {
+                // On a directory: expand it and step cursor into the
+                // first child. On a file: leave the cursor where it
+                // is (the preview already shows the file's contents).
+                let rows = crate::tree::flatten_tree(
+                    &self.cwd,
+                    &self.tree_expanded,
+                    self.tree_sort,
+                    self.tree_sort_descending,
+                    self.show_hidden,
+                    self.filter.as_deref(),
+                );
+                if let Some(row) = rows.get(self.tree_nav.cursor) {
+                    if row.entry.is_dir() {
+                        let already_expanded = self.tree_expanded.contains(&row.entry.path);
+                        if !already_expanded {
+                            self.tree_expanded.insert(row.entry.path.clone());
+                            // Step into the first child.
+                            self.tree_nav.move_by(1, total + 1);
+                        }
+                    }
+                }
+            }
+            Action::ParentDir => {
+                // On an expanded directory at the cursor: collapse
+                // it. Otherwise jump cursor to the parent dir row,
+                // or `cd ..` when at the root.
+                let rows = crate::tree::flatten_tree(
+                    &self.cwd,
+                    &self.tree_expanded,
+                    self.tree_sort,
+                    self.tree_sort_descending,
+                    self.show_hidden,
+                    self.filter.as_deref(),
+                );
+                if let Some(row) = rows.get(self.tree_nav.cursor) {
+                    if row.entry.is_dir() && self.tree_expanded.contains(&row.entry.path) {
+                        self.tree_expanded.remove(&row.entry.path);
+                    } else if row.depth > 0 {
+                        // Walk back up the rows to the first one at
+                        // strictly lower depth — that's the parent
+                        // directory.
+                        let target = row.depth - 1;
+                        for i in (0..self.tree_nav.cursor).rev() {
+                            if rows[i].depth == target {
+                                self.tree_nav.cursor = i;
+                                break;
+                            }
+                        }
+                    } else {
+                        // Root-level: cd to the parent of cwd.
+                        if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+                            self.tree_expanded.clear();
+                            self.tree_nav = Nav::default();
+                            let _ = self.cd(&parent);
+                        }
+                    }
+                } else if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+                    self.tree_expanded.clear();
+                    self.tree_nav = Nav::default();
+                    let _ = self.cd(&parent);
+                }
+            }
+            Action::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                let _ = self.refresh();
+            }
+            Action::Refresh => {
+                let _ = self.refresh();
+            }
+            Action::ToggleFocus | Action::ToggleFullPreview => {
+                // Tree mode has no focus split / full-preview modal —
+                // the preview already takes ~70% of the screen.
+            }
+            Action::StartFilter => {
+                self.filter_input = Some(self.filter.clone().unwrap_or_default());
+            }
+            Action::StartFind => {
+                self.finder = Some(FinderState::new());
+            }
+            Action::StartEditor => {
+                let rows = crate::tree::flatten_tree(
+                    &self.cwd,
+                    &self.tree_expanded,
+                    self.tree_sort,
+                    self.tree_sort_descending,
+                    self.show_hidden,
+                    self.filter.as_deref(),
+                );
+                if let Some(row) = rows.get(self.tree_nav.cursor) {
+                    if !row.entry.is_dir() {
+                        self.pending_editor = Some(row.entry.path.clone());
+                    }
+                }
+            }
+            Action::PreviewNarrower | Action::PreviewWider => {
+                // Could resize the tree-vs-preview split — wire up
+                // later. For v1 the split is fixed at 35/65.
+            }
+            Action::TreeCycleSortNext => {
+                self.tree_sort = match self.tree_sort {
+                    crate::tree::FbCol::Name => crate::tree::FbCol::Size,
+                    crate::tree::FbCol::Size => crate::tree::FbCol::Modified,
+                    crate::tree::FbCol::Modified => crate::tree::FbCol::Name,
+                };
+            }
+            Action::TreeCycleSortPrev => {
+                self.tree_sort = match self.tree_sort {
+                    crate::tree::FbCol::Name => crate::tree::FbCol::Modified,
+                    crate::tree::FbCol::Size => crate::tree::FbCol::Name,
+                    crate::tree::FbCol::Modified => crate::tree::FbCol::Size,
+                };
+            }
+            Action::TreeReverseSort => {
+                self.tree_sort_descending = !self.tree_sort_descending;
+            }
+            Action::ToggleViewMode => {
+                // Already handled in the outer dispatcher. Defensive
+                // no-op here.
+            }
+            // File-ops (Trash / HardDelete / Rename / Touch) currently
+            // route through the miller-mode entries vector. Supporting
+            // them in tree mode requires the modal flow to read from
+            // the tree-row cursor — deferred to a follow-up.
+            Action::Trash | Action::HardDelete | Action::Rename | Action::Touch => {
+                self.status_message =
+                    Some("file ops: switch to Miller mode (T) for now".to_string());
+                self.status_message_ticks = 24;
+            }
+            Action::Noop => {}
+        }
+        if self.tree_nav.cursor != prior_cursor {
+            self.request_tree_preview();
+        }
+        false
+    }
+
     fn request_preview(&mut self) {
         let Some(entry) = self.selected().cloned() else {
             self.preview_state = PreviewState::None;
@@ -1116,6 +1396,22 @@ impl App {
     }
 
     fn handle(&mut self, action: Action) -> bool {
+        // Mode toggle handled before everything else so it works
+        // regardless of which mode we're currently in. State for both
+        // modes survives — toggling is non-destructive.
+        if matches!(action, Action::ToggleViewMode) {
+            self.view_mode = match self.view_mode {
+                ViewMode::Miller => ViewMode::Tree,
+                ViewMode::Tree => ViewMode::Miller,
+            };
+            // Refresh preview against whichever mode's cursor is now
+            // active so the right-hand pane updates immediately.
+            self.request_preview_for_active_mode();
+            return false;
+        }
+        if matches!(self.view_mode, ViewMode::Tree) {
+            return self.handle_tree(action);
+        }
         let prior_idx = self.nav.cursor;
         // Modal short-circuit: only quit, close, and scroll work
         // while the full-preview modal is open. Everything else is a
@@ -1309,6 +1605,13 @@ impl App {
                 }
                 let _ = self.refresh();
             }
+            // Tree-mode-specific actions are dispatched in
+            // `handle_tree`; reaching them here means we're in
+            // miller mode and they should be no-ops.
+            Action::ToggleViewMode
+            | Action::TreeCycleSortNext
+            | Action::TreeCycleSortPrev
+            | Action::TreeReverseSort => {}
             Action::Noop => {}
         }
         // Any movement / refresh / cd may have changed the selected

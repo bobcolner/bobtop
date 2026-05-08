@@ -24,7 +24,7 @@ pub enum Action {
     Refresh,
     /// Cycle focus between the directory list and the preview pane.
     ToggleFocus,
-    /// Toggle the large preview modal (spacebar).
+    /// Toggle the large preview modal (spacebar). No-op in tree mode.
     ToggleFullPreview,
     /// Soft cancel — closes the modal if open, otherwise quits.
     Cancel,
@@ -47,6 +47,15 @@ pub enum Action {
     PreviewNarrower,
     /// Grow the preview pane one step (Hidden → Small → Medium → Large).
     PreviewWider,
+    /// Flip between Miller and Tree view modes (`T`). Each mode
+    /// keeps its own cursor/sort state so toggling is non-destructive.
+    ToggleViewMode,
+    /// Tree-mode only: cycle to the next sortable column (`.`).
+    TreeCycleSortNext,
+    /// Tree-mode only: cycle to the previous sortable column (`,`).
+    TreeCycleSortPrev,
+    /// Tree-mode only: flip sort direction (`R`).
+    TreeReverseSort,
     Noop,
 }
 
@@ -89,6 +98,16 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char(']') => Action::PreviewWider,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
+        // View mode toggle. `T` is unbound in miller mode today and
+        // unique enough to not collide with anything muscle memory.
+        KeyCode::Char('T') => Action::ToggleViewMode,
+        // Tree-mode-only sort cycling. `s` / `S` advance / step back
+        // through the sortable columns; `R` flips direction. (`.`
+        // would have been more mnemonic but it's already bound to
+        // ToggleHidden.) These actions are no-ops in miller mode.
+        KeyCode::Char('s') => Action::TreeCycleSortNext,
+        KeyCode::Char('S') => Action::TreeCycleSortPrev,
+        KeyCode::Char('R') => Action::TreeReverseSort,
         _ => Action::Noop,
     }
 }

@@ -60,21 +60,110 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
         }
     }
     let (top, bottom) = split_top_bottom(area, 1);
-    let rects = split_main_columns(top, app.preview_size().weight());
-    draw_parent_pane(app, frame, theme, rects[0]);
-    draw_list_pane(app, frame, theme, rects[1]);
-    draw_preview_pane(app, frame, theme, rects[2]);
-    draw_action_bar(app, frame, theme, bottom);
-    if app.is_full_preview() {
-        if app.editor().is_some() {
-            draw_editor_modal(app, frame, theme, area);
-        } else {
-            draw_preview_modal(app, frame, theme, area);
+    match app.view_mode {
+        crate::app::ViewMode::Miller => {
+            let rects = split_main_columns(top, app.preview_size().weight());
+            draw_parent_pane(app, frame, theme, rects[0]);
+            draw_list_pane(app, frame, theme, rects[1]);
+            draw_preview_pane(app, frame, theme, rects[2]);
+            draw_action_bar(app, frame, theme, bottom);
+            if app.is_full_preview() {
+                if app.editor().is_some() {
+                    draw_editor_modal(app, frame, theme, area);
+                } else {
+                    draw_preview_modal(app, frame, theme, area);
+                }
+            }
+        }
+        crate::app::ViewMode::Tree => {
+            draw_tree_view(app, frame, theme, top);
+            draw_action_bar(app, frame, theme, bottom);
         }
     }
     if let Some(modal) = app.input_modal() {
         draw_input_modal(modal, frame, theme, area);
     }
+}
+
+/// Two-pane layout for `ViewMode::Tree`: tree (left ~30%) +
+/// preview (right ~70%). Tree pane uses [`bobtop_tui::LiveTable`]
+/// in tree-glyph mode; preview pane reuses the same renderer the
+/// miller-mode side preview uses, just with a much bigger area.
+fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use bobtop_tui::widgets::live_table::LiveTable;
+    use bobtop_tui::widgets::live_table::{Align, ColumnDef, WidthSpec};
+    use bobtop_tui::CornerStyle;
+    use crate::tree::{build_rows_for_app, FbCol, TreeRow};
+
+    let weights = [
+        ratatui::layout::Constraint::Percentage(35),
+        ratatui::layout::Constraint::Min(0),
+    ];
+    let rects = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints(weights)
+        .split(area);
+
+    let rows = build_rows_for_app(
+        app.cwd(),
+        app.tree_sort,
+        app.tree_sort_descending,
+        app.show_hidden(),
+        &app.tree_expanded,
+        app.filter(),
+    );
+
+    let columns: Vec<ColumnDef<FbCol>> = vec![
+        ColumnDef {
+            id: FbCol::Name,
+            label: "Name",
+            width: WidthSpec::Flex,
+            align: Align::Left,
+            sortable: true,
+        },
+        ColumnDef {
+            id: FbCol::Size,
+            label: "Size",
+            width: WidthSpec::Fixed(7),
+            align: Align::Right,
+            sortable: true,
+        },
+        ColumnDef {
+            id: FbCol::Modified,
+            label: "Modified",
+            width: WidthSpec::Fixed(16),
+            align: Align::Left,
+            sortable: true,
+        },
+    ];
+
+    let panel = bobtop_tui::widgets::panel(
+        theme.panel_accents[3],
+        theme.title,
+        CornerStyle::default(),
+    )
+    .with_title(format!("tree · {}", app.cwd_display()));
+    frame.render_widget(&panel, rects[0]);
+    let inner = panel.inner(rects[0]);
+    if inner.height >= 1 && inner.width >= 4 {
+        let body_h = inner.height.saturating_sub(1) as usize;
+        let scroll = bobtop_tui::middle_anchor_scroll(
+            app.tree_nav.cursor,
+            rows.len(),
+            body_h,
+        );
+        let table: LiveTable<TreeRow, (), FbCol> =
+            LiveTable::new(&rows, &columns, theme, FbCol::Name)
+                .with_selection(Some(app.tree_nav.cursor), scroll)
+                .with_sort(Some(app.tree_sort), app.tree_sort_descending)
+                .with_tree_glyphs(true)
+                .with_fade(false);
+        frame.render_widget(&table, inner);
+    }
+
+    // Preview pane — reuse the miller-mode preview renderer against
+    // the bigger right-hand rect.
+    draw_preview_pane(app, frame, theme, rects[1]);
 }
 
 fn target_name(p: &std::path::Path) -> String {
