@@ -318,6 +318,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bobtop-db"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bobtop-tui",
+ "clap",
+ "crossterm",
+ "ratatui",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "bobtop-engine"
 version = "0.2.0"
 dependencies = [
