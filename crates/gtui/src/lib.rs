@@ -15,6 +15,7 @@ pub mod layout;
 pub mod prelude;
 pub mod theme;
 pub mod text;
+pub mod tree;
 pub mod util;
 pub mod widgets;
 

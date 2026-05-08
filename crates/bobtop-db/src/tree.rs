@@ -4,10 +4,16 @@
 //! every connection is its own depth-0 endpoint, so multi-`--connect`
 //! sessions show all endpoints stacked. Expansion is lazy: schemas
 //! and tables are fetched the first time a parent expands.
+//!
+//! As of the Phase 2 refactor the depth / ancestor-continues / last-
+//! sibling computation lives in [`gtui::tree`]. This module supplies
+//! the connection-rooted [`gtui::tree::Catalog`] impl and the
+//! domain-shaped [`CatalogNode`] view the UI consumes.
 
 use std::collections::HashSet;
 
 use anyhow::Result;
+use gtui::tree::{flatten, Catalog};
 
 use crate::conn::Connection;
 
@@ -19,7 +25,7 @@ pub enum NodeKind {
     Table,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct NodePath {
     /// Index into the `App::conns` vector. Lets the App route
     /// queries (preview load, etc.) to the right backend.
@@ -30,25 +36,50 @@ pub struct NodePath {
 }
 
 impl NodePath {
-    /// Stable string key used for the expanded-set. The connection
-    /// index goes first so two endpoints with the same `ml_momo`
-    /// database name don't collide. Nesting separator is `\0`.
-    pub fn key(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&self.conn.to_string());
-        if let Some(db) = &self.database {
-            out.push('\0');
-            out.push_str(db);
+    fn endpoint(conn: usize) -> Self {
+        Self {
+            conn,
+            ..Default::default()
         }
-        if let Some(s) = &self.schema {
-            out.push('\0');
-            out.push_str(s);
+    }
+
+    fn database(conn: usize, db: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            ..Default::default()
         }
-        if let Some(t) = &self.table {
-            out.push('\0');
-            out.push_str(t);
+    }
+
+    fn schema(conn: usize, db: &str, sch: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            schema: Some(sch.to_string()),
+            ..Default::default()
         }
-        out
+    }
+
+    fn table(conn: usize, db: &str, sch: &str, tbl: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            schema: Some(sch.to_string()),
+            table: Some(tbl.to_string()),
+        }
+    }
+
+    fn level(&self) -> NodeKind {
+        match (
+            self.database.is_some(),
+            self.schema.is_some(),
+            self.table.is_some(),
+        ) {
+            (false, _, _) => NodeKind::Endpoint,
+            (true, false, _) => NodeKind::Database,
+            (true, true, false) => NodeKind::Schema,
+            (true, true, true) => NodeKind::Table,
+        }
     }
 }
 
@@ -67,11 +98,124 @@ pub struct CatalogNode {
     pub expanded: bool,
 }
 
+/// Per-row payload the toolkit walker hands back. The full
+/// [`CatalogNode`] is reconstructed from a [`gtui::tree::TreeRow`] +
+/// this once flatten is done.
+#[derive(Debug, Clone)]
+struct NodeData {
+    kind: NodeKind,
+    label: String,
+}
+
+/// Connection-rooted [`Catalog`] impl. One catalog per rebuild — the
+/// connections slice is borrowed for the lifetime of the walk.
+struct ConnectionGroup<'a> {
+    conns: &'a [Box<dyn Connection>],
+}
+
+impl<'a> Catalog for ConnectionGroup<'a> {
+    type NodeId = NodePath;
+    type Row = NodeData;
+
+    fn roots(&self) -> Vec<(Self::NodeId, Self::Row)> {
+        self.conns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    NodePath::endpoint(i),
+                    NodeData {
+                        kind: NodeKind::Endpoint,
+                        label: c.endpoint_label().to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn children(&self, node: &Self::NodeId) -> Vec<(Self::NodeId, Self::Row)> {
+        let Some(conn) = self.conns.get(node.conn) else {
+            return Vec::new();
+        };
+        match node.level() {
+            NodeKind::Endpoint => match conn.databases() {
+                Ok(dbs) => dbs
+                    .into_iter()
+                    .map(|db| {
+                        (
+                            NodePath::database(node.conn, &db.name),
+                            NodeData {
+                                kind: NodeKind::Database,
+                                label: db.name,
+                            },
+                        )
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("databases() failed for conn {}: {e:#}", node.conn);
+                    Vec::new()
+                }
+            },
+            NodeKind::Database => {
+                let db = node.database.as_deref().unwrap_or_default();
+                match conn.schemas(db) {
+                    Ok(schemas) => schemas
+                        .into_iter()
+                        .map(|s| {
+                            (
+                                NodePath::schema(node.conn, db, &s.name),
+                                NodeData {
+                                    kind: NodeKind::Schema,
+                                    label: s.name,
+                                },
+                            )
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!("schemas({db}) failed for conn {}: {e:#}", node.conn);
+                        Vec::new()
+                    }
+                }
+            }
+            NodeKind::Schema => {
+                let db = node.database.as_deref().unwrap_or_default();
+                let sch = node.schema.as_deref().unwrap_or_default();
+                match conn.tables(db, sch) {
+                    Ok(tables) => tables
+                        .into_iter()
+                        .map(|t| {
+                            (
+                                NodePath::table(node.conn, db, sch, &t.name),
+                                NodeData {
+                                    kind: NodeKind::Table,
+                                    label: t.name,
+                                },
+                            )
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            "tables({db},{sch}) failed for conn {}: {e:#}",
+                            node.conn
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            NodeKind::Table => Vec::new(),
+        }
+    }
+
+    fn is_expandable(&self, node: &Self::NodeId) -> bool {
+        !matches!(node.level(), NodeKind::Table)
+    }
+}
+
 pub struct CatalogTree {
     /// Flattened list of currently-visible nodes. Rebuilt from the
     /// connections + `expanded` set whenever expansion changes.
     nodes: Vec<CatalogNode>,
-    expanded: HashSet<String>,
+    expanded: HashSet<NodePath>,
 }
 
 impl CatalogTree {
@@ -85,9 +229,9 @@ impl CatalogTree {
         // connections, this surfaces them all at once rather than
         // hiding everything behind a press of `Enter`.
         for i in 0..conns.len() {
-            tree.expanded.insert(NodePath { conn: i, ..Default::default() }.key());
+            tree.expanded.insert(NodePath::endpoint(i));
         }
-        tree.rebuild(conns)?;
+        tree.rebuild(conns);
         Ok(tree)
     }
 
@@ -97,7 +241,7 @@ impl CatalogTree {
 
     #[allow(dead_code)] // exposed for future tree-state queries (jump-to-parent etc.)
     pub fn is_expanded(&self, path: &NodePath) -> bool {
-        self.expanded.contains(&path.key())
+        self.expanded.contains(path)
     }
 
     /// Toggle expansion at `idx`. Tables are leaves, so toggling them
@@ -110,113 +254,30 @@ impl CatalogTree {
         if !node.expandable {
             return Ok(self.nodes.len());
         }
-        let key = node.path.key();
-        if self.expanded.contains(&key) {
-            self.expanded.remove(&key);
+        if self.expanded.contains(&node.path) {
+            self.expanded.remove(&node.path);
         } else {
-            self.expanded.insert(key);
+            self.expanded.insert(node.path);
         }
-        self.rebuild(conns)?;
+        self.rebuild(conns);
         Ok(self.nodes.len())
     }
 
-    fn rebuild(&mut self, conns: &[Box<dyn Connection>]) -> Result<()> {
-        let mut out = Vec::new();
-        for (i, conn) in conns.iter().enumerate() {
-            let is_last_endpoint = i == conns.len() - 1;
-            let endpoint_path = NodePath { conn: i, ..Default::default() };
-            let endpoint_expanded = self.expanded.contains(&endpoint_path.key());
-            out.push(CatalogNode {
-                kind: NodeKind::Endpoint,
-                label: conn.endpoint_label().to_string(),
-                depth: 0,
-                ancestor_continues: Vec::new(),
-                is_last_sibling: is_last_endpoint,
-                path: endpoint_path,
-                expandable: true,
-                expanded: endpoint_expanded,
-            });
-
-            if !endpoint_expanded {
-                continue;
-            }
-
-            let dbs = conn.databases()?;
-            for (j, db) in dbs.iter().enumerate() {
-                let is_last_db = j == dbs.len() - 1;
-                let db_path = NodePath {
-                    conn: i,
-                    database: Some(db.name.clone()),
-                    ..Default::default()
-                };
-                let db_expanded = self.expanded.contains(&db_path.key());
-                out.push(CatalogNode {
-                    kind: NodeKind::Database,
-                    label: db.name.clone(),
-                    depth: 1,
-                    ancestor_continues: vec![!is_last_endpoint],
-                    is_last_sibling: is_last_db,
-                    path: db_path.clone(),
-                    expandable: true,
-                    expanded: db_expanded,
-                });
-
-                if !db_expanded {
-                    continue;
-                }
-                let schemas = conn.schemas(&db.name)?;
-                for (k, sch) in schemas.iter().enumerate() {
-                    let is_last_schema = k == schemas.len() - 1;
-                    let sch_path = NodePath {
-                        conn: i,
-                        database: Some(db.name.clone()),
-                        schema: Some(sch.name.clone()),
-                        ..Default::default()
-                    };
-                    let sch_expanded = self.expanded.contains(&sch_path.key());
-                    out.push(CatalogNode {
-                        kind: NodeKind::Schema,
-                        label: sch.name.clone(),
-                        depth: 2,
-                        ancestor_continues: vec![!is_last_endpoint, !is_last_db],
-                        is_last_sibling: is_last_schema,
-                        path: sch_path.clone(),
-                        expandable: true,
-                        expanded: sch_expanded,
-                    });
-
-                    if !sch_expanded {
-                        continue;
-                    }
-                    let tables = conn.tables(&db.name, &sch.name)?;
-                    for (m, tbl) in tables.iter().enumerate() {
-                        let is_last_tbl = m == tables.len() - 1;
-                        out.push(CatalogNode {
-                            kind: NodeKind::Table,
-                            label: tbl.name.clone(),
-                            depth: 3,
-                            ancestor_continues: vec![
-                                !is_last_endpoint,
-                                !is_last_db,
-                                !is_last_schema,
-                            ],
-                            is_last_sibling: is_last_tbl,
-                            path: NodePath {
-                                conn: i,
-                                database: Some(db.name.clone()),
-                                schema: Some(sch.name.clone()),
-                                table: Some(tbl.name.clone()),
-                            },
-                            expandable: false,
-                            expanded: false,
-                        });
-                    }
-                }
-            }
-        }
-
-        self.nodes = out;
-        Ok(())
+    fn rebuild(&mut self, conns: &[Box<dyn Connection>]) {
+        let group = ConnectionGroup { conns };
+        self.nodes = flatten(&group, &self.expanded)
+            .into_iter()
+            .map(|tr| CatalogNode {
+                kind: tr.row.kind,
+                label: tr.row.label,
+                depth: tr.depth,
+                ancestor_continues: tr.ancestor_continues,
+                is_last_sibling: tr.is_last_sibling,
+                path: tr.id,
+                expandable: tr.expandable,
+                expanded: tr.expanded,
+            })
+            .collect();
     }
 }
 

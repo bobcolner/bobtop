@@ -4,13 +4,20 @@
 //! ([`crate::ui::draw_tree_view`]) takes the flattened row list this
 //! module produces and feeds it to a `gtui::LiveTable` in
 //! tree-glyph mode.
+//!
+//! As of the Phase 2 refactor the depth / ancestor-continues / last-
+//! sibling computation lives in [`gtui::tree`]. This module supplies
+//! the filesystem-specific [`gtui::tree::Catalog`] impl and a thin
+//! adapter that converts toolkit rows into the [`TreeRow`] shape
+//! `LiveTable` consumes via [`TableRowExt`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use gtui::widgets::live_table::{Cell, TableEntry, TableRowExt};
 use gtui::format_bytes_compact;
+use gtui::tree::{flatten, Catalog};
+use gtui::widgets::live_table::{Cell, TableEntry, TableRowExt};
 
 use crate::fs::entry::{EntryKind, FsEntry};
 use crate::fs::scan::{scan_dir, SortMode};
@@ -60,17 +67,115 @@ fn sort_entries(entries: &mut [FsEntry], col: FbCol, descending: bool) {
     });
 }
 
+/// Filesystem-rooted [`Catalog`] impl. Captures all the per-walk
+/// knobs (sort, filter, hidden-files, expansion set) so
+/// [`Catalog::children`] can sort and filter without arguments.
+struct FsCatalog<'a> {
+    cwd: &'a Path,
+    expanded: &'a HashSet<PathBuf>,
+    sort: FbCol,
+    descending: bool,
+    show_hidden: bool,
+    /// Pre-lowercased filter substring. `None` = no filter.
+    filter: Option<String>,
+}
+
+impl<'a> FsCatalog<'a> {
+    fn new(
+        cwd: &'a Path,
+        expanded: &'a HashSet<PathBuf>,
+        sort: FbCol,
+        descending: bool,
+        show_hidden: bool,
+        filter: Option<&str>,
+    ) -> Self {
+        Self {
+            cwd,
+            expanded,
+            sort,
+            descending,
+            show_hidden,
+            filter: filter.map(|s| s.to_lowercase()),
+        }
+    }
+
+    /// Read `dir`, sort the results, then drop entries that don't
+    /// match the active filter (or that have no matching descendant
+    /// in expanded subtrees). Errors are silently swallowed — the
+    /// surfaced action bar is the user-visible reporting path.
+    fn read_visible(&self, dir: &Path) -> Vec<FsEntry> {
+        let Ok(mut entries) = scan_dir(dir, self.show_hidden, SortMode::Name) else {
+            return Vec::new();
+        };
+        sort_entries(&mut entries, self.sort, self.descending);
+        let visible = self.compute_visible(&entries);
+        entries
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(e, v)| if v { Some(e) } else { None })
+            .collect()
+    }
+
+    /// Visibility mask. With no filter, every entry is visible.
+    /// With a filter, an entry is visible if its name matches OR
+    /// (it's a directory the user has expanded and a direct child
+    /// matches). We don't recursively scan unexpanded subtrees just
+    /// to drive the filter — that'd hammer the FS on big trees.
+    fn compute_visible(&self, entries: &[FsEntry]) -> Vec<bool> {
+        let Some(q) = self.filter.as_deref() else {
+            return vec![true; entries.len()];
+        };
+        entries
+            .iter()
+            .map(|e| {
+                if e.name.to_lowercase().contains(q) {
+                    return true;
+                }
+                if e.is_dir() && self.expanded.contains(&e.path) {
+                    if let Ok(children) = scan_dir(&e.path, self.show_hidden, SortMode::Name) {
+                        return children.iter().any(|c| c.name.to_lowercase().contains(q));
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+}
+
+impl<'a> Catalog for FsCatalog<'a> {
+    type NodeId = PathBuf;
+    type Row = FsEntry;
+
+    fn roots(&self) -> Vec<(Self::NodeId, Self::Row)> {
+        self.read_visible(self.cwd)
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect()
+    }
+
+    fn children(&self, node: &Self::NodeId) -> Vec<(Self::NodeId, Self::Row)> {
+        self.read_visible(node)
+            .into_iter()
+            .map(|e| (e.path.clone(), e))
+            .collect()
+    }
+
+    fn is_expandable(&self, node: &Self::NodeId) -> bool {
+        // Path-only test would force a `metadata` syscall per node.
+        // The roots/children paths already produced FsEntry with the
+        // kind cached, but the trait sees only the NodeId. Re-stat
+        // here — cheap on hot caches and only called by the walker
+        // when deciding whether to descend.
+        node.is_dir()
+    }
+}
+
 /// Walk `cwd` and any expanded subdirectories under it; return a
 /// flattened, sorted list of [`TreeRow`]s ready to feed `LiveTable`.
 ///
 /// `show_hidden`: include dot-files. `filter`: hide entries whose
 /// name doesn't substring-match (case-insensitive); ancestors of
 /// matching descendants stay visible so context isn't lost.
-///
-/// Errors during recursive scans are silently swallowed (an
-/// unreadable directory yields no children rather than aborting the
-/// tree). The user-visible surface is the action bar; tree-render
-/// is best-effort.
 pub fn flatten_tree(
     cwd: &Path,
     expanded: &HashSet<PathBuf>,
@@ -79,109 +184,14 @@ pub fn flatten_tree(
     show_hidden: bool,
     filter: Option<&str>,
 ) -> Vec<TreeRow> {
-    let mut out = Vec::new();
-    walk(
-        cwd,
-        0,
-        &Vec::new(),
-        true,
-        expanded,
-        sort,
-        descending,
-        show_hidden,
-        filter,
-        &mut out,
-    );
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk(
-    dir: &Path,
-    depth: u8,
-    ancestor_continues: &[bool],
-    _root_is_last: bool,
-    expanded: &HashSet<PathBuf>,
-    sort: FbCol,
-    descending: bool,
-    show_hidden: bool,
-    filter: Option<&str>,
-    out: &mut Vec<TreeRow>,
-) {
-    let Ok(mut entries) = scan_dir(dir, show_hidden, SortMode::Name) else { return };
-    sort_entries(&mut entries, sort, descending);
-
-    // Filter pass: when a filter is active, keep entries whose name
-    // matches OR which are directories that contain a match
-    // (transitively). Implementing the second half requires looking
-    // ahead — pre-walk to compute a "has-match" set.
-    let visible = compute_visible(&entries, expanded, dir, sort, descending, show_hidden, filter);
-
-    for (i, entry) in entries.iter().enumerate() {
-        if !visible[i] {
-            continue;
-        }
-        let is_last = visible[(i + 1)..].iter().all(|v| !*v);
-        out.push(TreeRow {
-            entry: entry.clone(),
-            depth,
-            ancestor_continues: ancestor_continues.to_vec(),
-            is_last_sibling: is_last,
-        });
-        if entry.is_dir() && expanded.contains(&entry.path) {
-            let mut next_ancestors = ancestor_continues.to_vec();
-            next_ancestors.push(!is_last);
-            walk(
-                &entry.path,
-                depth + 1,
-                &next_ancestors,
-                is_last,
-                expanded,
-                sort,
-                descending,
-                show_hidden,
-                filter,
-                out,
-            );
-        }
-    }
-}
-
-/// Visibility mask for `entries` under `dir`. With no filter, every
-/// entry is visible. With a filter, an entry is visible if its name
-/// matches OR (it's a directory and has a matching descendant).
-#[allow(clippy::too_many_arguments)]
-fn compute_visible(
-    entries: &[FsEntry],
-    expanded: &HashSet<PathBuf>,
-    dir: &Path,
-    sort: FbCol,
-    descending: bool,
-    show_hidden: bool,
-    filter: Option<&str>,
-) -> Vec<bool> {
-    let Some(q) = filter.map(|s| s.to_lowercase()) else {
-        return vec![true; entries.len()];
-    };
-    let _ = (sort, descending, dir);
-    entries
-        .iter()
-        .map(|e| {
-            if e.name.to_lowercase().contains(&q) {
-                return true;
-            }
-            // For directories that *don't* match by name, peek inside
-            // (only when the user has expanded this branch — we don't
-            // recursively scan everything just to drive a filter
-            // because that'd hammer the FS on big trees).
-            if e.is_dir() && expanded.contains(&e.path) {
-                if let Ok(children) = scan_dir(&e.path, show_hidden, SortMode::Name) {
-                    return children
-                        .iter()
-                        .any(|c| c.name.to_lowercase().contains(&q));
-                }
-            }
-            false
+    let catalog = FsCatalog::new(cwd, expanded, sort, descending, show_hidden, filter);
+    flatten(&catalog, expanded)
+        .into_iter()
+        .map(|tr| TreeRow {
+            entry: tr.row,
+            depth: tr.depth,
+            ancestor_continues: tr.ancestor_continues,
+            is_last_sibling: tr.is_last_sibling,
         })
         .collect()
 }
