@@ -42,6 +42,11 @@ futures = "0.3"
 # Postgres client (used by bobtop-db)
 tokio-postgres = "0.7"
 
+# DuckDB client (used by bobtop-db). `bundled` builds libduckdb from
+# source so we don't depend on a system install — first compile is
+# slow (~2-3 min) but every subsequent build is incremental.
+duckdb = { version = "1.4", features = ["bundled"] }
+
 # System data sources
 sysinfo = "0.32"
 pcap = "2.0"

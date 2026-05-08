@@ -7,6 +7,7 @@
 //! `.await`. Volume per call is bounded by `LIMIT` clauses, so the
 //! latency hit is acceptable for browse-only access.
 
+pub mod duck;
 pub mod mock;
 pub mod pg;
 
@@ -14,7 +15,10 @@ use anyhow::Result;
 
 /// Top-level handle: owns the database list for a single endpoint.
 /// "Endpoint" = a Postgres server, a single DuckDB file, etc.
-pub trait Connection: Send {
+///
+/// Not `Send`: the `duckdb` crate's `Connection` is `!Send` (raw
+/// pointers internally), and the TUI is single-threaded anyway.
+pub trait Connection {
     /// Display label for the endpoint (e.g. "postgres@db.example",
     /// "duckdb:/data/lake.db", "mock").
     fn endpoint_label(&self) -> &str;
@@ -92,14 +96,33 @@ pub struct Row {
 /// - `mock` → built-in demo data
 /// - `postgres://...` → tokio-postgres backend (TODO: not wired yet)
 /// - `duckdb:///path` → duckdb-rs backend (TODO: not wired yet)
-pub fn open(target: &str) -> Result<Box<dyn Connection>> {
+/// DuckLake attach parameters. When `Some`, [`open`] opens the DuckDB
+/// connection and immediately runs `INSTALL ducklake; LOAD ducklake;
+/// ATTACH 'ducklake:postgres:URL' AS <name> (DATA_PATH '...')` so the
+/// lake is browsable as another catalog in the tree.
+#[derive(Debug, Clone)]
+pub struct DuckLakeAttach {
+    pub name: String,
+    pub catalog_pg_url: String,
+    pub data_path: String,
+}
+
+pub fn open(target: &str, ducklake: Option<DuckLakeAttach>) -> Result<Box<dyn Connection>> {
     match target {
         "mock" => Ok(Box::new(mock::MockConnection::demo())),
         s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
+            if ducklake.is_some() {
+                anyhow::bail!("--ducklake-* flags only apply with --connect duckdb://...");
+            }
             Ok(Box::new(pg::PgConnection::open(s)?))
         }
         s if s.starts_with("duckdb://") => {
-            anyhow::bail!("duckdb backend not wired yet — use `--connect mock` for now")
+            let path = s.strip_prefix("duckdb://").unwrap_or("");
+            let mut conn = duck::DuckConnection::open(path)?;
+            if let Some(attach) = ducklake {
+                conn.attach_ducklake(&attach.name, &attach.catalog_pg_url, &attach.data_path)?;
+            }
+            Ok(Box::new(conn))
         }
         other => anyhow::bail!("unrecognized connection target: {other}"),
     }

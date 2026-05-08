@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use bobtop_tui::{load_theme, DEFAULT_THEME_NAME};
 
 use crate::app::App;
-use crate::conn;
+use crate::conn::{self, DuckLakeAttach};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +27,7 @@ pub struct Cli {
     /// Connection target. Examples:
     ///   `postgres://user:pass@host:5432/dbname`
     ///   `duckdb:///path/to/file.db`
+    ///   `duckdb://memory` (in-memory; useful with --ducklake-*)
     ///   `mock` (built-in demo, default)
     #[arg(long, default_value = "mock")]
     pub connect: String,
@@ -34,6 +35,22 @@ pub struct Cli {
     /// Theme name from the bundled bobtop registry.
     #[arg(long, default_value = DEFAULT_THEME_NAME)]
     pub theme: String,
+
+    /// DuckLake catalog Postgres URL. When set together with
+    /// `--ducklake-path`, runs `ATTACH 'ducklake:postgres:URL' AS
+    /// <name> (DATA_PATH '...')` after opening the DuckDB connection.
+    /// Only valid with `--connect duckdb://...`.
+    #[arg(long)]
+    pub ducklake_catalog: Option<String>,
+
+    /// DuckLake DATA_PATH (directory containing the lake's Parquet files).
+    #[arg(long)]
+    pub ducklake_path: Option<String>,
+
+    /// Name to attach the DuckLake under. Shows up as a database in
+    /// the tree pane. Defaults to `lake`.
+    #[arg(long, default_value = "lake")]
+    pub ducklake_name: String,
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
@@ -42,7 +59,18 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Err(e) => e.exit(),
     };
     let theme = load_theme(&cli.theme);
-    let connection = conn::open(&cli.connect)?;
+    let ducklake = match (cli.ducklake_catalog.as_ref(), cli.ducklake_path.as_ref()) {
+        (Some(url), Some(path)) => Some(DuckLakeAttach {
+            name: cli.ducklake_name.clone(),
+            catalog_pg_url: url.clone(),
+            data_path: path.clone(),
+        }),
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!("--ducklake-catalog and --ducklake-path must be set together")
+        }
+        (None, None) => None,
+    };
+    let connection = conn::open(&cli.connect, ducklake)?;
     let mut app = App::new(connection, theme);
 
     let mut stdout = io::stdout();
