@@ -39,6 +39,7 @@ toml = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 libc = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

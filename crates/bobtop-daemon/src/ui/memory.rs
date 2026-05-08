@@ -14,7 +14,7 @@ use super::presenter;
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let title = presenter::memory_panel_title(app);
-    let panel = boxed_panel(app.theme.mem_box, app.theme.title, app.corner_style).with_title(title);
+    let panel = boxed_panel(app.theme.mem_box(), app.theme.title, app.corner_style).with_title(title);
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.height < 3 {
@@ -199,7 +199,7 @@ fn draw_memory_breakdown(
 /// = 7 cells per column × 3 columns = 21 cells, plus 2 leading spaces.
 const PSI_NUMS_W: u16 = 23;
 
-fn draw_psi_header(frame: &mut Frame, area: Rect, theme: &bobtop_tui::Theme) {
+fn draw_psi_header(frame: &mut Frame, area: Rect, theme: &crate::monitor_theme::MonitorTheme) {
     if area.width < PSI_NUMS_W + 8 {
         return;
     }
@@ -227,7 +227,7 @@ fn draw_psi_row(
     pressure: Option<MemoryPressure>,
     history: &VecDeque<f64>,
     gradient: Gradient,
-    theme: &bobtop_tui::Theme,
+    theme: &crate::monitor_theme::MonitorTheme,
 ) {
     if area.width < 12 || area.height == 0 {
         return;

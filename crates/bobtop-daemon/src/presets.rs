@@ -5,7 +5,7 @@
 //! model. Theme is intentionally NOT in here — it's a per-session
 //! choice that survives preset swaps.
 
-use bobtop_tui::widgets::ProcessTableSort as TableSort;
+use crate::widgets::TableSort as TableSort;
 use bobtop_tui::LayoutPreset;
 
 #[derive(Debug, Clone, Copy)]

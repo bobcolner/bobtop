@@ -32,7 +32,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // values still drive the in-graph y-axis scale via
     // `app.net_scale_bps()`, so the trend graph stays comparable
     // across spikes.
-    let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
+    let panel = boxed_panel(app.theme.net_box(), app.theme.title, app.corner_style)
         .with_title(title)
         .with_controls(format!(
             "↑ {}/s   ↓ {}/s",
@@ -332,7 +332,7 @@ const FLOW_HEADERS: [&str; 6] = ["PID", "PROC", "REMOTE", "STATE", "↓/s", "↑
 /// to key on (pid, 5-tuple).
 fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
     let Some(store) = app.attribution.as_ref() else {
-        let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
+        let panel = boxed_panel(app.theme.net_box(), app.theme.title, app.corner_style)
             .with_title("net · flows".to_string());
         frame.render_widget(&panel, area);
         let inner = panel.inner(area);
@@ -372,7 +372,7 @@ fn draw_flows(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!("↑ {}/s   ↓ {}/s", format_rate(tx_total), format_rate(rx_total))
     };
-    let panel = boxed_panel(app.theme.net_box, app.theme.title, app.corner_style)
+    let panel = boxed_panel(app.theme.net_box(), app.theme.title, app.corner_style)
         .with_title(title)
         .with_controls(controls);
     frame.render_widget(&panel, area);
@@ -542,7 +542,7 @@ fn rate_style(grad: &bobtop_tui::Gradient, value: f64, peak: f64) -> Style {
 /// Pick a colour for the STATE cell. ESTABLISHED uses the title accent
 /// (it's the "live" state); LISTEN gets `hi_fg` to flag it as a
 /// distinct mode; everything else dims into `inactive_fg`.
-fn state_color(theme: &bobtop_tui::Theme, state: bobtop_pid_attr::SocketState) -> Style {
+fn state_color(theme: &crate::monitor_theme::MonitorTheme, state: bobtop_pid_attr::SocketState) -> Style {
     use bobtop_pid_attr::SocketState as S;
     let fg = match state {
         S::Established => theme.title,

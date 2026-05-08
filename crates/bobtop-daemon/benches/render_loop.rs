@@ -22,6 +22,7 @@ use bobtop_core::sample::{
 };
 use bobtop_core::MetricEvent;
 use bobtop_daemon::app::App;
+use bobtop_daemon::monitor_theme;
 use bobtop_daemon::ui;
 use bobtop_pid_attr::AttributorTier;
 use bobtop_tui::LayoutPreset;
@@ -30,7 +31,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 fn populated_app() -> App {
-    let theme = bobtop_tui::load_theme("dracula");
+    let theme = monitor_theme::load("dracula");
     let tick = Arc::new(AtomicU64::new(1500));
     let mut app = App::new(theme, LayoutPreset::Full, tick, false, true);
     app.net_tier = AttributorTier::EbpfKernel;

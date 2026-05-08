@@ -6,7 +6,7 @@
 use std::cmp::Ordering;
 
 use bobtop_core::sample::ProcessInfo;
-use bobtop_tui::widgets::ProcessTableSort as TableSort;
+use crate::widgets::TableSort as TableSort;
 
 pub fn sort_processes(rows: &mut [ProcessInfo], sort: TableSort, descending: bool) {
     rows.sort_by(|a, b| {

@@ -15,8 +15,10 @@ use bobtop_core::sample::{
 };
 use bobtop_core::{BoxesEnabled, MetricEvent};
 use bobtop_pid_attr::{AttributorTier, DiskAttributorTier};
-use bobtop_tui::widgets::{CornerStyle, ProcessTableSort as TableSort};
-use bobtop_tui::{LayoutPreset, Theme};
+use bobtop_tui::widgets::CornerStyle;
+use bobtop_tui::LayoutPreset;
+use crate::monitor_theme::MonitorTheme;
+use crate::widgets::TableSort;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::{MAX_TICK_MS, MIN_TICK_MS, TICK_STEP_MS};
@@ -94,7 +96,7 @@ impl Default for NetworkPanelVariant {
 
 #[derive(Debug)]
 pub struct App {
-    pub theme: Theme,
+    pub theme: MonitorTheme,
     pub layout_preset: LayoutPreset,
     /// Per-panel size selection. Drives layout proportions AND the
     /// `boxes` bitmask the collectors read for skip-when-disabled. Pressing
@@ -233,7 +235,7 @@ pub struct App {
 
 impl App {
     pub fn new(
-        theme: Theme,
+        theme: MonitorTheme,
         layout_preset: LayoutPreset,
         tick_ms: Arc<AtomicU64>,
         tty_graphs: bool,
@@ -584,10 +586,10 @@ impl App {
     ///   the 256-palette (btop's algorithm — `bobtop_tui::downsample_256`).
     pub fn apply_color_options(&mut self) {
         if !self.theme_background {
-            self.theme.main_bg = None;
+            self.theme.base.main_bg = None;
         }
         if !self.truecolor {
-            bobtop_tui::downsample_theme_to_256(&mut self.theme);
+            crate::monitor_theme::downsample_to_256(&mut self.theme);
         }
     }
 
@@ -1291,8 +1293,8 @@ mod tests {
 
     use super::*;
 
-    fn theme() -> Theme {
-        Theme::fallback()
+    fn theme() -> MonitorTheme {
+        MonitorTheme::fallback()
     }
 
     fn fake_cpu(util: f32) -> CpuSample {

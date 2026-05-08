@@ -124,7 +124,7 @@ mod tests {
         use std::sync::{atomic::AtomicU64, Arc};
         let s = fake_sample(32);
         let app = super::super::app::App::new(
-            bobtop_tui::Theme::default(),
+            crate::monitor_theme::MonitorTheme::default(),
             bobtop_tui::LayoutPreset::Full,
             Arc::new(AtomicU64::new(500)),
             false,
@@ -163,7 +163,7 @@ mod tests {
         use std::sync::{atomic::AtomicU64, Arc};
         let s = fake_sample(8);
         let app = super::super::app::App::new(
-            bobtop_tui::Theme::default(),
+            crate::monitor_theme::MonitorTheme::default(),
             bobtop_tui::LayoutPreset::Full,
             Arc::new(AtomicU64::new(500)),
             false,

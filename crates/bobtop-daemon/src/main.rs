@@ -11,10 +11,11 @@ use bobtop_core::BoxesEnabled;
 use bobtop_daemon::cli::CornerChoice;
 use bobtop_daemon::config::Config;
 use bobtop_engine::{Engine, EngineConfig};
-use bobtop_tui::{builtin_names, load_theme, LayoutPreset};
+use bobtop_tui::{builtin_names, LayoutPreset};
 
 use bobtop_daemon::app::App;
 use bobtop_daemon::cli::{Cli, LayoutChoice};
+use bobtop_daemon::monitor_theme;
 use bobtop_daemon::tui;
 
 // Synchronous entry point: handles the multi-call dispatches (`agent`,
@@ -85,7 +86,7 @@ async fn daemon_main() -> Result<()> {
     let cfg = Config::load_or_default();
     let eff = resolve(&cli, &matches, &cfg);
 
-    let theme = load_theme(&eff.theme);
+    let theme = monitor_theme::load(&eff.theme);
     tracing::info!(theme = %theme.name, "loaded theme");
 
     let layout_preset = match eff.layout {

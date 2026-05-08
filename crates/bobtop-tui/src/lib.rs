@@ -21,7 +21,7 @@ pub use layout::{
     PanelSizes,
 };
 pub use theme::{
-    builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, Theme,
+    builtin_names, builtin_source, downsample_theme_to_256, load as load_theme, RawTheme, Theme,
     DEFAULT_THEME_NAME,
 };
 pub use text::{
@@ -29,10 +29,8 @@ pub use text::{
     write_str_at, write_str_clipped,
 };
 pub use widgets::{
-    ActionBar, BrailleGraph, BrailleText, BoxedPanel, CornerStyle, DataTable, DualMode,
-    EditableText, GraphStyle, LegendStyle, Meter, MillerColumn, MillerColumns, MiniMeter,
-    ModalShell, ScrollableText, SectionHeader, SelectableList, SettingRow, SettingValue,
-    SettingsForm, Sparkline, StackedBar, StackedSegment, Cell, Column, ProcessTableGroupHeader,
-    ProcessTableRow, ProcessTableRowMeta, ProcessTableSort, Row, RowKind, Table, ToggleRow,
-    Trace,
+    ActionBar, BrailleGraph, BrailleText, BoxedPanel, CornerStyle, DualMode, EditableText,
+    GraphStyle, LegendStyle, Meter, MillerColumn, MillerColumns, MiniMeter, ModalShell,
+    ScrollableText, SectionHeader, SelectableList, SettingRow, SettingValue, SettingsForm,
+    Sparkline, StackedBar, StackedSegment, Cell, Column, Row, RowKind, Table, ToggleRow, Trace,
 };

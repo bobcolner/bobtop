@@ -5,30 +5,35 @@
 //! - Runtime search path: built-in → `~/.config/bobtop/themes/` →
 //!   `~/.config/btop/themes/` (so existing btop users inherit their themes).
 //!
-//! The [`Theme`] struct is a strongly-typed view over the canonical key set.
-//! Missing keys fall through to a sensible fallback so new btop releases that
-//! add keys never break us.
+//! The [`Theme`] struct is the *generic* toolkit theme — visual primitives
+//! every TUI app in the suite needs. Apps that need monitor-specific colors
+//! (CPU/MEM/NET gradients, process-modal slots) layer their own struct on
+//! top — see `bobtop-daemon::monitor_theme::MonitorTheme` for the canonical
+//! example. The `.theme` parser stays generic; per-app overlays read
+//! whatever extra keys they need from the same `RawTheme`.
 
 use std::path::PathBuf;
 
 use ratatui::style::Color;
 
-use crate::color::Gradient;
-
 pub mod builtin;
 pub mod parser;
 
 pub use builtin::{builtin_names, builtin_source, BUILTIN_THEMES, DEFAULT_THEME_NAME};
+pub use parser::RawTheme;
 
-/// Strongly-typed theme. Solid keys are required (filled from a fallback if
-/// missing). Gradient triples are required. Optional keys (`main_bg`,
-/// `proc_misc`, etc.) reflect btop's own optionality — `None` for
-/// `main_bg` means "use the terminal default background."
+/// Generic theme — the visual primitives any TUI app in the suite needs.
+///
+/// `panel_accents` corresponds to btop's `cpu_box` / `mem_box` / `net_box` /
+/// `proc_box` keys (in that order). Apps index whichever they like; the
+/// suite keeps four slots so btop themes round-trip without loss.
+///
+/// `accent_subtle` corresponds to btop's `proc_misc` key. Used for tree
+/// branch glyphs and other subdued accents.
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: String,
 
-    // Solid colors (15 canonical + a few extras observed across themes)
     pub main_bg: Option<Color>,
     pub main_fg: Color,
     pub title: Color,
@@ -38,51 +43,32 @@ pub struct Theme {
     pub inactive_fg: Color,
     pub graph_text: Color,
     pub meter_bg: Color,
-    pub proc_misc: Color,
-    pub cpu_box: Color,
-    pub mem_box: Color,
-    pub net_box: Color,
-    pub proc_box: Color,
     pub div_line: Color,
 
-    // Optional theme-specific solids
-    pub followed_bg: Option<Color>,
-    pub followed_fg: Option<Color>,
-    pub proc_banner_bg: Option<Color>,
-    pub proc_banner_fg: Option<Color>,
-    pub proc_follow_bg: Option<Color>,
-    pub proc_pause_bg: Option<Color>,
+    /// Four panel-accent colors, parsed from btop's `cpu_box` / `mem_box` /
+    /// `net_box` / `proc_box` keys in that order.
+    pub panel_accents: [Color; 4],
 
-    // 9 gradient triples
-    pub cpu: Gradient,
-    pub temp: Gradient,
-    pub used: Gradient,
-    pub available: Gradient,
-    pub cached: Gradient,
-    pub free: Gradient,
-    pub download: Gradient,
-    pub upload: Gradient,
-    pub process: Gradient,
+    /// Subdued accent — tree glyphs, subtle highlights. From btop `proc_misc`.
+    pub accent_subtle: Color,
 }
 
 impl Theme {
-    /// Parse a theme from raw `.theme` source. Missing keys fall back to the
-    /// hardcoded fallback ([`Theme::fallback`]).
+    /// Parse a theme from raw `.theme` source. Missing keys fall back to
+    /// [`Theme::fallback`].
     pub fn from_source(name: impl Into<String>, source: &str) -> Self {
         let raw = parser::parse(source);
         Self::from_raw(name.into(), &raw)
     }
 
-    fn from_raw(name: String, raw: &parser::RawTheme) -> Self {
+    /// Build a `Theme` from an already-parsed `RawTheme`. Useful when an app
+    /// also reads extra keys for its own overlay (e.g. `MonitorTheme`).
+    pub fn from_raw(name: impl Into<String>, raw: &RawTheme) -> Self {
         let fb = Theme::fallback();
 
-        // Solid: required → fallback if absent. We treat `Some(None)` (key
-        // explicitly empty) as "use fallback solid color" since most solid
-        // slots aren't visually meaningful as transparent.
         let solid = |key: &str, default: Color| -> Color {
             raw.get(key).and_then(|v| *v).unwrap_or(default)
         };
-        // Optional: `Some(None)` (empty value) collapses to None alongside missing.
         let opt_solid = |key: &str, default: Option<Color>| -> Option<Color> {
             match raw.get(key) {
                 Some(v) => *v,
@@ -90,15 +76,8 @@ impl Theme {
             }
         };
 
-        let grad = |start: &str, mid: &str, end: &str, default: Gradient| -> Gradient {
-            let s = raw.get(start).and_then(|v| *v).unwrap_or(default.start);
-            let m = raw.get(mid).and_then(|v| *v).unwrap_or(default.mid);
-            let e = raw.get(end).and_then(|v| *v).unwrap_or(default.end);
-            Gradient::new(s, m, e)
-        };
-
         Self {
-            name,
+            name: name.into(),
             main_bg: opt_solid("main_bg", fb.main_bg),
             main_fg: solid("main_fg", fb.main_fg),
             title: solid("title", fb.title),
@@ -108,42 +87,14 @@ impl Theme {
             inactive_fg: solid("inactive_fg", fb.inactive_fg),
             graph_text: solid("graph_text", fb.graph_text),
             meter_bg: solid("meter_bg", fb.meter_bg),
-            proc_misc: solid("proc_misc", fb.proc_misc),
-            cpu_box: solid("cpu_box", fb.cpu_box),
-            mem_box: solid("mem_box", fb.mem_box),
-            net_box: solid("net_box", fb.net_box),
-            proc_box: solid("proc_box", fb.proc_box),
             div_line: solid("div_line", fb.div_line),
-            followed_bg: opt_solid("followed_bg", fb.followed_bg),
-            followed_fg: opt_solid("followed_fg", fb.followed_fg),
-            proc_banner_bg: opt_solid("proc_banner_bg", fb.proc_banner_bg),
-            proc_banner_fg: opt_solid("proc_banner_fg", fb.proc_banner_fg),
-            proc_follow_bg: opt_solid("proc_follow_bg", fb.proc_follow_bg),
-            proc_pause_bg: opt_solid("proc_pause_bg", fb.proc_pause_bg),
-            cpu: grad("cpu_start", "cpu_mid", "cpu_end", fb.cpu),
-            temp: grad("temp_start", "temp_mid", "temp_end", fb.temp),
-            used: grad("used_start", "used_mid", "used_end", fb.used),
-            available: grad(
-                "available_start",
-                "available_mid",
-                "available_end",
-                fb.available,
-            ),
-            cached: grad("cached_start", "cached_mid", "cached_end", fb.cached),
-            free: grad("free_start", "free_mid", "free_end", fb.free),
-            download: grad(
-                "download_start",
-                "download_mid",
-                "download_end",
-                fb.download,
-            ),
-            upload: grad("upload_start", "upload_mid", "upload_end", fb.upload),
-            process: grad(
-                "process_start",
-                "process_mid",
-                "process_end",
-                fb.process,
-            ),
+            panel_accents: [
+                solid("cpu_box", fb.panel_accents[0]),
+                solid("mem_box", fb.panel_accents[1]),
+                solid("net_box", fb.panel_accents[2]),
+                solid("proc_box", fb.panel_accents[3]),
+            ],
+            accent_subtle: solid("proc_misc", fb.accent_subtle),
         }
     }
 
@@ -151,8 +102,6 @@ impl Theme {
     /// when the user hasn't selected a theme and as the source of fallback
     /// values for individual missing keys.
     pub fn fallback() -> Self {
-        // Values cribbed from themes/dracula.theme so the fallback is a
-        // visually complete theme even if every other lookup misses.
         let rgb = |r: u8, g: u8, b: u8| Color::Rgb(r, g, b);
         Self {
             name: "fallback".into(),
@@ -165,27 +114,14 @@ impl Theme {
             inactive_fg: rgb(0x44, 0x47, 0x5a),
             graph_text: rgb(0xf8, 0xf8, 0xf2),
             meter_bg: rgb(0x44, 0x47, 0x5a),
-            proc_misc: rgb(0xbd, 0x93, 0xf9),
-            cpu_box: rgb(0x50, 0xfa, 0x7b),
-            mem_box: rgb(0xf1, 0xfa, 0x8c),
-            net_box: rgb(0xbd, 0x93, 0xf9),
-            proc_box: rgb(0xff, 0x55, 0x55),
             div_line: rgb(0x44, 0x47, 0x5a),
-            followed_bg: None,
-            followed_fg: None,
-            proc_banner_bg: None,
-            proc_banner_fg: None,
-            proc_follow_bg: None,
-            proc_pause_bg: None,
-            cpu: Gradient::new(rgb(0x50, 0xfa, 0x7b), rgb(0xf1, 0xfa, 0x8c), rgb(0xff, 0x55, 0x55)),
-            temp: Gradient::new(rgb(0x8b, 0xe9, 0xfd), rgb(0xff, 0xb8, 0x6c), rgb(0xff, 0x55, 0x55)),
-            used: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0xff, 0xb8, 0x6c), rgb(0xff, 0x55, 0x55)),
-            available: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0xf1, 0xfa, 0x8c), rgb(0x50, 0xfa, 0x7b)),
-            cached: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0x8b, 0xe9, 0xfd), rgb(0xbd, 0x93, 0xf9)),
-            free: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0x8b, 0xe9, 0xfd), rgb(0x50, 0xfa, 0x7b)),
-            download: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0xbd, 0x93, 0xf9), rgb(0xff, 0x79, 0xc6)),
-            upload: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0xff, 0x79, 0xc6), rgb(0xff, 0xb8, 0x6c)),
-            process: Gradient::new(rgb(0x44, 0x47, 0x5a), rgb(0xf1, 0xfa, 0x8c), rgb(0x50, 0xfa, 0x7b)),
+            panel_accents: [
+                rgb(0x50, 0xfa, 0x7b), // cpu_box
+                rgb(0xf1, 0xfa, 0x8c), // mem_box
+                rgb(0xbd, 0x93, 0xf9), // net_box
+                rgb(0xff, 0x55, 0x55), // proc_box
+            ],
+            accent_subtle: rgb(0xbd, 0x93, 0xf9),
         }
     }
 }
@@ -203,9 +139,6 @@ impl Default for Theme {
 /// hit the hot path.
 pub fn downsample_theme_to_256(theme: &mut Theme) {
     let conv = crate::color::truecolor_to_256;
-    let conv_grad = |g: Gradient| -> Gradient {
-        Gradient::new(conv(g.start), conv(g.mid), conv(g.end))
-    };
     if let Some(bg) = theme.main_bg {
         theme.main_bg = Some(conv(bg));
     }
@@ -217,27 +150,11 @@ pub fn downsample_theme_to_256(theme: &mut Theme) {
     theme.inactive_fg = conv(theme.inactive_fg);
     theme.graph_text = conv(theme.graph_text);
     theme.meter_bg = conv(theme.meter_bg);
-    theme.proc_misc = conv(theme.proc_misc);
-    theme.cpu_box = conv(theme.cpu_box);
-    theme.mem_box = conv(theme.mem_box);
-    theme.net_box = conv(theme.net_box);
-    theme.proc_box = conv(theme.proc_box);
     theme.div_line = conv(theme.div_line);
-    if let Some(c) = theme.followed_bg { theme.followed_bg = Some(conv(c)); }
-    if let Some(c) = theme.followed_fg { theme.followed_fg = Some(conv(c)); }
-    if let Some(c) = theme.proc_banner_bg { theme.proc_banner_bg = Some(conv(c)); }
-    if let Some(c) = theme.proc_banner_fg { theme.proc_banner_fg = Some(conv(c)); }
-    if let Some(c) = theme.proc_follow_bg { theme.proc_follow_bg = Some(conv(c)); }
-    if let Some(c) = theme.proc_pause_bg { theme.proc_pause_bg = Some(conv(c)); }
-    theme.cpu = conv_grad(theme.cpu);
-    theme.temp = conv_grad(theme.temp);
-    theme.used = conv_grad(theme.used);
-    theme.available = conv_grad(theme.available);
-    theme.cached = conv_grad(theme.cached);
-    theme.free = conv_grad(theme.free);
-    theme.download = conv_grad(theme.download);
-    theme.upload = conv_grad(theme.upload);
-    theme.process = conv_grad(theme.process);
+    for accent in &mut theme.panel_accents {
+        *accent = conv(*accent);
+    }
+    theme.accent_subtle = conv(theme.accent_subtle);
 }
 
 /// Locate a theme by name. Search order: built-in → `~/.config/bobtop/themes/`
@@ -255,10 +172,6 @@ pub fn find_source(name: &str) -> Option<(String, String)> {
                 // Expected — try the next search dir without noise.
             }
             Err(e) => {
-                // Permission denied / broken symlink / IO error on a file
-                // that exists. The user expected this theme to load and
-                // it didn't — surface the reason rather than silently
-                // falling back to built-in.
                 tracing::warn!(
                     theme = name,
                     path = %path.display(),
@@ -305,30 +218,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_has_complete_gradients() {
-        let t = Theme::fallback();
-        // No way to assert gradient validity directly, but at least confirm
-        // sample() doesn't panic across the range.
-        for i in 0..=10 {
-            let _ = t.cpu.sample(i as f32 / 10.0);
-            let _ = t.used.sample(i as f32 / 10.0);
-        }
-    }
-
-    #[test]
     fn from_source_uses_known_keys() {
-        // Use `r##"..."##` because content contains `"#` (closing-quote +
-        // hex prefix) which would otherwise terminate `r#"..."#`.
         let src = r##"
 theme[main_bg]="#000000"
-theme[cpu_start]="#101010"
-theme[cpu_mid]="#808080"
-theme[cpu_end]="#ffffff"
+theme[cpu_box]="#abcdef"
+theme[proc_misc]="#112233"
 "##;
         let t = Theme::from_source("test", src);
         assert_eq!(t.main_bg, Some(Color::Rgb(0, 0, 0)));
-        assert_eq!(t.cpu.start, Color::Rgb(0x10, 0x10, 0x10));
-        assert_eq!(t.cpu.end, Color::Rgb(0xff, 0xff, 0xff));
+        assert_eq!(t.panel_accents[0], Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(t.accent_subtle, Color::Rgb(0x11, 0x22, 0x33));
     }
 
     #[test]
@@ -336,7 +235,8 @@ theme[cpu_end]="#ffffff"
         let t = Theme::from_source("sparse", "");
         let fb = Theme::fallback();
         assert_eq!(t.main_fg, fb.main_fg);
-        assert_eq!(t.cpu_box, fb.cpu_box);
+        assert_eq!(t.panel_accents, fb.panel_accents);
+        assert_eq!(t.accent_subtle, fb.accent_subtle);
     }
 
     #[test]
@@ -351,8 +251,7 @@ theme[cpu_end]="#ffffff"
             let src = builtin_source(name).expect("builtin lookup");
             let t = Theme::from_source(name, src);
             assert_eq!(t.name, name);
-            // Spot-check at least one gradient endpoint resolved to RGB.
-            assert!(matches!(t.cpu.start, Color::Rgb(..)));
+            assert!(matches!(t.panel_accents[0], Color::Rgb(..)));
         }
     }
 

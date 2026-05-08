@@ -118,7 +118,7 @@ fn draw_input_modal(modal: &InputModal, frame: &mut Frame<'_>, theme: &Theme, ar
             "y delete  •  any other key cancel",
         ),
     };
-    let panel = BoxedPanel::new(theme.proc_box, theme.title)
+    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
         .with_title(title.to_string())
         .with_controls(controls.to_string())
         .flat();
@@ -166,7 +166,7 @@ fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         return;
     }
     let title = app.cwd_display();
-    let bcol = border_color(theme, app.focus() == Focus::List, theme.proc_box);
+    let bcol = border_color(theme, app.focus() == Focus::List, theme.panel_accents[3]);
     // Right-side status pill: while typing the filter, echo the input
     // with a trailing cursor mark. Otherwise show the applied filter
     // (if any) followed by the visible item count so the user can
@@ -200,7 +200,7 @@ fn draw_finder_pane(
     theme: &Theme,
     area: Rect,
 ) {
-    let bcol = border_color(theme, app.focus() == Focus::List, theme.proc_box);
+    let bcol = border_color(theme, app.focus() == Focus::List, theme.panel_accents[3]);
     let panel = BoxedPanel::new(bcol, theme.title)
         .with_title(format!("🔍 find: {}▏", finder.input))
         .with_controls(format!("{} results", finder.results.len()));
@@ -322,7 +322,7 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
     // Match the list pane's focused accent (proc_box) so the two
     // panes read at equal brightness — the preview's prior `hi_fg`
     // was dimmer on most themes and made the focus state ambiguous.
-    let bcol = border_color(theme, app.focus() == Focus::Preview, theme.proc_box);
+    let bcol = border_color(theme, app.focus() == Focus::Preview, theme.panel_accents[3]);
     let panel = BoxedPanel::new(bcol, theme.title)
         .with_title(preview_title)
         .with_controls(controls);
@@ -391,7 +391,7 @@ fn render_preview_body(
 /// rect for a much higher-resolution view.
 fn draw_editor_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     let Some(editor) = app.editor() else { return };
-    let bcol = theme.proc_box; // editor always has focus implicitly
+    let bcol = theme.panel_accents[3]; // editor always has focus implicitly
     let dirty_mark = if editor.dirty { " ●" } else { "" };
     let title = format!("✎ {}{}", editor.name(), dirty_mark);
     let controls = format!(
@@ -431,7 +431,7 @@ fn draw_editor_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
         editor.cursor.0 + 1,
         editor.cursor.1 + 1
     );
-    let panel = BoxedPanel::new(theme.proc_box, theme.title)
+    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
         .with_title(title)
         .with_controls(controls)
         .flat();
@@ -454,7 +454,7 @@ fn draw_preview_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rec
         .selected()
         .map(|e| e.name.clone())
         .unwrap_or_else(|| "preview".to_string());
-    let panel = BoxedPanel::new(theme.proc_box, theme.title)
+    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
         .with_title(title)
         .with_controls("j/k scroll  •  Space/Esc close")
         .flat();

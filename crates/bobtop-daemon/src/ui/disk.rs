@@ -14,7 +14,7 @@ use super::presenter;
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let title = presenter::disk_panel_title(app);
-    let panel = boxed_panel(app.theme.mem_box, app.theme.title, app.corner_style).with_title(title);
+    let panel = boxed_panel(app.theme.mem_box(), app.theme.title, app.corner_style).with_title(title);
     frame.render_widget(&panel, area);
     let inner = panel.inner(area);
     if inner.width < 8 || inner.height < 2 {
@@ -142,7 +142,7 @@ fn draw_swap_row(buf: &mut Buffer, area: Rect, app: &App) {
     m.render(area, buf);
 }
 
-fn build_disk_meter_used_only(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {
+fn build_disk_meter_used_only(fs: &FilesystemSample, theme: &crate::monitor_theme::MonitorTheme) -> Meter {
     let frac = if fs.total_bytes > 0 {
         fs.used_bytes as f64 / fs.total_bytes as f64
     } else {
@@ -160,7 +160,7 @@ fn build_disk_meter_used_only(fs: &FilesystemSample, theme: &bobtop_tui::Theme) 
         .with_text_colors(theme.main_fg, theme.title)
 }
 
-fn build_disk_meter(fs: &FilesystemSample, theme: &bobtop_tui::Theme) -> Meter {
+fn build_disk_meter(fs: &FilesystemSample, theme: &crate::monitor_theme::MonitorTheme) -> Meter {
     let frac = if fs.total_bytes > 0 {
         fs.used_bytes as f64 / fs.total_bytes as f64
     } else {

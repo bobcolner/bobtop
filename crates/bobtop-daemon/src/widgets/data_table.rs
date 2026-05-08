@@ -8,13 +8,14 @@
 //! `scroll_offset` so this widget stays render-only.
 
 use bobtop_core::sample::ProcessInfo;
+use bobtop_tui::text;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthChar;
 
-use crate::Theme;
+use crate::monitor_theme::MonitorTheme;
 
 /// One row the renderer paints. Headers carry aggregates (group total
 /// CPU/MEM/etc); processes carry their own info plus depth/branch info
@@ -201,7 +202,7 @@ pub struct DataTable<'a> {
     pub rows: &'a [TableRow],
     pub selected: Option<usize>,
     pub scroll_offset: usize,
-    pub theme: &'a Theme,
+    pub theme: &'a MonitorTheme,
     pub show_net_columns: bool,
     pub sort: TableSort,
     pub sort_descending: bool,
@@ -211,7 +212,7 @@ pub struct DataTable<'a> {
 }
 
 impl<'a> DataTable<'a> {
-    pub fn new(rows: &'a [TableRow], theme: &'a Theme) -> Self {
+    pub fn new(rows: &'a [TableRow], theme: &'a MonitorTheme) -> Self {
         Self {
             rows,
             selected: None,
@@ -485,7 +486,7 @@ impl<'a> DataTable<'a> {
                 }
                 buf[(x, y)].set_style(
                     Style::default()
-                        .fg(lerp_color(self.theme.proc_misc, self.theme.inactive_fg, fade_t)),
+                        .fg(lerp_color(self.theme.accent_subtle, self.theme.inactive_fg, fade_t)),
                 );
                 x = x.saturating_add(1);
             }
@@ -651,7 +652,7 @@ where
             break;
         }
         let (text, style, right_align) = cell_fn(i);
-        let len = crate::text::display_width(&text) as u16;
+        let len = text::display_width(&text) as u16;
         let (text_x, text) = if right_align && len < avail {
             (cursor + (avail - len), text)
         } else if len > avail {
@@ -763,7 +764,7 @@ mod tests {
 
     #[test]
     fn header_renders_at_first_row() {
-        let theme = Theme::fallback();
+        let theme = MonitorTheme::fallback();
         let rows = flat_rows(vec![proc(1, "init", 0.01, 5)]);
         let table = DataTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 4);
@@ -780,7 +781,7 @@ mod tests {
 
     #[test]
     fn data_row_shows_pid_name_cpu() {
-        let theme = Theme::fallback();
+        let theme = MonitorTheme::fallback();
         let rows = flat_rows(vec![proc(12345, "cargo", 0.42, 256)]);
         let table = DataTable::new(&rows, &theme);
         let area = Rect::new(0, 0, 80, 3);
@@ -794,7 +795,7 @@ mod tests {
 
     #[test]
     fn selected_row_gets_background_fill() {
-        let theme = Theme::fallback();
+        let theme = MonitorTheme::fallback();
         let rows = flat_rows(vec![proc(1, "a", 0.1, 1), proc(2, "b", 0.1, 1)]);
         let table = DataTable::new(&rows, &theme).with_selection(Some(1), 0);
         let area = Rect::new(0, 0, 80, 4);
@@ -810,7 +811,7 @@ mod tests {
 
     #[test]
     fn net_columns_appear_when_enabled() {
-        let theme = Theme::fallback();
+        let theme = MonitorTheme::fallback();
         let mut p = proc(1, "x", 0.0, 0);
         p.net_rx_bytes_per_sec = Some(2048.0);
         p.net_tx_bytes_per_sec = Some(512.0);

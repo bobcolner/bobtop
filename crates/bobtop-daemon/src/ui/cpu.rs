@@ -19,7 +19,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .map(|s| s.aggregate_utilization * 100.0)
         .unwrap_or(0.0);
     let title = presenter::cpu_panel_title(app);
-    let panel = boxed_panel(app.theme.cpu_box, app.theme.title, app.corner_style)
+    let panel = boxed_panel(app.theme.cpu_box(), app.theme.title, app.corner_style)
         .with_title(title)
         .with_center_title(presenter::cpu_clock_label(app.tick_ms()))
         .with_controls(format!("- {}ms +", app.tick_ms()));

@@ -45,7 +45,7 @@ pub struct ThemePreview {
 
 impl ThemePreview {
     pub fn apply_to(&self, app: &mut App) {
-        app.theme = bobtop_tui::load_theme(&self.theme);
+        app.theme = crate::monitor_theme::load(&self.theme);
         app.theme_background = self.theme_background;
         app.truecolor = self.truecolor;
         app.apply_color_options();
@@ -68,7 +68,7 @@ pub struct OptionsCommit {
 
 impl OptionsCommit {
     pub fn apply_to(&self, app: &mut App) {
-        app.theme = bobtop_tui::load_theme(&self.theme);
+        app.theme = crate::monitor_theme::load(&self.theme);
         app.theme_background = self.theme_background;
         app.truecolor = self.truecolor;
         app.apply_color_options();

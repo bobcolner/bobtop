@@ -1,6 +1,6 @@
 use bobtop_tui::widgets::panel as boxed_panel;
 use bobtop_tui::widgets::{Cell as GridCell, Column as GridColumn, Row as GridRow, Table};
-use bobtop_tui::widgets::ProcessTableSort as TableSort;
+use crate::widgets::TableSort as TableSort;
 use bobtop_tui::write_str_at;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -12,7 +12,7 @@ use super::presenter;
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let title = presenter::process_title(app);
-        let panel = boxed_panel(app.theme.proc_box, app.theme.title, app.corner_style)
+        let panel = boxed_panel(app.theme.proc_box(), app.theme.title, app.corner_style)
         .with_title(title)
         .with_keybinds(
             "q quit  ↑↓ select  ←→ sort  r rev  s sticky  f filter  g group  Space [/] expand  k/K kill  Enter  ?",
@@ -37,11 +37,11 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let rows = app.display_rows();
     let scroll_offset = selection_scroll_offset(app.selected_proc, rows.len(), body_h);
     let layout = match app.group_mode {
-        crate::group::GroupMode::Flat => bobtop_tui::widgets::TableLayout::Flat,
+        crate::group::GroupMode::Flat => crate::widgets::TableLayout::Flat,
         crate::group::GroupMode::ByExecutable
         | crate::group::GroupMode::ByCgroup
-        | crate::group::GroupMode::ByContainer => bobtop_tui::widgets::TableLayout::Grouped,
-        crate::group::GroupMode::ByParent => bobtop_tui::widgets::TableLayout::Tree,
+        | crate::group::GroupMode::ByContainer => crate::widgets::TableLayout::Grouped,
+        crate::group::GroupMode::ByParent => crate::widgets::TableLayout::Tree,
     };
     let (columns, grid_rows, sort_col) = build_table_model(app, &rows, layout);
     let table = Table::new(&columns, &grid_rows, &app.theme)
@@ -76,7 +76,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
 fn build_table_model(
     app: &App,
     rows: &[crate::group::TableRow],
-    layout: bobtop_tui::widgets::TableLayout,
+    layout: crate::widgets::TableLayout,
 ) -> (Vec<GridColumn<'static>>, Vec<GridRow<'static>>, Option<usize>) {
     // Drop RX/s and TX/s when the active net tier doesn't expose per-pid
     // bandwidth (proc_inode shows only connections). Cleaner than
@@ -149,7 +149,7 @@ fn compute_metric_scales(rows: &[crate::group::TableRow]) -> MetricScales {
 }
 
 fn build_columns(
-    layout: bobtop_tui::widgets::TableLayout,
+    layout: crate::widgets::TableLayout,
     show_net: bool,
 ) -> Vec<GridColumn<'static>> {
     let mut cols = Vec::with_capacity(11);
@@ -177,7 +177,7 @@ fn build_columns(
 
 fn sort_column_index(
     app: &App,
-    layout: bobtop_tui::widgets::TableLayout,
+    layout: crate::widgets::TableLayout,
     columns: &[GridColumn<'static>],
 ) -> Option<usize> {
     let title = match app.proc_sort {
@@ -252,7 +252,7 @@ fn build_header_row(
 fn build_process_row(
     app: &App,
     meta: &crate::group::TableRowMeta,
-    layout: bobtop_tui::widgets::TableLayout,
+    layout: crate::widgets::TableLayout,
     columns: &[GridColumn<'static>],
     scales: &MetricScales,
 ) -> GridRow<'static> {
@@ -274,7 +274,7 @@ fn build_process_row(
     }
     if let Some(i) = pos("Program") {
         let prog_style = if layout.draws_tree_glyphs() {
-            Style::default().fg(app.theme.proc_misc)
+            Style::default().fg(app.theme.accent_subtle)
         } else {
             base_style
         };
@@ -350,7 +350,7 @@ fn build_process_row(
 /// uid is the same color across sessions); root is highlighted
 /// with the theme's `hi_fg` so it stands out as a privileged
 /// owner. `—` (mixed-user group) renders dim.
-fn user_color(user: &str, theme: &bobtop_tui::Theme) -> ratatui::style::Color {
+fn user_color(user: &str, theme: &crate::monitor_theme::MonitorTheme) -> ratatui::style::Color {
     if user == "—" || user.is_empty() {
         return theme.inactive_fg;
     }
@@ -368,11 +368,11 @@ fn user_color(user: &str, theme: &bobtop_tui::Theme) -> ratatui::style::Color {
     theme.process.sample(slot)
 }
 
-fn cpu_style(fraction: f32, theme: &bobtop_tui::Theme) -> Style {
+fn cpu_style(fraction: f32, theme: &crate::monitor_theme::MonitorTheme) -> Style {
     Style::default().fg(theme.cpu.sample(fraction.clamp(0.0, 1.0)))
 }
 
-fn mem_style(bytes: u64, theme: &bobtop_tui::Theme) -> Style {
+fn mem_style(bytes: u64, theme: &crate::monitor_theme::MonitorTheme) -> Style {
     // 32 GiB reference matches the original code — proxy for "this
     // process is using a meaningful slice of system memory."
     let r = if bytes == 0 {
@@ -384,7 +384,7 @@ fn mem_style(bytes: u64, theme: &bobtop_tui::Theme) -> Style {
     Style::default().fg(theme.used.sample(r))
 }
 
-fn threads_style(n: u32, max: u32, theme: &bobtop_tui::Theme) -> Style {
+fn threads_style(n: u32, max: u32, theme: &crate::monitor_theme::MonitorTheme) -> Style {
     if max == 0 {
         return Style::default().fg(theme.inactive_fg);
     }
@@ -402,7 +402,7 @@ fn rate_style(
     value: Option<f64>,
     max: f64,
     gradient: bobtop_tui::color::Gradient,
-    theme: &bobtop_tui::Theme,
+    theme: &crate::monitor_theme::MonitorTheme,
 ) -> Style {
     match value {
         None => Style::default().fg(theme.inactive_fg),

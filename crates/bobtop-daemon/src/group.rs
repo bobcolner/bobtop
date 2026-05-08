@@ -26,12 +26,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bobtop_core::sample::ProcessInfo;
-pub use bobtop_tui::widgets::{
-    ProcessTableGroupHeader as TableGroupHeader,
-    ProcessTableRow as TableRow,
-    ProcessTableRowMeta as TableRowMeta,
-};
-use bobtop_tui::widgets::ProcessTableSort as TableSort;
+pub use crate::widgets::{TableGroupHeader, TableRow, TableRowMeta};
+use crate::widgets::TableSort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupMode {
