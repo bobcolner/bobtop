@@ -13,6 +13,7 @@ pub mod layout;
 pub mod prelude;
 pub mod theme;
 pub mod text;
+pub mod util;
 pub mod widgets;
 
 pub use color::{dim, lerp_color, parse_btop_color, Gradient};
@@ -25,9 +26,10 @@ pub use theme::{
     DEFAULT_THEME_NAME,
 };
 pub use text::{
-    bool_label, display_width, format_bytes, format_bytes_compact, format_rate, truncate_chars,
-    write_str_at, write_str_clipped,
+    bool_label, display_width, format_bytes, format_bytes_compact, format_rate, sanitize_for_display,
+    truncate_chars, write_str_at, write_str_clipped,
 };
+pub use util::{middle_anchor_scroll, Nav};
 pub use widgets::{
     ActionBar, BrailleGraph, BrailleText, BoxedPanel, ColumnDef, CornerStyle, DualMode,
     EditableText, GraphStyle, GroupAggregate, LegendStyle, LiveTable, Meter, MillerColumn,

@@ -1,3 +1,4 @@
+use bobtop_tui::middle_anchor_scroll;
 use bobtop_tui::widgets::panel as boxed_panel;
 use bobtop_tui::write_str_at;
 use ratatui::layout::Rect;
@@ -32,7 +33,7 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
     let body_h = table_area.height.saturating_sub(1) as usize;
     let rows = app.display_rows();
-    let scroll_offset = selection_scroll_offset(app.selected_proc, rows.len(), body_h);
+    let scroll_offset = middle_anchor_scroll(app.selected_proc, rows.len(), body_h);
     let layout = match app.group_mode {
         crate::group::GroupMode::Flat => TableLayout::Flat,
         crate::group::GroupMode::ByExecutable
@@ -79,32 +80,3 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Anchor selection roughly in the middle of the visible viewport, but
-/// clamp at the top (no negative scroll) and bottom (so we don't scroll
-/// past the last row that fits).
-fn selection_scroll_offset(selected: usize, total_rows: usize, body_h: usize) -> usize {
-    if body_h == 0 || total_rows == 0 {
-        return 0;
-    }
-    let max_scroll = total_rows.saturating_sub(body_h);
-    let anchor = body_h / 2;
-    selected.saturating_sub(anchor).min(max_scroll)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::selection_scroll_offset;
-
-    #[test]
-    fn selection_keeps_one_row_buffer_at_bottom() {
-        assert_eq!(selection_scroll_offset(9, 10, 5), 5);
-        assert_eq!(selection_scroll_offset(8, 10, 5), 5);
-        assert_eq!(selection_scroll_offset(3, 10, 5), 1);
-    }
-
-    #[test]
-    fn tiny_viewports_do_not_over_scroll() {
-        assert_eq!(selection_scroll_offset(4, 10, 1), 4);
-        assert_eq!(selection_scroll_offset(4, 10, 2), 3);
-    }
-}

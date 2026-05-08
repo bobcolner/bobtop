@@ -22,7 +22,7 @@ use tokio::runtime::Runtime;
 use crate::fs::entry::FsEntry;
 use crate::fs::scan::{scan_dir, SortMode};
 use crate::keys::{map as map_key, Action};
-use crate::nav::Nav;
+use bobtop_tui::Nav;
 use crate::preview::{
     self,
     cache::PreviewCache,

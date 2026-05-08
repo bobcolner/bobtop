@@ -54,6 +54,34 @@ pub fn bool_label(b: bool) -> String {
     if b { "yes".into() } else { "no".into() }
 }
 
+/// Replace tabs with a single space and drop other ASCII control bytes,
+/// then collapse runs of whitespace. Use for any string that comes from
+/// outside (process `/proc` files, log lines, query results, error
+/// traces) before writing it into a terminal cell — `Cell::set_char('\t')`
+/// produces unpredictable cursor jumps, and other C0/DEL bytes can
+/// corrupt the buffer. Non-ASCII (UTF-8) survives intact.
+pub fn sanitize_for_display<S: AsRef<str>>(s: S) -> String {
+    let mut out = String::with_capacity(s.as_ref().len());
+    let mut prev_was_space = false;
+    for ch in s.as_ref().chars() {
+        let ch = match ch {
+            '\t' => ' ',
+            c if c.is_control() => continue,
+            c => c,
+        };
+        if ch == ' ' {
+            if prev_was_space {
+                continue;
+            }
+            prev_was_space = true;
+        } else {
+            prev_was_space = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub fn format_bytes(b: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
