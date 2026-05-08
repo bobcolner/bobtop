@@ -193,8 +193,11 @@ pub struct App {
     pub processes_sorted: Vec<ProcessInfo>,
 
     pub selected_proc: usize,
-    /// Stable identity for the selected process row.
-    selected_proc_pid: Option<u32>,
+    /// Stable identity for the selected process row. Surfaced to
+    /// `ui/processes.rs` so it can drive `LiveTable::sticky_key` —
+    /// the widget then resolves to the right visual row even if
+    /// `selected_proc` is briefly stale after a re-sort.
+    pub selected_proc_pid: Option<u32>,
     /// Keep the highlighted process attached to the same pid as it moves.
     pub sticky_proc_selection: bool,
 

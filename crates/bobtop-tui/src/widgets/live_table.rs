@@ -104,6 +104,25 @@ pub trait TableRowExt<Cid> {
     fn is_last_sibling(&self) -> bool {
         false
     }
+
+    /// Stable identity used for sticky selection. The daemon uses
+    /// pids; a stock blotter would use ticker-as-hash. Default `None`
+    /// disables sticky behaviour — apps opt in by overriding.
+    ///
+    /// Apps with non-numeric keys hash to `u64` (pick any reasonable
+    /// hasher — keys only need to be stable across renders, not
+    /// cryptographically distinct).
+    fn key(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the user-visible content of this row matches `q` for
+    /// filter purposes. App-owned policy (which fields to search,
+    /// case sensitivity, fuzzy vs substring). Default true so
+    /// filter-unaware row types are unaffected by [`LiveTable::filter`].
+    fn matches_filter(&self, _q: &str) -> bool {
+        true
+    }
 }
 
 /// Group-header contract. Provides a label (rendered with a chevron in
@@ -153,6 +172,18 @@ pub struct LiveTable<'a, R, G, Cid: Copy + PartialEq> {
     /// toward `inactive_fg` (btop's depth cue). Off preserves exact
     /// per-cell colors — useful for apps that want a flat list look.
     pub fade: bool,
+    /// When set, items whose `TableRowExt::matches_filter(q)` returns
+    /// false are hidden. Headers always render — group aggregates stay
+    /// app-policy (the daemon recomputes them for the filtered set;
+    /// a blotter might leave them aggregating the full sector).
+    pub filter: Option<&'a str>,
+    /// Sticky-selection by row identity. When `Some(key)`, the widget
+    /// scans visible items for a row whose `TableRowExt::key()` matches
+    /// and uses that index as the effective selection — overriding
+    /// `selected`. Survives sort changes, filter toggles, and
+    /// upstream re-orderings without the app having to remap indices.
+    /// Falls back to `selected` if no row matches.
+    pub sticky_key: Option<u64>,
 }
 
 impl<'a, R, G, Cid> LiveTable<'a, R, G, Cid>
@@ -173,6 +204,8 @@ where
             label_column,
             draws_tree_glyphs: false,
             fade: true,
+            filter: None,
+            sticky_key: None,
         }
     }
 
@@ -195,6 +228,18 @@ where
 
     pub fn with_fade(mut self, on: bool) -> Self {
         self.fade = on;
+        self
+    }
+
+    pub fn with_filter(mut self, q: Option<&'a str>) -> Self {
+        // An empty query is treated as "no filter" so apps don't have
+        // to special-case the case where the user hasn't typed yet.
+        self.filter = q.filter(|s| !s.is_empty());
+        self
+    }
+
+    pub fn with_sticky_key(mut self, key: Option<u64>) -> Self {
+        self.sticky_key = key;
         self
     }
 }
@@ -240,16 +285,40 @@ where
             .position(|c| c.id == self.label_column)
             .expect("label_column must reference a column in columns");
 
-        for (i, (row_idx, entry)) in self
+        // Resolve the visible-row list once — applies filter (Items
+        // whose `matches_filter` is false drop out; Headers stay so
+        // group structure remains visible).
+        let visible: Vec<(usize, &TableEntry<R, G>)> = self
             .rows
             .iter()
             .enumerate()
+            .filter(|(_, e)| match (e, self.filter) {
+                (TableEntry::Item(r), Some(q)) => r.matches_filter(q),
+                _ => true,
+            })
+            .collect();
+
+        // Sticky selection: walk visible items for a key match. Wins
+        // over `selected` when found; falls back otherwise so apps
+        // can pass both fields without coordinating.
+        let effective_selected: Option<usize> = self
+            .sticky_key
+            .and_then(|k| {
+                visible.iter().find_map(|(orig_idx, e)| match e {
+                    TableEntry::Item(r) if r.key() == Some(k) => Some(*orig_idx),
+                    _ => None,
+                })
+            })
+            .or(self.selected);
+
+        for (i, (row_idx, entry)) in visible
+            .iter()
             .skip(self.scroll_offset)
             .take(body_h)
             .enumerate()
         {
             let y = body_top + i as u16;
-            let is_selected = self.selected == Some(row_idx);
+            let is_selected = effective_selected == Some(*row_idx);
             let fade_t = if self.fade {
                 (i as f32 / max_visible as f32) * FADE_END
             } else {
@@ -506,6 +575,40 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Cycle to the next or previous sortable column. `direction = 1`
+/// advances; `-1` goes back. Wraps at the ends. Returns `None` when
+/// `columns` has no sortable entries — apps should treat that as
+/// "leave sort state unchanged."
+///
+/// This is the helper that used to live as `TableSort::cycle()` in the
+/// daemon — same shape, generic over any Cid.
+pub fn cycle_sort_column<Cid>(
+    columns: &[ColumnDef<Cid>],
+    current: Option<Cid>,
+    direction: i32,
+) -> Option<Cid>
+where
+    Cid: Copy + PartialEq,
+{
+    let sortable: Vec<Cid> = columns
+        .iter()
+        .filter(|c| c.sortable)
+        .map(|c| c.id)
+        .collect();
+    if sortable.is_empty() {
+        return None;
+    }
+    let pos = current.and_then(|c| sortable.iter().position(|x| *x == c));
+    let n = sortable.len();
+    let next = match (pos, direction.signum()) {
+        (None, _) => 0,
+        (Some(i), 1) => (i + 1) % n,
+        (Some(i), -1) => (i + n - 1) % n,
+        _ => 0,
+    };
+    Some(sortable[next])
+}
+
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let t = t.clamp(0.0, 1.0);
     match (a, b) {
@@ -658,5 +761,147 @@ mod tests {
         let row1 = read_text(&buf, 1, 0, 20);
         assert!(row1.contains('▼'), "got {row1:?}");
         assert!(row1.contains("group-1"), "got {row1:?}");
+    }
+
+    /// A row type that opts into key()/matches_filter() so we can drive
+    /// the sticky + filter render paths.
+    struct KeyedRow {
+        name: &'static str,
+        key: u64,
+    }
+
+    impl TableRowExt<TestCol> for KeyedRow {
+        fn cell(&self, col: TestCol) -> Cell {
+            match col {
+                TestCol::A => Cell::plain(self.name),
+                _ => Cell::plain(""),
+            }
+        }
+        fn key(&self) -> Option<u64> {
+            Some(self.key)
+        }
+        fn matches_filter(&self, q: &str) -> bool {
+            self.name.contains(q)
+        }
+    }
+
+    #[test]
+    fn filter_hides_non_matching_items() {
+        let theme = Theme::fallback();
+        let cols = test_columns();
+        // Use names with disjoint character sets so a single-letter
+        // query targets exactly one row.
+        let rows: Vec<TableEntry<KeyedRow, ()>> = vec![
+            TableEntry::Item(KeyedRow { name: "axx", key: 1 }),
+            TableEntry::Item(KeyedRow { name: "byy", key: 2 }),
+            TableEntry::Item(KeyedRow { name: "czz", key: 3 }),
+        ];
+        let table = LiveTable::new(&rows, &cols, &theme, TestCol::B).with_filter(Some("yy"));
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        (&table).render(area, &mut buf);
+        // Header on row 0; only "byy" matches → row 1.
+        // Rows 2 and 3 should be empty (no other visible items).
+        let row1 = read_text(&buf, 1, 0, 20);
+        let row2 = read_text(&buf, 2, 0, 20);
+        assert!(row1.contains("byy"), "row1={row1:?}");
+        assert!(
+            !row2.contains("axx") && !row2.contains("czz"),
+            "non-matching rows should be hidden: row2={row2:?}"
+        );
+    }
+
+    #[test]
+    fn empty_filter_string_is_treated_as_no_filter() {
+        let theme = Theme::fallback();
+        let cols = test_columns();
+        let rows: Vec<TableEntry<KeyedRow, ()>> = vec![TableEntry::Item(KeyedRow {
+            name: "alpha",
+            key: 1,
+        })];
+        let table = LiveTable::new(&rows, &cols, &theme, TestCol::B).with_filter(Some(""));
+        assert!(table.filter.is_none(), "empty filter should normalize to None");
+    }
+
+    #[test]
+    fn sticky_key_overrides_selected_index() {
+        let theme = Theme::fallback();
+        let cols = test_columns();
+        let rows: Vec<TableEntry<KeyedRow, ()>> = vec![
+            TableEntry::Item(KeyedRow { name: "alpha", key: 10 }),
+            TableEntry::Item(KeyedRow { name: "beta", key: 20 }),
+            TableEntry::Item(KeyedRow { name: "gamma", key: 30 }),
+        ];
+        // selected says row 0; sticky_key says key=20 (row 1). Sticky wins.
+        let table = LiveTable::new(&rows, &cols, &theme, TestCol::B)
+            .with_selection(Some(0), 0)
+            .with_sticky_key(Some(20));
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        (&table).render(area, &mut buf);
+        // Row 2 (header at 0, items at 1/2/3) is "beta" — selected_bg
+        // should paint that row, not the alpha row.
+        for x in 0..20 {
+            assert_eq!(
+                buf[(x, 2)].style().bg,
+                Some(theme.selected_bg),
+                "beta row should be highlighted at col {x}"
+            );
+        }
+        for x in 0..20 {
+            assert_ne!(
+                buf[(x, 1)].style().bg,
+                Some(theme.selected_bg),
+                "alpha row should NOT be highlighted at col {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_key_falls_back_to_selected_when_no_match() {
+        let theme = Theme::fallback();
+        let cols = test_columns();
+        let rows: Vec<TableEntry<KeyedRow, ()>> = vec![TableEntry::Item(KeyedRow {
+            name: "alpha",
+            key: 10,
+        })];
+        let table = LiveTable::new(&rows, &cols, &theme, TestCol::B)
+            .with_selection(Some(0), 0)
+            .with_sticky_key(Some(999));
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        (&table).render(area, &mut buf);
+        // sticky=999 doesn't match; selected=0 wins.
+        for x in 0..20 {
+            assert_eq!(buf[(x, 1)].style().bg, Some(theme.selected_bg));
+        }
+    }
+
+    #[test]
+    fn cycle_sort_advances_through_sortable_columns() {
+        let cols = test_columns();
+        // sortable: A, B (C is non-sortable).
+        let next = cycle_sort_column(&cols, None, 1);
+        assert_eq!(next, Some(TestCol::A));
+        let next = cycle_sort_column(&cols, Some(TestCol::A), 1);
+        assert_eq!(next, Some(TestCol::B));
+        // wraps
+        let next = cycle_sort_column(&cols, Some(TestCol::B), 1);
+        assert_eq!(next, Some(TestCol::A));
+        // reverse
+        let prev = cycle_sort_column(&cols, Some(TestCol::A), -1);
+        assert_eq!(prev, Some(TestCol::B));
+    }
+
+    #[test]
+    fn cycle_sort_returns_none_when_no_sortable_columns() {
+        let cols = vec![ColumnDef {
+            id: TestCol::A,
+            label: "A",
+            width: WidthSpec::Fixed(4),
+            align: Align::Left,
+            sortable: false,
+        }];
+        assert_eq!(cycle_sort_column(&cols, None, 1), None);
     }
 }

@@ -36,8 +36,8 @@ pub use meter::Meter;
 pub use modal::ModalShell;
 pub use mini_meter::MiniMeter;
 pub use live_table::{
-    Align as TableAlign, Cell as TableCell, ColumnDef, GroupAggregate, LiveTable, TableEntry,
-    TableRowExt, WidthSpec,
+    cycle_sort_column, Align as TableAlign, Cell as TableCell, ColumnDef, GroupAggregate,
+    LiveTable, TableEntry, TableRowExt, WidthSpec,
 };
 pub use editable_text::EditableText;
 pub use miller_columns::{MillerColumn, MillerColumns};

@@ -296,6 +296,13 @@ pub struct DataTable<'a> {
     pub sort: TableSort,
     pub sort_descending: bool,
     pub layout: TableLayout,
+    /// Sticky-by-pid selection. When `Some(pid)`, the widget locates
+    /// the row whose `ProcessRowView::key()` matches and highlights
+    /// it — overriding `selected`. The app passes its tracked
+    /// `selected_proc_pid` here when sticky mode is on; the row
+    /// stays visually selected across re-sorts and re-filters
+    /// without the app having to remap indices first.
+    pub sticky_pid: Option<u32>,
 }
 
 impl<'a> DataTable<'a> {
@@ -309,6 +316,7 @@ impl<'a> DataTable<'a> {
             sort: TableSort::Cpu,
             sort_descending: true,
             layout: TableLayout::Flat,
+            sticky_pid: None,
         }
     }
 
@@ -335,6 +343,11 @@ impl<'a> DataTable<'a> {
 
     pub fn with_sort(mut self, sort: TableSort) -> Self {
         self.sort = sort;
+        self
+    }
+
+    pub fn with_sticky_pid(mut self, pid: Option<u32>) -> Self {
+        self.sticky_pid = pid;
         self
     }
 }
@@ -369,7 +382,8 @@ impl<'a> Widget for &DataTable<'a> {
             .with_selection(self.selected, self.scroll_offset)
             .with_sort(Some(self.sort.col()), self.sort_descending)
             .with_tree_glyphs(draws_tree)
-            .with_fade(false);
+            .with_fade(false)
+            .with_sticky_key(self.sticky_pid.map(|p| p as u64));
         (&table).render(area, buf);
     }
 }
@@ -501,6 +515,22 @@ impl<'a> TableRowExt<ProcCol> for ProcessRowView<'a> {
 
     fn is_last_sibling(&self) -> bool {
         self.meta.is_last_sibling
+    }
+
+    fn key(&self) -> Option<u64> {
+        // Pids are stable for a process's lifetime — perfect sticky key.
+        // u32 fits trivially into u64.
+        Some(self.meta.info.pid as u64)
+    }
+
+    fn matches_filter(&self, q: &str) -> bool {
+        // Match against name and cmdline, case-insensitively. Mirrors
+        // the daemon's existing app-level filter; exposing it through
+        // the trait lets future apps drive the same filter via
+        // `LiveTable::with_filter`.
+        let needle = q.to_lowercase();
+        let p = &self.meta.info;
+        p.name.to_lowercase().contains(&needle) || p.cmdline.to_lowercase().contains(&needle)
     }
 }
 

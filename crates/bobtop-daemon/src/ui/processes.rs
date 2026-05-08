@@ -48,12 +48,23 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App) {
     // wider process names.
     let show_net = app.net_tier.has_bandwidth();
 
+    // Sticky pid → widget-level sticky-selection. When sticky mode is
+    // on, the app's tracked `selected_proc_pid` flows down into the
+    // widget which finds the matching row and highlights it. This
+    // makes visual selection robust against stale `selected_proc`
+    // indices in the gap between a re-sort and the next render.
+    let sticky_pid = if app.sticky_proc_selection {
+        app.selected_proc_pid
+    } else {
+        None
+    };
     let table = DataTable::new(&rows, &app.theme)
         .with_layout(layout)
         .with_net_columns(show_net)
         .with_selection(Some(app.selected_proc), scroll_offset)
         .with_sort(app.proc_sort)
-        .with_direction(app.proc_sort_descending);
+        .with_direction(app.proc_sort_descending)
+        .with_sticky_pid(sticky_pid);
     frame.render_widget(&table, table_area);
 
     if let Some(bar) = filter_bar {
