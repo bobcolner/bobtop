@@ -140,8 +140,28 @@ impl App {
             self.load_preview(node.path);
             return;
         }
+        let was_expanded = node.expanded;
         match self.tree.toggle(self.conn.as_ref(), self.tree_nav.cursor) {
             Ok(new_len) => {
+                // After expanding a parent the cursor would otherwise stay
+                // on the parent — pressing Enter again would collapse it,
+                // hiding the children we just revealed. Step into the
+                // first child instead so successive Enters drill straight
+                // down (database → schema → table). Collapse stays a
+                // single-key action via `h` / `←` / Backspace.
+                if !was_expanded {
+                    let next = self.tree_nav.cursor.saturating_add(1);
+                    if next < new_len
+                        && self
+                            .tree
+                            .nodes()
+                            .get(next)
+                            .map(|child| child.depth > node.depth)
+                            .unwrap_or(false)
+                    {
+                        self.tree_nav.cursor = next;
+                    }
+                }
                 if self.tree_nav.cursor >= new_len {
                     self.tree_nav.cursor = new_len.saturating_sub(1);
                 }
