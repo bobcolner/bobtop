@@ -10,9 +10,12 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+// `conn` is public because integration tests need to drive backends
+// directly without spinning up a TUI. The rest of the modules stay
+// crate-internal.
+pub mod conn;
 
 pub(crate) mod app;
-pub(crate) mod conn;
 pub(crate) mod keys;
 pub(crate) mod tree;
 pub(crate) mod ui;

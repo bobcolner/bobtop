@@ -39,6 +39,9 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
+# Postgres client (used by bobtop-db)
+tokio-postgres = "0.7"
+
 # System data sources
 sysinfo = "0.32"
 pcap = "2.0"

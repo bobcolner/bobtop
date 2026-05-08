@@ -20,6 +20,7 @@ bobtop-tui = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

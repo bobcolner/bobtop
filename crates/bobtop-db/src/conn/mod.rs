@@ -8,6 +8,7 @@
 //! latency hit is acceptable for browse-only access.
 
 pub mod mock;
+pub mod pg;
 
 use anyhow::Result;
 
@@ -95,7 +96,7 @@ pub fn open(target: &str) -> Result<Box<dyn Connection>> {
     match target {
         "mock" => Ok(Box::new(mock::MockConnection::demo())),
         s if s.starts_with("postgres://") || s.starts_with("postgresql://") => {
-            anyhow::bail!("postgres backend not wired yet — use `--connect mock` for now")
+            Ok(Box::new(pg::PgConnection::open(s)?))
         }
         s if s.starts_with("duckdb://") => {
             anyhow::bail!("duckdb backend not wired yet — use `--connect mock` for now")
