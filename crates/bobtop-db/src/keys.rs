@@ -2,7 +2,7 @@
 //! base keymap. Hardcoded for v1; config-driven keymaps land later
 //! in line with the rest of the suite.
 
-use bobtop_tui::{Scope, ScopeResult};
+use gtui::{Scope, ScopeResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +49,7 @@ pub fn map(ev: KeyEvent) -> Option<Action> {
 }
 
 /// Base scope — the always-on keymap that sees keys when no modal is
-/// open. Sits at the bottom of the [`bobtop_tui::ScopeStack`].
+/// open. Sits at the bottom of the [`gtui::ScopeStack`].
 pub struct BaseScope;
 
 impl Scope<Action> for BaseScope {

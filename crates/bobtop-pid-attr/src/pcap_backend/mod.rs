@@ -20,7 +20,7 @@
 //! ## Privileges
 //!
 //! libpcap on Linux requires either `CAP_NET_RAW` (recommended via
-//! `setcap cap_net_raw=ep ./bobtop`) or root. `available()` probes for the
+//! `setcap cap_net_raw=ep ./gtop`) or root. `available()` probes for the
 //! capability before claiming the tier.
 //!
 //! ## macOS
@@ -109,7 +109,7 @@ impl PcapAttributor {
             let s = Arc::clone(&shared);
             let name = dev.name.clone();
             let handle = thread::Builder::new()
-                .name(format!("bobtop-pcap-{}", name))
+                .name(format!("gtop-pcap-{}", name))
                 .spawn(move || capture_loop(name, s))
                 .map_err(|e| NetError::other(format!("spawn capture thread: {e}")))?;
             threads.push(handle);
@@ -119,7 +119,7 @@ impl PcapAttributor {
         {
             let s = Arc::clone(&shared);
             let h = thread::Builder::new()
-                .name("bobtop-pcap-cache".into())
+                .name("gtop-pcap-cache".into())
                 .spawn(move || cache_refresh_loop(s))
                 .map_err(|e| NetError::other(format!("spawn cache thread: {e}")))?;
             threads.push(h);

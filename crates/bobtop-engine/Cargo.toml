@@ -1,6 +1,6 @@
 [package]
 name = "bobtop-engine"
-description = "bobtop sampling engine — bus, collectors, attribution, sample store, retrospective ring"
+description = "gtop sampling engine — bus, collectors, attribution, sample store, retrospective ring"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

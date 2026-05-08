@@ -2,7 +2,7 @@
 //!
 //! sysinfo gives us pid / name / cmdline / cpu / RSS / VSZ / parent / status
 //! on every supported platform. Per-process network attribution is *not*
-//! handled here — that comes from `bobtop-net` and is joined in the daemon.
+//! handled here — that comes from `gtop-net` and is joined in the daemon.
 
 use std::collections::HashMap;
 use std::sync::Mutex;

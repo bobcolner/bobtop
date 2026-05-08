@@ -12,7 +12,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use bobtop_tui::{load_theme, DEFAULT_THEME_NAME};
+use gtui::{load_theme, DEFAULT_THEME_NAME};
 
 use crate::app::App;
 use crate::conn::{self, Connection, DuckLakeAttach};
@@ -35,7 +35,7 @@ pub struct Cli {
     #[arg(long)]
     pub connect: Vec<String>,
 
-    /// Theme name from the bundled bobtop registry.
+    /// Theme name from the bundled gtop registry.
     #[arg(long, default_value = DEFAULT_THEME_NAME)]
     pub theme: String,
 

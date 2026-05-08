@@ -27,7 +27,7 @@ use super::common::{has_bpf_capability, has_kernel_min_version, is_cgroup_v2_uni
 use crate::disk_attributor::{DiskAttributor, DiskAttributorTier, ProcessDiskSample};
 use crate::{NetError, Result};
 
-#[cfg(bobtop_bpf_built)]
+#[cfg(gtop_bpf_built)]
 mod skel {
     include!(concat!(env!("OUT_DIR"), "/disk.skel.rs"));
 }
@@ -56,9 +56,9 @@ pub struct EbpfDiskAttributor {
 }
 
 struct Inner {
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     skel: skel::BobtopDiskSkel<'static>,
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     _open_object: Box<MaybeUninit<libbpf_rs::OpenObject>>,
     last_seen: HashMap<u32, (u64, u64, Instant)>,
     idle_streak: HashMap<u32, u32>,
@@ -71,7 +71,7 @@ impl std::fmt::Debug for EbpfDiskAttributor {
 }
 
 impl EbpfDiskAttributor {
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     pub fn new() -> Result<Self> {
         if !is_cgroup_v2_unified_mounted() {
             return Err(NetError::MissingCapability("cgroup v2 unified mount"));
@@ -110,7 +110,7 @@ impl EbpfDiskAttributor {
         })
     }
 
-    #[cfg(not(bobtop_bpf_built))]
+    #[cfg(not(gtop_bpf_built))]
     pub fn new() -> Result<Self> {
         Err(NetError::other(
             "Disk BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
@@ -132,14 +132,14 @@ impl DiskAttributor for EbpfDiskAttributor {
     }
 
     fn available() -> bool {
-        cfg!(bobtop_bpf_built)
+        cfg!(gtop_bpf_built)
             && is_cgroup_v2_unified_mounted()
             && has_kernel_min_version(5, 8)
             && has_bpf_capability()
     }
 }
 
-#[cfg(bobtop_bpf_built)]
+#[cfg(gtop_bpf_built)]
 fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
@@ -219,7 +219,7 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     Ok(out)
 }
 
-#[cfg(not(bobtop_bpf_built))]
+#[cfg(not(gtop_bpf_built))]
 fn sample_blocking(_inner: &Mutex<Inner>) -> Result<Vec<ProcessDiskSample>> {
     Ok(Vec::new())
 }

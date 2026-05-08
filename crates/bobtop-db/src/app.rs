@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use bobtop_tui::{Nav, ScopeStack, Theme};
+use gtui::{Nav, ScopeStack, Theme};
 use crossterm::event::{self, Event};
 use ratatui::backend::Backend;
 use ratatui::Terminal;
@@ -40,7 +40,7 @@ pub struct App {
     pub should_quit: bool,
     /// Stack of key-handling scopes. Base is always present; modal
     /// scopes get pushed and popped as they open/close. The
-    /// abstraction lives in `bobtop_tui::keymap` so daemon and fb can
+    /// abstraction lives in `gtui::keymap` so daemon and fb can
     /// share the same dispatch shape (and so a stuck modal can't
     /// silently swallow keys for the rest of the session).
     pub scopes: ScopeStack<Action>,

@@ -16,10 +16,10 @@
 //! the loader falls back to its compiled-in empty skeletons.
 
 fn main() {
-    println!("cargo:rerun-if-changed=bpf/bobtop_net.bpf.c");
-    println!("cargo:rerun-if-changed=bpf/bobtop_disk.bpf.c");
+    println!("cargo:rerun-if-changed=bpf/gtop_net.bpf.c");
+    println!("cargo:rerun-if-changed=bpf/gtop_disk.bpf.c");
     // Always declare the cfg so rustc doesn't warn even when the feature is off.
-    println!("cargo:rustc-check-cfg=cfg(bobtop_bpf_built)");
+    println!("cargo:rustc-check-cfg=cfg(gtop_bpf_built)");
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     compile_bpf();
@@ -35,16 +35,16 @@ fn compile_bpf() {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
 
     let net_ok = build_skel(
-        &manifest_dir.join("bpf/bobtop_net.bpf.c"),
+        &manifest_dir.join("bpf/gtop_net.bpf.c"),
         &out_dir.join("net.skel.rs"),
     );
     let disk_ok = build_skel(
-        &manifest_dir.join("bpf/bobtop_disk.bpf.c"),
+        &manifest_dir.join("bpf/gtop_disk.bpf.c"),
         &out_dir.join("disk.skel.rs"),
     );
 
     if net_ok && disk_ok {
-        println!("cargo:rustc-cfg=bobtop_bpf_built");
+        println!("cargo:rustc-cfg=gtop_bpf_built");
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "bobtop-db"
-description = "TUI database browser (Postgres + DuckDB / DuckLake) built on bobtop-tui widgets"
+description = "TUI database browser (Postgres + DuckDB / DuckLake) built on the gtui toolkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,7 +15,7 @@ name = "bobtop-db"
 path = "src/bin/bobtop-db.rs"
 
 [dependencies]
-bobtop-tui = { workspace = true }
+gtui = { workspace = true }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }

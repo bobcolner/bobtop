@@ -2,9 +2,9 @@
 //!
 //! ## Lifecycle
 //!
-//! - Bind path: `$XDG_RUNTIME_DIR/bobtop.sock` if set, else `/tmp/bobtop-$UID.sock`.
+//! - Bind path: `$XDG_RUNTIME_DIR/gtop.sock` if set, else `/tmp/gtop-$UID.sock`.
 //! - Single-instance: if the socket file exists, probe it; if a peer answers,
-//!   we exit without binding (another bobtop owns the socket). If the probe
+//!   we exit without binding (another gtop owns the socket). If the probe
 //!   fails (stale socket from a crashed previous run), we unlink and rebind.
 //! - On `Drop` of the listener task, the socket file is removed best-effort.
 //!
@@ -34,16 +34,16 @@ use super::schema::{
 };
 
 /// Resolve the socket path using the first available of:
-/// 1. `$XDG_RUNTIME_DIR/bobtop.sock`
-/// 2. `/tmp/bobtop-$UID.sock`
+/// 1. `$XDG_RUNTIME_DIR/gtop.sock`
+/// 2. `/tmp/gtop-$UID.sock`
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         if !dir.is_empty() {
-            return PathBuf::from(dir).join("bobtop.sock");
+            return PathBuf::from(dir).join("gtop.sock");
         }
     }
     let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/bobtop-{uid}.sock"))
+    PathBuf::from(format!("/tmp/gtop-{uid}.sock"))
 }
 
 /// Handle returned by [`spawn`]: the bound socket path plus an atomic
@@ -107,7 +107,7 @@ fn bind_with_stale_recovery(path: &Path) -> io::Result<UnixListener> {
             match std::os::unix::net::UnixStream::connect(path) {
                 Ok(_) => Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    "another bobtop is listening on this socket",
+                    "another gtop is listening on this socket",
                 )),
                 Err(_) => {
                     let _ = std::fs::remove_file(path);
@@ -234,7 +234,7 @@ fn dispatch(raw: &str, store: &SampleStore, history: &History) -> String {
         "responsible_for" => handle_responsible_for(req, history),
         other => encode(&ErrorResponse::new(
             "unknown_verb",
-            format!("verb '{other}' is not supported in bobtop/v1 yet"),
+            format!("verb '{other}' is not supported in gtop/v1 yet"),
         )),
     }
 }
@@ -266,7 +266,7 @@ fn handle_top(req: Request, store: &SampleStore) -> String {
                 return encode(&ErrorResponse::new(
                     "bad_query",
                     format!(
-                        "group '{s}' not supported in bobtop/v1 (use `flat`, `exec`, `cgroup`, or `tree`)"
+                        "group '{s}' not supported in gtop/v1 (use `flat`, `exec`, `cgroup`, or `tree`)"
                     ),
                 ))
             }
@@ -610,7 +610,7 @@ fn encode<T: serde::Serialize>(v: &T) -> String {
         // structures — none of our schema types contain those, so this
         // branch is effectively unreachable, but stays as a safe fallback.
         format!(
-            r#"{{"schema":"bobtop/v1","error":{{"code":"internal","message":"serialize: {}"}}}}"#,
+            r#"{{"schema":"gtop/v1","error":{{"code":"internal","message":"serialize: {}"}}}}"#,
             e
         )
     })
@@ -650,7 +650,7 @@ mod tests {
         // Wait briefly for the store updater task to fold the publish.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let resp = dispatch(r#"{"q":"snapshot"}"#, &store, &history);
-        assert!(resp.contains("\"schema\":\"bobtop/v1\""));
+        assert!(resp.contains("\"schema\":\"gtop/v1\""));
         assert!(resp.contains("\"mem_used_bytes\":4000000000"));
         assert!(resp.contains("\"mem_total_bytes\":16000000000"));
     }

@@ -1,0 +1,9 @@
+The .theme files in this directory are vendored from btop
+(https://github.com/aristocratos/btop) and are redistributed under the
+Apache License 2.0.
+
+Upstream source: https://github.com/aristocratos/btop/tree/main/themes
+Copyright (c) Aristocratos and the btop contributors.
+
+gtop is also licensed under MIT OR Apache-2.0; redistribution of these
+.theme files is governed by the Apache-2.0 license per the btop project.

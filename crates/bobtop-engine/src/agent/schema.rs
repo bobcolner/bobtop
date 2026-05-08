@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bobtop_core::{HostSample, PeakResult, ProcRef, WindowStats};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: &str = "bobtop/v1";
+pub const SCHEMA_VERSION: &str = "gtop/v1";
 
 /// Inbound request envelope. Every query is a single JSON object whose
 /// `q` field selects the verb. Unknown or unrecognized fields are ignored
@@ -425,7 +425,7 @@ mod tests {
     fn error_response_wraps_code_and_message() {
         let e = ErrorResponse::new("bad_query", "no q field");
         let s = serde_json::to_string(&e).unwrap();
-        assert!(s.contains("\"schema\":\"bobtop/v1\""));
+        assert!(s.contains("\"schema\":\"gtop/v1\""));
         assert!(s.contains("\"code\":\"bad_query\""));
         assert!(s.contains("\"message\":\"no q field\""));
     }

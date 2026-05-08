@@ -1,6 +1,6 @@
 [package]
 name = "bobtop-pid-attr"
-description = "Tiered per-process kernel attribution for bobtop — network and disk I/O via eBPF / libpcap / /proc"
+description = "Tiered per-process kernel attribution for gtop — network and disk I/O via eBPF / libpcap / /proc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

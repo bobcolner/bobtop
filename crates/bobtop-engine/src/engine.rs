@@ -1,4 +1,4 @@
-//! The bobtop sampling engine — bus + collectors + per-pid attribution +
+//! The gtop sampling engine — bus + collectors + per-pid attribution +
 //! latest-value store + retrospective ring buffer, packaged behind one
 //! handle so callers don't have to spawn each task individually.
 //!

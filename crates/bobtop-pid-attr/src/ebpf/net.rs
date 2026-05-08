@@ -3,7 +3,7 @@
 //! Two kprobes maintain a `BPF_MAP_TYPE_HASH` keyed by tgid (process pid)
 //! holding `(rx, tx)` byte counters. Userspace polls the map every sample
 //! interval and computes per-pid bytes-per-second from deltas. See the
-//! companion C source at `crates/bobtop-pid-attr/bpf/bobtop_net.bpf.c`.
+//! companion C source at `crates/bobtop-pid-attr/bpf/gtop_net.bpf.c`.
 //!
 //! - `tcp_sendmsg(struct sock*, struct msghdr*, size_t size)` → `+= size` to TX
 //! - `tcp_cleanup_rbuf(struct sock*, int copied)` → `+= copied` to RX
@@ -38,11 +38,11 @@ use super::common::{
 };
 use crate::{AttributorTier, NetError, NetworkAttributor, ProcessNetSample, Result};
 
-#[cfg(bobtop_bpf_built)]
+#[cfg(gtop_bpf_built)]
 mod skel {
     include!(concat!(env!("OUT_DIR"), "/net.skel.rs"));
 }
-#[cfg(not(bobtop_bpf_built))]
+#[cfg(not(gtop_bpf_built))]
 mod skel {
     /// Stub when build.rs couldn't compile the BPF object (no clang or
     /// libbpf-cargo failed). `available()` reports false in that case so
@@ -80,9 +80,9 @@ pub struct EbpfAttributor {
 struct Inner {
     /// The loaded skeleton owns the kernel-side BPF object + attached
     /// kprobes. Drop = unload + detach.
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     skel: skel::BobtopNetSkel<'static>,
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     _open_object: Box<MaybeUninit<libbpf_rs::OpenObject>>,
     /// Last absolute (rx, tx, observed_at) per pid, for delta computation.
     last_seen: HashMap<u32, (u64, u64, Instant)>,
@@ -99,7 +99,7 @@ impl std::fmt::Debug for EbpfAttributor {
 }
 
 impl EbpfAttributor {
-    #[cfg(bobtop_bpf_built)]
+    #[cfg(gtop_bpf_built)]
     pub fn new() -> Result<Self> {
         if !is_cgroup_v2_unified_mounted() {
             return Err(NetError::MissingCapability("cgroup v2 unified mount"));
@@ -144,7 +144,7 @@ impl EbpfAttributor {
         })
     }
 
-    #[cfg(not(bobtop_bpf_built))]
+    #[cfg(not(gtop_bpf_built))]
     pub fn new() -> Result<Self> {
         Err(NetError::other(
             "BPF object not compiled — install clang + libbpf-dev and rebuild with --features ebpf",
@@ -166,14 +166,14 @@ impl NetworkAttributor for EbpfAttributor {
     }
 
     fn available() -> bool {
-        cfg!(bobtop_bpf_built)
+        cfg!(gtop_bpf_built)
             && is_cgroup_v2_unified_mounted()
             && has_kernel_min_version(5, 8)
             && has_bpf_capability()
     }
 }
 
-#[cfg(bobtop_bpf_built)]
+#[cfg(gtop_bpf_built)]
 fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     let mut g = inner.lock().unwrap_or_else(|p| p.into_inner());
     let now = Instant::now();
@@ -262,7 +262,7 @@ fn sample_blocking(inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     Ok(out)
 }
 
-#[cfg(not(bobtop_bpf_built))]
+#[cfg(not(gtop_bpf_built))]
 fn sample_blocking(_inner: &Mutex<Inner>) -> Result<Vec<ProcessNetSample>> {
     Ok(Vec::new())
 }

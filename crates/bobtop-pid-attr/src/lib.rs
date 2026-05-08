@@ -1,4 +1,4 @@
-//! Tiered per-process kernel attribution for bobtop — network and disk I/O.
+//! Tiered per-process kernel attribution for gtop — network and disk I/O.
 //!
 //! Four backends, ordered by accuracy and privilege requirements:
 //!
@@ -85,7 +85,7 @@ impl Default for SelectOptions {
 /// reports itself available.
 ///
 /// Logs the chosen tier and the rejection reason for each higher tier — when
-/// users wonder why bobtop is showing connections-only and no per-process
+/// users wonder why gtop is showing connections-only and no per-process
 /// bandwidth, the log line is the first place to look.
 pub fn select(opts: SelectOptions) -> Box<dyn NetworkAttributor> {
     // Tier 3 — eBPF (Linux only, feature-gated).

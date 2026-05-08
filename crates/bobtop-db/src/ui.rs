@@ -2,11 +2,11 @@
 //! a status row and an action bar. Both panes use [`LiveTable`] from
 //! the toolkit; this is the marquee demo of LiveTable's tree mode.
 
-use bobtop_tui::widgets::{panel as boxed_panel, ActionBar};
-use bobtop_tui::widgets::live_table::{
+use gtui::widgets::{panel as boxed_panel, ActionBar};
+use gtui::widgets::live_table::{
     Align, Cell, ColumnDef, LiveTable, TableEntry, TableRowExt, WidthSpec,
 };
-use bobtop_tui::write_str_clipped;
+use gtui::write_str_clipped;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::Frame;
@@ -20,7 +20,7 @@ pub fn draw(app: &App, frame: &mut Frame<'_>) {
         return;
     }
     // Paint main_bg across the whole canvas first so chrome and
-    // gutters carry the theme bg. Same approach as bobtop-fb.
+    // gutters carry the theme bg. Same approach as gfb.
     if let Some(bg) = app.theme.main_bg {
         let buf = frame.buffer_mut();
         for y in area.y..area.y + area.height {
@@ -100,7 +100,7 @@ fn draw_tree_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         sortable: false,
     }];
     let body_h = inner.height.saturating_sub(1) as usize;
-    let scroll = bobtop_tui::middle_anchor_scroll(app.tree_nav.cursor, nodes.len(), body_h);
+    let scroll = gtui::middle_anchor_scroll(app.tree_nav.cursor, nodes.len(), body_h);
     let table = LiveTable::new(&entries, &columns, &app.theme, TreeCol::Name)
         .with_selection(Some(app.tree_nav.cursor), scroll)
         .with_tree_glyphs(true)
@@ -162,7 +162,7 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .map(|r| TableEntry::Item(PreviewRowView { row: r }))
         .collect();
     let body_h = inner.height.saturating_sub(1) as usize;
-    let scroll = bobtop_tui::middle_anchor_scroll(
+    let scroll = gtui::middle_anchor_scroll(
         app.preview_nav.cursor,
         preview.rows.len(),
         body_h,
@@ -193,7 +193,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(&bar, area);
 }
 
-fn border_color(theme: &bobtop_tui::Theme, focused: bool, accent: Color) -> Color {
+fn border_color(theme: &gtui::Theme, focused: bool, accent: Color) -> Color {
     if focused {
         accent
     } else {
@@ -208,7 +208,7 @@ enum TreeCol {
 
 struct TreeRowView<'a> {
     node: &'a CatalogNode,
-    theme: &'a bobtop_tui::Theme,
+    theme: &'a gtui::Theme,
 }
 
 impl<'a> TableRowExt<TreeCol> for TreeRowView<'a> {

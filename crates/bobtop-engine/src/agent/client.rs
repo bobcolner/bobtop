@@ -1,7 +1,7 @@
 //! Client primitives for talking to the agent socket.
 //!
 //! Argv parsing and the daemon-binary auto-spawn live in the consuming
-//! crate (the bobtop daemon today, future MCP shims tomorrow); this
+//! crate (the gtop daemon today, future MCP shims tomorrow); this
 //! module is the protocol-only half: connect, send one line of JSON,
 //! read one line back.
 
@@ -67,7 +67,7 @@ pub fn send(path: &Path, request: &serde_json::Value) -> Result<AgentResponse, S
 /// can opt out by env.
 ///
 /// Errors carry a human-readable reason. The caller is expected to
-/// surface them to the user with appropriate context (e.g. "is bobtop
+/// surface them to the user with appropriate context (e.g. "is gtop
 /// running?").
 pub fn connect_or_spawn(
     path: &Path,

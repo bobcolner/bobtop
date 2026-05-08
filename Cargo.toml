@@ -5,10 +5,10 @@ members = [
     "crates/bobtop-collectors",
     "crates/bobtop-pid-attr",
     "crates/bobtop-engine",
-    "crates/bobtop-tui",
-    "crates/bobtop-daemon",
+    "crates/gtui",
+    "crates/gtop",
     "crates/bobtop-db",
-    "crates/bobtop-fb",
+    "crates/gfb",
 ]
 
 [workspace.package]
@@ -25,9 +25,9 @@ bobtop-core = { path = "crates/bobtop-core" }
 bobtop-collectors = { path = "crates/bobtop-collectors" }
 bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
 bobtop-engine = { path = "crates/bobtop-engine" }
-bobtop-tui = { path = "crates/bobtop-tui" }
+gtui = { path = "crates/gtui" }
 bobtop-db = { path = "crates/bobtop-db" }
-bobtop-fb = { path = "crates/bobtop-fb" }
+gfb = { path = "crates/gfb" }
 
 # TUI rendering
 ratatui = "0.29"

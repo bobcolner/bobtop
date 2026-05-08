@@ -1,6 +1,6 @@
 [package]
 name = "bobtop-collectors"
-description = "Per-subsystem data collectors for bobtop (CPU, memory, disk, network, processes, GPU)"
+description = "Per-subsystem data collectors for gtop (CPU, memory, disk, network, processes, GPU)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

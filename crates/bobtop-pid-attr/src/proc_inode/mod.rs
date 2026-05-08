@@ -3,7 +3,7 @@
 //! Enumerates TCP/TCP6 connections and joins them to processes via socket
 //! inodes. No per-process bandwidth — that's what Tiers 2 and 3 are for.
 //!
-//! Privileges: none required, but a non-root bobtop will only see processes
+//! Privileges: none required, but a non-root gtop will only see processes
 //! it owns. Sockets owned by other users will appear unattributed (under
 //! pid 0). We log this once at startup but don't error.
 

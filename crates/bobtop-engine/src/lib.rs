@@ -1,4 +1,4 @@
-//! The bobtop sampling engine + agent query layer.
+//! The gtop sampling engine + agent query layer.
 //!
 //! Two layers in one crate:
 //!
@@ -7,7 +7,7 @@
 //!   [`Engine::start`](engine::Engine::start) call.
 //! - [`agent`] — the queryable JSON-RPC surface (schema types, query
 //!   handlers, Unix-socket server, client helpers). Wire format
-//!   documented in the README and stable at `bobtop/v1`.
+//!   documented in the README and stable at `gtop/v1`.
 //!
 //! Embedders (the daemon binary, future MCP shims, library bindings)
 //! pull this crate to get a self-contained engine + agent surface

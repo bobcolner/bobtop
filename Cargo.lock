@@ -520,39 +520,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "bobtop-daemon"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "bobtop-collectors",
- "bobtop-core",
- "bobtop-engine",
- "bobtop-fb",
- "bobtop-pid-attr",
- "bobtop-tui",
- "clap",
- "criterion",
- "crossterm",
- "libc",
- "ratatui",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "unicode-width 0.2.0",
-]
-
-[[package]]
 name = "bobtop-db"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bobtop-tui",
  "clap",
  "crossterm",
  "duckdb",
+ "gtui",
  "ratatui",
  "tokio",
  "tokio-postgres",
@@ -578,29 +553,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bobtop-fb"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "bobtop-tui",
- "clap",
- "crossterm",
- "globset",
- "image",
- "lru",
- "notify",
- "pulldown-cmark",
- "ratatui",
- "serde",
- "syntect",
- "tokio",
- "toml",
- "trash",
- "unicode-width 0.2.0",
- "viuer",
-]
-
-[[package]]
 name = "bobtop-pid-attr"
 version = "0.2.0"
 dependencies = [
@@ -612,17 +564,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "bobtop-tui"
-version = "0.2.0"
-dependencies = [
- "bobtop-core",
- "crossterm",
- "ratatui",
- "tracing",
- "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -1488,6 +1429,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "gfb"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "globset",
+ "gtui",
+ "image",
+ "lru",
+ "notify",
+ "pulldown-cmark",
+ "ratatui",
+ "serde",
+ "syntect",
+ "tokio",
+ "toml",
+ "trash",
+ "unicode-width 0.2.0",
+ "viuer",
+]
+
+[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1508,6 +1472,42 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "gtop"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bobtop-collectors",
+ "bobtop-core",
+ "bobtop-engine",
+ "bobtop-pid-attr",
+ "clap",
+ "criterion",
+ "crossterm",
+ "gfb",
+ "gtui",
+ "libc",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "gtui"
+version = "0.2.0"
+dependencies = [
+ "bobtop-core",
+ "crossterm",
+ "ratatui",
+ "tracing",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

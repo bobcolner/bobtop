@@ -1,7 +1,7 @@
-//! Shared types and traits for the bobtop system monitor.
+//! Shared types and traits for the gtop system monitor.
 //!
 //! Crates downstream of this one (`bobtop-collectors`, `bobtop-pid-attr`,
-//! `bobtop-tui`, `bobtop-daemon`) all build on the abstractions defined here:
+//! `gtui`, `gtop`) all build on the abstractions defined here:
 //!
 //! - [`Collector`] — the async data-source trait every subsystem implements.
 //! - [`MetricEvent`] — the unified, fan-out-friendly enum that wraps every
