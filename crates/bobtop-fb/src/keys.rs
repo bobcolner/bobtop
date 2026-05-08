@@ -1,9 +1,11 @@
-//! Keymap → semantic action.
+//! Keymap → semantic action plus a [`Scope`] impl for the always-on
+//! base keymap.
 //!
 //! v1 hardcodes a vim-flavored layout. Config-driven keymaps land later;
 //! the `Action` enum is the stable surface — adding new bindings in v2
 //! won't break the dispatch site in `App::handle_key`.
 
+use bobtop_tui::{Scope, ScopeResult};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,5 +90,24 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
         _ => Action::Noop,
+    }
+}
+
+/// Base scope — always-on keymap that sits at the bottom of
+/// [`bobtop_tui::ScopeStack`]. fb's modals (input prompts, editor,
+/// finder, filter input, full preview) are still flag-based today;
+/// migrating each into its own pushed Scope is a series of follow-ups.
+pub struct BaseScope;
+
+impl Scope<Action> for BaseScope {
+    fn name(&self) -> &'static str {
+        "base"
+    }
+
+    fn handle(&mut self, ev: &KeyEvent) -> ScopeResult<Action> {
+        match map(*ev) {
+            Action::Noop => ScopeResult::PassThrough,
+            a => ScopeResult::Action(a),
+        }
     }
 }

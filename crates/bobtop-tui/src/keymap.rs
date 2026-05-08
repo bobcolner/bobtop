@@ -58,6 +58,17 @@ pub struct ScopeStack<A> {
     scopes: Vec<Box<dyn Scope<A>>>,
 }
 
+/// Print the stack as its scope names — useful for `#[derive(Debug)]`
+/// on App structs that want to embed a `ScopeStack` without forcing a
+/// `Debug` bound on the `Scope` trait.
+impl<A> std::fmt::Debug for ScopeStack<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.scopes.iter().map(|s| s.name()))
+            .finish()
+    }
+}
+
 impl<A> ScopeStack<A> {
     /// Create a stack with `base` at the bottom. The base is the
     /// app's main keymap — the always-on layer that sees keys when

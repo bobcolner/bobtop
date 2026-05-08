@@ -77,6 +77,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.ui.show_help {
         overlays::draw_help_overlay(frame, area, app);
     }
+    // Always-on modal-state indicator. Renders only when something
+    // beyond the default keymap is consuming keys — empty otherwise,
+    // so it's invisible during normal use. Catches "stuck modal"
+    // bugs that historically went undiagnosed for hours: the same
+    // class that motivated the keymap toolkit refactor.
+    let modals = app.active_modal_names();
+    if !modals.is_empty() {
+        draw_modal_indicator(frame, area, app, &modals);
+    }
+
     // Transient error / status banner. Painted *last* so it sits on top
     // of every panel and modal — these are the messages that have been
     // silently black-holed historically (file-browser launch failures
@@ -84,6 +94,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(msg) = &app.ui.last_options_msg {
         draw_toast(frame, area, app, msg);
     }
+}
+
+fn draw_modal_indicator(frame: &mut Frame, area: Rect, app: &App, modals: &[&'static str]) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let label = format!("[ {} ]", modals.join(" · "));
+    // Top-right corner. Using `inactive_fg` keeps it quiet during
+    // normal modal use — the toast banner uses `selected_bg` for
+    // the loud cases.
+    let style = Style::default()
+        .fg(app.theme.inactive_fg)
+        .bg(app.theme.main_bg.unwrap_or(app.theme.meter_bg));
+    let len = label.chars().count() as u16;
+    if len + 2 > area.width {
+        return;
+    }
+    let x = area.right().saturating_sub(len + 1);
+    let buf = frame.buffer_mut();
+    bobtop_tui::write_str_clipped(buf, x, area.y, &label, len, style);
 }
 
 fn draw_toast(frame: &mut Frame, area: Rect, app: &App, msg: &str) {

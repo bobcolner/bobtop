@@ -8,6 +8,7 @@ pub mod cli;
 pub mod config;
 pub mod cpuinfo;
 pub mod group;
+pub mod keys;
 pub mod kill;
 pub mod monitor_theme;
 pub mod options_editor;

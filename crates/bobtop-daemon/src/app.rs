@@ -231,6 +231,12 @@ pub struct App {
     pub tree_depth_cap: Option<u8>,
 
     pub ui: UiState,
+    /// Key dispatch stack. Today only the help overlay is migrated
+    /// onto this — the rest of the modal cascade still lives in
+    /// `handle_key`. The stack is checked first; if a scope returns
+    /// an action it runs via `run_scope_action`. Otherwise we fall
+    /// through to the existing cascade.
+    pub scopes: bobtop_tui::ScopeStack<crate::keys::Action>,
 }
 
 impl App {
@@ -286,6 +292,7 @@ impl App {
             tree_depth_cap: None,
             network_panel: NetworkPanelVariant::default(),
             attribution: None,
+            scopes: bobtop_tui::ScopeStack::new(Box::new(crate::keys::BaseScope)),
         }
     }
 
@@ -855,6 +862,17 @@ impl App {
             self.ui.last_options_msg = None;
             self.ui.dirty = true;
         }
+        // Scope-stack dispatch first — modals that have been migrated
+        // (currently just the help overlay) intercept keys here. If
+        // none of the stacked scopes claim the key we fall through to
+        // the legacy `handle_key` cascade.
+        if let Some(action) = self.scopes.dispatch(&k) {
+            let flow = self.run_scope_action(action);
+            if matches!(flow, ControlFlow::Continue) {
+                self.ui.dirty = true;
+            }
+            return flow;
+        }
         // Every recognized key either quits or mutates rendered state
         // (selection, sort, layout, tick). Cheaper to mark unconditionally
         // here than to thread `mark_dirty()` through each branch.
@@ -889,15 +907,13 @@ impl App {
         if let Some(flow) = self.handle_filter_input(k) {
             return flow;
         }
-        if let Some(flow) = self.handle_help_overlay(k) {
-            return flow;
-        }
         if let Some(flow) = self.handle_boxes_overlay(k) {
             return flow;
         }
         match k.code {
             KeyCode::Char('?') => {
                 self.ui.show_help = true;
+                self.scopes.push(Box::new(crate::keys::HelpScope));
                 ControlFlow::Continue
             }
             KeyCode::Char('B') => {
@@ -1205,20 +1221,47 @@ impl App {
         Some(ControlFlow::Continue)
     }
 
-    /// Help overlay. `?` / Esc close it; `q` quits even with the
-    /// overlay up; everything else is swallowed.
-    fn handle_help_overlay(&mut self, k: KeyEvent) -> Option<ControlFlow> {
-        if !self.ui.show_help {
-            return None;
-        }
-        match k.code {
-            KeyCode::Char('?') | KeyCode::Esc => {
+    /// Apply an [`Action`](crate::keys::Action) returned by a stacked
+    /// scope. Scopes that pop themselves via `CloseWith` only need
+    /// the App to flip the corresponding flag here.
+    fn run_scope_action(&mut self, action: crate::keys::Action) -> ControlFlow {
+        match action {
+            crate::keys::Action::Quit => ControlFlow::Quit,
+            crate::keys::Action::CloseHelp => {
                 self.ui.show_help = false;
-                Some(ControlFlow::Continue)
+                ControlFlow::Continue
             }
-            KeyCode::Char('q') => Some(ControlFlow::Quit),
-            _ => Some(ControlFlow::Continue),
         }
+    }
+
+    /// Names of every modal currently consuming or potentially
+    /// consuming keys. Combines the legacy flag-based modals (still
+    /// most of them) with the scopes pushed onto `self.scopes`.
+    /// Surfaced by the UI when non-empty so a stuck modal — the bug
+    /// pattern that motivated the scope-stack refactor — becomes
+    /// visible immediately instead of after hours of confusion.
+    pub fn active_modal_names(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.ui.options.is_some() {
+            out.push("options");
+        }
+        if self.ui.detail.is_some() {
+            out.push("detail");
+        }
+        if self.ui.pending_kill.is_some() {
+            out.push("kill");
+        }
+        if self.ui.filter_active {
+            out.push("filter");
+        }
+        if self.ui.show_boxes_overlay {
+            out.push("boxes");
+        }
+        // Scope stack — base is always present so skip it.
+        for name in self.scopes.stack_names().into_iter().skip(1) {
+            out.push(name);
+        }
+        out
     }
 
     /// Boxes overlay — ↑/↓ moves cursor, space/Enter toggles. Note this

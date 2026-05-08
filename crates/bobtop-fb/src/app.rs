@@ -21,7 +21,7 @@ use tokio::runtime::Runtime;
 
 use crate::fs::entry::FsEntry;
 use crate::fs::scan::{scan_dir, SortMode};
-use crate::keys::{map as map_key, Action};
+use crate::keys::{Action, BaseScope};
 use bobtop_tui::Nav;
 use crate::preview::{
     self,
@@ -503,6 +503,12 @@ pub struct App {
     /// Cleared after a few ticks so it doesn't linger.
     status_message: Option<String>,
     status_message_ticks: u8,
+    /// Key dispatch stack. Today the modals (input prompts, editor,
+    /// finder, filter) intercept keys via flag-based pre-checks in
+    /// `run`; the stack only carries the always-on `BaseScope`.
+    /// As each modal is migrated, it'll push a real `Scope` here so
+    /// the cascade collapses into a single dispatch site.
+    scopes: bobtop_tui::ScopeStack<Action>,
 }
 
 #[derive(Debug, Clone)]
@@ -644,6 +650,7 @@ impl App {
             editor: None,
             status_message: None,
             status_message_ticks: 0,
+            scopes: bobtop_tui::ScopeStack::new(Box::new(BaseScope)),
         };
         app.start_watcher();
         app.refresh()?;
@@ -1834,9 +1841,10 @@ impl App {
                             // Modal preempts chord/history routing —
                             // jump out of the special interceptors so
                             // navigation can't sneak past the modal.
-                            let action = map_key(key);
-                            if self.handle(action) {
-                                return Ok(());
+                            if let Some(action) = self.scopes.dispatch(&key) {
+                                if self.handle(action) {
+                                    return Ok(());
+                                }
                             }
                         } else if self.jump_pending() {
                             self.handle_jump_key(key);
@@ -1853,9 +1861,10 @@ impl App {
                             }
                             self.request_preview();
                         } else {
-                            let action = map_key(key);
-                            if self.handle(action) {
-                                return Ok(());
+                            if let Some(action) = self.scopes.dispatch(&key) {
+                                if self.handle(action) {
+                                    return Ok(());
+                                }
                             }
                             // The Enter handler may have queued an
                             // editor open — drain it before the next
