@@ -1,0 +1,17 @@
+[package]
+name = "gtui"
+description = "Reusable Ratatui toolkit: widgets, themes, layout, keymap, tree-walk primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["tui", "ratatui", "terminal", "ui", "toolkit"]
+categories = ["command-line-interface", "graphics::ratatui"]
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+tracing = { workspace = true }

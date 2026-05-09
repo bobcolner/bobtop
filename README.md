@@ -1,12 +1,20 @@
-# bobtop
+# gtop
 
-bobtop is a terminal system monitor in Rust with a btop-style TUI, async
+`gtop` is a terminal system monitor in Rust with a btop-style TUI, async
 sampling, and per-process network bandwidth attribution. It is Linux-first;
 macOS support is best-effort.
 
+`gtop` is one of three crates in this workspace:
+
+| Crate | Kind | What it is |
+| --- | --- | --- |
+| [`gtui`](crates/gtui)  | library | Reusable Ratatui toolkit — widgets, themes, layout, keymap |
+| [`gtop`](crates/gtop)  | binary  | btop-flavoured system monitor (this README) |
+| [`gfb`](crates/gfb)    | binary  | TUI file (and database) browser, built on `gtui` |
+
 ## Summary
 
-bobtop gives you two ways to work with the same engine:
+`gtop` gives you two ways to work with the same engine:
 
 1. The TUI for interactive monitoring.
 2. The agent query mode for structured host-state questions over a Unix socket.
@@ -21,8 +29,10 @@ Key capabilities:
 - Live per-flow network panel (toggle with `N`): pid · proc · remote · state ·
   ↓/s · ↑/s sorted by busiest, with proc_inode connection enumeration that
   works on top of any byte-attribution tier.
-- TUI file browser embedded as `bobtop fb` with a built-in nano-style editor
-  that ships live syntect syntax highlighting.
+- Companion `gfb` binary: TUI file browser with a built-in nano-style
+  editor and (with `--features all-sources`) Postgres / DuckDB /
+  DuckLake catalog browsing. Ships separately — see
+  [`crates/gfb/README.md`](crates/gfb/README.md).
 - Theme support for btop `.theme` files (42 bundled).
 - Headless daemon mode plus auto-spawning agent clients.
 
@@ -32,13 +42,13 @@ Public-release hygiene — what you can verify with the commands in
 `Tests` below:
 
 - `cargo build --release`: **zero warnings** across the workspace.
-- `cargo test --workspace`: **313 tests passing**, no `#[ignore]`s, no
+- `cargo test --workspace`: hundreds of tests passing, no `#[ignore]`s, no
   fixed-port `bind`s in tests.
 - **Zero `TODO` / `FIXME` / `XXX` / `HACK` markers** anywhere in `crates/`.
-- `#![forbid(unsafe_code)]` on every crate that doesn't need to talk to the
-  kernel; the one exception (`bobtop-pid-attr`) uses `#![deny(unsafe_code)]`
-  with a single documented `unsafe fn` for plain-bytes round-tripping a
-  libbpf-rs map value.
+- `#![forbid(unsafe_code)]` on `gtui` and `gfb`; `gtop`'s `pid_attr`
+  module uses `#![deny(unsafe_code)]` with a single documented
+  `unsafe fn` for plain-bytes round-tripping a libbpf-rs map value
+  (and an unavoidable need to talk to the kernel).
 - No `panic!` / `unwrap` / `expect` in non-test code paths.
 - `tracing` for diagnostics; `println!` / `eprintln!` only appear in
   user-facing CLI surfaces (help text, `--list-themes`).
@@ -49,10 +59,10 @@ Public-release hygiene — what you can verify with the commands in
 
 ### Agent prompt
 
-Use this prompt for an agent that should operate bobtop:
+Use this prompt for an agent that should operate `gtop`:
 
 ```text
-You are operating bobtop through its agent interface.
+You are operating gtop through its agent interface.
 Use `snapshot` for current host state, `top` for ranked process lists,
 `summary` for host or process-family rollups, `pid_inspect` for a single
 process, `window` and `peak` for history, and `responsible_for` for
@@ -62,12 +72,12 @@ Prefer the smallest query that answers the question.
 Use `--group flat|exec|cgroup|tree` when ranking processes.
 Use `--match` to narrow by process name or command line. In the raw JSON
 wire format, `match` accepts a single string or an array of strings, and
-array entries are OR'd together. In the `bobtop agent` CLI, pass one
+array entries are OR'd together. In the `gtop agent` CLI, pass one
 pattern per `--match`.
 Use `re:` for regex matching and glob wildcards like `*chrome*` for pattern
 matching.
 If a match is ambiguous, refine it or switch to `--pid`.
-Return the answer and the exact bobtop query you used.
+Return the answer and the exact gtop query you used.
 ```
 
 ### Agent verbs
@@ -87,14 +97,13 @@ Return the answer and the exact bobtop query you used.
 ```bash
 git clone https://github.com/bobcolner/bobtop
 cd bobtop
-cargo build --release -p bobtop-daemon
+cargo build --release -p gtop
 ```
 
 Optional features:
 
 | feature | adds | system deps |
 |---|---|---|
-| `fb` (default) | embeds the file browser as `bobtop fb`; bound to `b` in the TUI | none |
 | `ebpf` (default) | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
 | `pcap` | Tier 2 per-process bandwidth attribution | `libpcap-dev` |
 
@@ -103,46 +112,46 @@ Examples:
 ```bash
 # Linux + libpcap
 sudo apt install libpcap-dev
-cargo build --release -p bobtop-daemon --features pcap
+cargo build --release -p gtop --features pcap
 
 # Linux + eBPF
 sudo apt install clang libbpf-dev
-cargo build --release -p bobtop-daemon --features ebpf
+cargo build --release -p gtop --features ebpf
 ```
 
 ## Run
 
 ```bash
-./target/release/bobtop
+./target/release/gtop
 ```
 
 Useful flags:
 
 ```bash
-./target/release/bobtop --theme tokyo-night
-./target/release/bobtop --list-themes
-./target/release/bobtop --help-keys
-./target/release/bobtop --layout minimal
-./target/release/bobtop --tick-ms 500
-./target/release/bobtop --corners square
-./target/release/bobtop --tty
-./target/release/bobtop --show-virtual-net
-./target/release/bobtop --no-ebpf --no-pcap
-RUST_LOG=info ./target/release/bobtop
+./target/release/gtop --theme tokyo-night
+./target/release/gtop --list-themes
+./target/release/gtop --help-keys
+./target/release/gtop --layout minimal
+./target/release/gtop --tick-ms 500
+./target/release/gtop --corners square
+./target/release/gtop --tty
+./target/release/gtop --show-virtual-net
+./target/release/gtop --no-ebpf --no-pcap
+RUST_LOG=info ./target/release/gtop
 ```
 
-Sticky preferences live at `~/.config/bobtop/bobtop.toml`. CLI flags override
+Sticky preferences live at `~/.config/gtop/gtop.toml`. CLI flags override
 file values. Edit live in the TUI via the `O` overlay.
 
 Agent mode:
 
 ```bash
-./target/release/bobtop agent snapshot
-./target/release/bobtop agent top --by cpu --n 5
-./target/release/bobtop agent top --by mem --group exec --match '*chrome*' --match 're:^pg_'
-./target/release/bobtop agent summary --match 'node' --match 'redis'
-./target/release/bobtop agent pid_inspect --match 'postgres' --match 're:^pg_'
-./target/release/bobtop agent summary --pid 1234
+./target/release/gtop agent snapshot
+./target/release/gtop agent top --by cpu --n 5
+./target/release/gtop agent top --by mem --group exec --match '*chrome*' --match 're:^pg_'
+./target/release/gtop agent summary --match 'node' --match 'redis'
+./target/release/gtop agent pid_inspect --match 'postgres' --match 're:^pg_'
+./target/release/gtop agent summary --pid 1234
 ```
 
 Raw socket example:
@@ -176,7 +185,7 @@ Raw socket example:
 
 ## Architecture
 
-bobtop is organized around a shared engine and thin front-ends.
+`gtop` is organized around a shared engine and thin front-ends.
 
 ### Runtime design
 
@@ -184,25 +193,21 @@ bobtop is organized around a shared engine and thin front-ends.
 - The engine publishes samples into a latest-value store and a history ring.
 - The TUI reads the same engine state for display.
 - The agent server exposes that state over a Unix socket as line-delimited JSON.
-- The CLI client can auto-connect or auto-spawn `bobtop --daemon` when the
+- The CLI client can auto-connect or auto-spawn `gtop --daemon` when the
   socket is missing.
 
 ### Workspace layout
 
 | crate | role |
 |---|---|
-| `bobtop-core` | shared types, history, sample store, bus, and common helpers |
-| `bobtop-collectors` | CPU, memory, network, disk, and process collectors |
-| `bobtop-pid-attr` | per-process network and disk attribution helpers |
-| `bobtop-engine` | sampling engine plus agent query surface |
-| `bobtop-tui` | ratatui widgets, themes, and layout code |
-| `bobtop-fb` | TUI file browser + embedded nano-style editor |
-| `bobtop-daemon` | binary, CLI, and TUI wiring |
+| `gtui` | reusable Ratatui toolkit — widgets, themes, layout, keymap, tree |
+| `gtop` | the system monitor (this README). Internal `core/`, `collectors/`, `engine/`, `pid_attr/` modules. |
+| `gfb` | TUI file (and optional DB) browser + embedded nano-style editor |
 
 ### Agent surface
 
-The agent socket lives at `$XDG_RUNTIME_DIR/bobtop.sock`, with a fallback to
-`/tmp/bobtop-$UID.sock`. Responses are schema-versioned as `bobtop/v1`.
+The agent socket lives at `$XDG_RUNTIME_DIR/gtop.sock`, with a fallback to
+`/tmp/gtop-$UID.sock`. Responses are schema-versioned as `gtop/v1`.
 
 The current query surface is read-only and includes:
 
@@ -221,7 +226,7 @@ array entries are OR'd.
 
 ### Attribution tiers
 
-bobtop chooses the best available bandwidth attribution backend at startup.
+`gtop` chooses the best available bandwidth attribution backend at startup.
 
 | tier | backend | per-pid bytes | privilege |
 |---|---|---|---|
@@ -233,16 +238,16 @@ bobtop chooses the best available bandwidth attribution backend at startup.
 To unlock tier 3 on Linux without root:
 
 ```bash
-sudo setcap 'cap_bpf,cap_perfmon=ep' ./target/release/bobtop
-./target/release/bobtop
+sudo setcap 'cap_bpf,cap_perfmon=ep' ./target/release/gtop
+./target/release/gtop
 ```
 
 ## Themes
 
-bobtop reads btop's native `.theme` format directly. All bundled themes ship
+`gtop` reads btop's native `.theme` format directly. All bundled themes ship
 in the binary. Drop your own at:
 
-- `~/.config/bobtop/themes/<name>.theme`
+- `~/.config/gtop/themes/<name>.theme`
 - `~/.config/btop/themes/<name>.theme`
 
 Then run `--theme <name>`.
@@ -251,17 +256,8 @@ Then run `--theme <name>`.
 
 ```bash
 cargo test --workspace
-cargo test -p bobtop-daemon --features pcap
-cargo bench -p bobtop-daemon
-```
-
-Visual smoke tests:
-
-```bash
-cargo run --example frame_smoke -p bobtop-daemon
-cargo run --example braille_smoke -p bobtop-daemon
-cargo run --example collectors_smoke -p bobtop-daemon
-cargo run --example ebpf_smoke -p bobtop-daemon --features ebpf
+cargo test -p gtop --features pcap
+cargo bench -p gtop
 ```
 
 ## License
@@ -275,6 +271,6 @@ Dual-licensed under either of:
 
 at your option.
 
-The vendored `.theme` files in `crates/bobtop-tui/themes/` come from
+The vendored `.theme` files in `crates/gtui/themes/` come from
 [aristocratos/btop](https://github.com/aristocratos/btop) and are
-redistributed under Apache-2.0; see `crates/bobtop-tui/themes/NOTICE`.
+redistributed under Apache-2.0; see `crates/gtui/themes/NOTICE`.

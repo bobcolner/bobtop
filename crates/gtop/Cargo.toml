@@ -1,0 +1,84 @@
+[package]
+name = "gtop"
+description = "btop-flavoured TUI system monitor: CPU, memory, network, disk, per-process bandwidth attribution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["monitor", "system", "tui", "btop", "ebpf"]
+categories = ["command-line-utilities", "os::linux-apis"]
+build = "build.rs"
+
+[lib]
+name = "gtop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gtop"
+path = "src/main.rs"
+
+[dependencies]
+gtui = { workspace = true }
+
+# Async runtime + plumbing (used by core, collectors, pid_attr, engine,
+# and the daemon glue).
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Errors / logging
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Config + CLI
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# TUI
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+
+# System data sources
+sysinfo = { workspace = true }
+libc = { workspace = true }
+
+# Engine query / matching
+globset = { workspace = true }
+regex = { workspace = true }
+
+# Optional: Tier 2 — userspace packet capture (pcap_backend module).
+pcap = { workspace = true, optional = true }
+
+# Tier 3 — eBPF userspace loader. Linux-only at the source level; the
+# `cfg(target_os = "linux")` gate keeps macOS builds clean even when
+# `ebpf` is requested.
+[target.'cfg(target_os = "linux")'.dependencies]
+libbpf-rs = { workspace = true, optional = true }
+
+# build.rs runs SkeletonBuilder at compile time to compile BPF C → ELF
+# and emit typed Rust skeletons. Build-deps run on the host, so this is
+# fine to leave un-target-gated; the feature flag still controls
+# whether it gets pulled in.
+[build-dependencies]
+libbpf-cargo = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "render_loop"
+harness = false
+
+[features]
+# eBPF on by default — build.rs gracefully no-ops when clang /
+# libbpf-dev aren't present, so gtop still builds on bare-bones
+# systems; it just falls through to Tier 2/1 attribution at runtime.
+default = ["ebpf"]
+ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
+pcap = ["dep:pcap"]

@@ -1,33 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bobtop-core",
-    "crates/bobtop-collectors",
-    "crates/bobtop-pid-attr",
-    "crates/bobtop-engine",
-    "crates/bobtop-tui",
-    "crates/bobtop-daemon",
-    "crates/bobtop-db",
-    "crates/bobtop-fb",
+    "crates/gtui",
+    "crates/gtop",
+    "crates/gfb",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bobcolner/bobtop"
-authors = ["bobtop contributors"]
+authors = ["gtop contributors"]
 
 [workspace.dependencies]
-# First-party crates (path-resolved within the workspace)
-bobtop-core = { path = "crates/bobtop-core" }
-bobtop-collectors = { path = "crates/bobtop-collectors" }
-bobtop-pid-attr = { path = "crates/bobtop-pid-attr" }
-bobtop-engine = { path = "crates/bobtop-engine" }
-bobtop-tui = { path = "crates/bobtop-tui" }
-bobtop-db = { path = "crates/bobtop-db" }
-bobtop-fb = { path = "crates/bobtop-fb" }
+# First-party crates. Both `path` (dev) and `version` (publish) —
+# `cargo publish` strips the path when packaging and pins the
+# crates.io version we declare here.
+gtui = { path = "crates/gtui", version = "0.3.0" }
+gfb = { path = "crates/gfb", version = "0.3.0" }
 
 # TUI rendering
 ratatui = "0.29"
@@ -39,10 +31,10 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
-# Postgres client (used by bobtop-db)
+# Postgres client (used by gfb's `postgres` feature)
 tokio-postgres = "0.7"
 
-# DuckDB client (used by bobtop-db). `bundled` builds libduckdb from
+# DuckDB client (used by gfb's `duckdb` feature). `bundled` builds libduckdb from
 # source so we don't depend on a system install — first compile is
 # slow (~2-3 min) but every subsequent build is incremental.
 #
