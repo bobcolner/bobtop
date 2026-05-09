@@ -95,60 +95,6 @@ pub fn restore_terminal(term: &mut Term) -> io::Result<()> {
     Ok(())
 }
 
-/// Re-enter the alt screen + raw mode on an existing `Term` — the
-/// inverse of `restore_terminal`. Used after running a subprocess
-/// (`gtop fb`, `$EDITOR`, etc.) that took the terminal for itself
-/// and returned. We force a full clear so ratatui's diff buffer
-/// resyncs against whatever the terminal shows now.
-pub fn re_init_terminal(term: &mut Term) -> io::Result<()> {
-    enable_raw_mode()?;
-    execute!(
-        term.backend_mut(),
-        EnterAlternateScreen,
-        EnableFocusChange,
-        Hide,
-        // Restore the title — the subprocess we're returning from
-        // (`gtop fb`, `$EDITOR`) will have stamped its own.
-        SetTitle("gtop"),
-    )?;
-    term.clear()?;
-    Ok(())
-}
-
-/// Suspend the gtop UI, re-exec ourselves with the `fb` subcommand
-/// to run the file browser, then resume gtop on return. Pauses the
-/// input thread for the duration so the child has the terminal to
-/// itself. Lives behind `cfg(feature = "fb")` — monitor-only builds
-/// strip this and the matching `b` keybind together.
-#[cfg(feature = "fb")]
-pub fn launch_file_browser(
-    term: &mut Term,
-    start: &std::path::Path,
-    theme_name: &str,
-) -> io::Result<()> {
-    pause_input_thread();
-    // Reverse the gtop terminal setup so the child can do its own
-    // EnterAlternateScreen / raw mode without nesting ours.
-    let _ = restore_terminal(term);
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("gtop"));
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("fb");
-    // An empty path means "let fb resume its persisted last_cwd";
-    // anything else is an explicit override (proc cwd from `b` on a
-    // selected process row).
-    if !start.as_os_str().is_empty() {
-        cmd.arg(start);
-    }
-    cmd.arg("--theme").arg(theme_name);
-    let status = cmd.status();
-    let _ = re_init_terminal(term);
-    resume_input_thread();
-    match status {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -160,21 +106,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Pause flag for the input thread. While true, the thread sleeps
-/// instead of consuming stdin events — that way a child process
-/// (e.g. `gtop fb`) can read the terminal without racing us.
-/// Toggled via `pause_input_thread()` / `resume_input_thread()`.
-static INPUT_PAUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub fn pause_input_thread() {
-    INPUT_PAUSED.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn resume_input_thread() {
-    INPUT_PAUSED.store(false, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// Spawn a blocking OS thread that polls crossterm and forwards events
 /// onto the async runtime via an unbounded mpsc.
 pub fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
@@ -182,12 +113,6 @@ pub fn spawn_input_thread() -> mpsc::UnboundedReceiver<Event> {
     std::thread::Builder::new()
         .name("gtop-input".into())
         .spawn(move || loop {
-            // While paused, sleep without polling so the child has
-            // the terminal to itself.
-            if INPUT_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
@@ -262,49 +187,12 @@ pub async fn run(
             input = input_rx.recv() => {
                 match input {
                     Some(ev) => {
-                        let (flow, browser_launch, theme_name) = {
+                        let flow = {
                             let mut g = lock(&app);
-                            let flow = g.handle_input(ev);
-                            // Drain the launch request before unlocking
-                            // so a second `b` press during the launch
-                            // can't queue another one.
-                            let launch = g.ui.pending_browser_launch.take();
-                            let theme = g.theme.name.clone();
-                            (flow, launch, theme)
+                            g.handle_input(ev)
                         };
                         if matches!(flow, ControlFlow::Quit) {
                             return Ok(());
-                        }
-                        if let Some(_start) = browser_launch {
-                            #[cfg(feature = "fb")]
-                            {
-                                // Subprocess launch — paused input thread,
-                                // restored terminal, ran child, re-init,
-                                // resumed thread.
-                                if let Err(e) = launch_file_browser(term, &_start, &theme_name) {
-                                    // Log AND surface to the user — this
-                                    // is the path that historically
-                                    // black-holed errors and made `b`
-                                    // appear "stuck."
-                                    tracing::warn!(error = %e, "file-browser launch failed");
-                                    let mut g = lock(&app);
-                                    g.ui.last_options_msg =
-                                        Some(format!("file browser: {}", e));
-                                    g.ui.dirty = true;
-                                }
-                                // ratatui's prev-buffer is stale after the
-                                // child scribbled over the screen; mark a
-                                // full repaint so the next draw clears.
-                                let mut g = lock(&app);
-                                g.ui.force_full_repaint = true;
-                                g.take_dirty();
-                                term.draw(|f| ui::draw(f, &g))?;
-                            }
-                            // suppress the unused-warning when fb feature is off
-                            #[cfg(not(feature = "fb"))]
-                            {
-                                let _ = theme_name;
-                            }
                         }
                     }
                     None => return Ok(()),

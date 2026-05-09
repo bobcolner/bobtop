@@ -14,7 +14,6 @@ Optional features:
 
 | feature | adds | system deps |
 |---|---|---|
-| `fb` (default) | embeds the file browser as `gtop fb`; bound to `b` | none |
 | `ebpf` (default) | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
 | `pcap` | Tier 2 per-process bandwidth attribution | `libpcap-dev` |
 
@@ -55,8 +54,6 @@ the TUI via the `O` overlay.
   required.
 - Live per-flow network panel (toggle `N`): pid · proc · remote ·
   state · ↓/s · ↑/s sorted by busiest.
-- Embedded file browser: press `b` (or `gtop fb …` from the
-  shell). Standalone version is `gfb`.
 - 41 btop `.theme` files bundled. Drop your own at
   `~/.config/gtop/themes/<name>.theme` or
   `~/.config/btop/themes/<name>.theme`.

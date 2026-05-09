@@ -21,11 +21,6 @@ path = "src/main.rs"
 
 [dependencies]
 gtui = { workspace = true }
-# gfb is folded into the gtop binary as a `gtop fb …` subcommand when
-# the default `fb` feature is on. Build with `--no-default-features
-# --features ebpf` to drop the file browser entirely (saves ~5 MB of
-# binary size + the syntect/image/viuer/notify/trash dep tree).
-gfb = { workspace = true, optional = true }
 
 # Async runtime + plumbing (used by core, collectors, pid_attr, engine,
 # and the daemon glue).
@@ -81,15 +76,9 @@ name = "render_loop"
 harness = false
 
 [features]
-# eBPF on by default — build.rs gracefully no-ops when clang / libbpf-dev
-# aren't present, so gtop still builds on bare-bones systems; it just
-# falls through to Tier 2/1 attribution at runtime.
-#
-# `fb` folds gfb into the binary so `gtop fb …` works and the `b`
-# keybind opens the file browser as a subprocess of the same
-# executable. Opt out with `--no-default-features --features ebpf` for
-# a leaner monitor-only build.
-default = ["ebpf", "fb"]
+# eBPF on by default — build.rs gracefully no-ops when clang /
+# libbpf-dev aren't present, so gtop still builds on bare-bones
+# systems; it just falls through to Tier 2/1 attribution at runtime.
+default = ["ebpf"]
 ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
 pcap = ["dep:pcap"]
-fb = ["dep:gfb"]

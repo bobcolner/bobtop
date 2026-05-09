@@ -1417,7 +1417,6 @@ dependencies = [
  "clap",
  "criterion",
  "crossterm",
- "gfb",
  "globset",
  "gtui",
  "libbpf-cargo",

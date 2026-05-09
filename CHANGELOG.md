@@ -60,6 +60,10 @@ First release under the `gtop` family banner. Three crates ship:
 - `bobtop-db` crate dissolved into `gfb`. Its tree state / catalog
   abstraction lives in `gfb::sources::multi`; its DB backends in
   `gfb::sources::{db,pg,duckdb}`.
+- `gtop`'s `fb` feature (the `gtop fb …` subcommand + the `b`
+  keybind that re-execs the binary as a file browser). The two-app
+  end state means `gfb` is the file browser; `gtop` no longer
+  bundles it. Drops gtop's release binary from ~47 MB to **5.5 MB**.
 
 ### Internal
 

@@ -235,8 +235,6 @@ pub const HELP_LINES: &[(&str, &str)] = &[
     ("?", "toggle this help"),
     ("q / Ctrl-C", "quit"),
     ("Esc", "close overlay (or quit when none open)"),
-    #[cfg(feature = "fb")]
-    ("b", "open file browser (resumes last directory)"),
     // panels
     ("1 / 2 / 3 / 4 / 5", "cycle CPU / Mem / Net / Proc / Disk size (default → large → off)"),
     ("B", "boxes overlay — quick on/off toggle for each panel"),

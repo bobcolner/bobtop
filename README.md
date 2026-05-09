@@ -29,8 +29,10 @@ Key capabilities:
 - Live per-flow network panel (toggle with `N`): pid · proc · remote · state ·
   ↓/s · ↑/s sorted by busiest, with proc_inode connection enumeration that
   works on top of any byte-attribution tier.
-- TUI file browser embedded as `gtop fb` (and standalone as `gfb`) with a
-  built-in nano-style editor that ships live syntect syntax highlighting.
+- Companion `gfb` binary: TUI file browser with a built-in nano-style
+  editor and (with `--features all-sources`) Postgres / DuckDB /
+  DuckLake catalog browsing. Ships separately — see
+  [`crates/gfb/README.md`](crates/gfb/README.md).
 - Theme support for btop `.theme` files (42 bundled).
 - Headless daemon mode plus auto-spawning agent clients.
 
@@ -43,10 +45,10 @@ Public-release hygiene — what you can verify with the commands in
 - `cargo test --workspace`: hundreds of tests passing, no `#[ignore]`s, no
   fixed-port `bind`s in tests.
 - **Zero `TODO` / `FIXME` / `XXX` / `HACK` markers** anywhere in `crates/`.
-- `#![forbid(unsafe_code)]` on every crate that doesn't need to talk to the
-  kernel; the one exception (`bobtop-pid-attr`) uses `#![deny(unsafe_code)]`
-  with a single documented `unsafe fn` for plain-bytes round-tripping a
-  libbpf-rs map value.
+- `#![forbid(unsafe_code)]` on `gtui` and `gfb`; `gtop`'s `pid_attr`
+  module uses `#![deny(unsafe_code)]` with a single documented
+  `unsafe fn` for plain-bytes round-tripping a libbpf-rs map value
+  (and an unavoidable need to talk to the kernel).
 - No `panic!` / `unwrap` / `expect` in non-test code paths.
 - `tracing` for diagnostics; `println!` / `eprintln!` only appear in
   user-facing CLI surfaces (help text, `--list-themes`).
@@ -102,7 +104,6 @@ Optional features:
 
 | feature | adds | system deps |
 |---|---|---|
-| `fb` (default) | embeds the file browser as `gtop fb`; bound to `b` in the TUI | none |
 | `ebpf` (default) | Tier 3 per-process bandwidth attribution | `clang`, `libbpf-dev` |
 | `pcap` | Tier 2 per-process bandwidth attribution | `libpcap-dev` |
 
@@ -199,16 +200,9 @@ Raw socket example:
 
 | crate | role |
 |---|---|
-| `bobtop-core` | shared types, history, sample store, bus, and common helpers |
-| `bobtop-collectors` | CPU, memory, network, disk, and process collectors |
-| `bobtop-pid-attr` | per-process network and disk attribution helpers |
-| `bobtop-engine` | sampling engine plus agent query surface |
-| `gtui` | reusable Ratatui toolkit — widgets, themes, layout, keymap |
-| `gfb` | TUI file browser + embedded nano-style editor |
-| `gtop` | the monitor binary, CLI, and TUI wiring |
-
-The four `bobtop-*` plumbing crates are scheduled to fold into `gtop` as
-internal modules in Phase 1 of the [gtop refactor](docs/gtop-refactor.md).
+| `gtui` | reusable Ratatui toolkit — widgets, themes, layout, keymap, tree |
+| `gtop` | the system monitor (this README). Internal `core/`, `collectors/`, `engine/`, `pid_attr/` modules. |
+| `gfb` | TUI file (and optional DB) browser + embedded nano-style editor |
 
 ### Agent surface
 

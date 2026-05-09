@@ -18,20 +18,19 @@ use gtop::cli::{Cli, LayoutChoice};
 use gtop::monitor_theme;
 use gtop::tui;
 
-// Synchronous entry point: handles the multi-call dispatches (`agent`,
-// `fb`) without entering a tokio runtime. Both subcommands build their
-// own runtimes internally — the agent client constructs a single-thread
-// runtime for the socket round-trip, and the fb crate constructs a
-// multi-thread runtime for its preview pipeline. Wrapping them in an
-// outer `#[tokio::main]` runtime would mean dropping the inner runtime
-// inside the outer's async context, which tokio panics on:
+// Synchronous entry point: handles the `agent` subcommand without
+// entering a tokio runtime. The agent client constructs its own
+// single-thread runtime for the socket round-trip; wrapping it in an
+// outer `#[tokio::main]` runtime would mean dropping the inner
+// runtime inside the outer's async context, which tokio panics on:
 //
 //     "Cannot drop a runtime in a context where blocking is not allowed."
 //
-// Symptom: `gtop fb` (and the `b` keybind that re-execs to it) would
-// crash on every invocation. Splitting the entry point keeps the daemon
-// path wrapped (it really is async) while letting the dispatched
-// subcommands run in plain sync context.
+// Symptom (historical): the `gtop agent` subcommand built its own
+// inner runtime and dropped it inside an outer `#[tokio::main]` async
+// context, which tokio panics on. Splitting the entry point keeps
+// the daemon path wrapped (it really is async) while letting the
+// dispatched agent client run in plain sync context.
 fn main() -> Result<()> {
     // Short-circuit: `gtop agent <subcommand>` is a thin Unix-socket
     // client that never starts collectors or the TUI. Detect it before
@@ -41,18 +40,6 @@ fn main() -> Result<()> {
     if raw_args.first().map(|s| s.as_str()) == Some("agent") {
         let code = gtop::agent::client::run(&raw_args[1..]);
         std::process::exit(code);
-    }
-    // `gtop fb …` — BusyBox-style multi-call entry. Dispatches to
-    // the file-browser CLI without spawning a separate binary; the
-    // `b` keybind in the main UI also re-execs us with this prefix.
-    // Behind the `fb` feature so monitor-only builds skip the dep
-    // graph entirely.
-    #[cfg(feature = "fb")]
-    if raw_args.first().map(|s| s.as_str()) == Some("fb") {
-        let prog = std::env::args().next().unwrap_or_else(|| "gfb".into());
-        let mut fb_args = vec![prog];
-        fb_args.extend(raw_args.iter().skip(1).cloned());
-        return gfb::cli::run(fb_args);
     }
 
     // Daemon / TUI path is genuinely async — build the runtime here and

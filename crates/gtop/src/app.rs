@@ -925,18 +925,6 @@ impl App {
                 self.ui.boxes_overlay_cursor = 0;
                 ControlFlow::Continue
             }
-            #[cfg(feature = "fb")]
-            KeyCode::Char('b') => {
-                // Lowercase `b` launches gfb as a subprocess.
-                // Always resume from fb's persisted state (last_cwd)
-                // so bouncing in and out of `b` keeps you in the
-                // same browser directory. The previous "jump to
-                // selected proc's /proc/<pid>/cwd" flow was actively
-                // fighting this — left as a placeholder for a
-                // separate keybind (Shift-B?) if it returns.
-                self.ui.pending_browser_launch = Some(std::path::PathBuf::new());
-                ControlFlow::Continue
-            }
             KeyCode::Char('f') => {
                 // Open the filter input (B3b). If a filter is already applied
                 // (text non-empty, but not in edit mode), `f` re-enters edit
