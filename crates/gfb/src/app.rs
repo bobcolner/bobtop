@@ -706,7 +706,7 @@ impl App {
             db_preview: None,
         };
         // Auto-expand each DB endpoint so the user immediately sees
-        // its database list — same UX bobtop-db ships when starting.
+        // its database list rather than a collapsed connection row.
         for i in 0..app.connections.len() {
             app.tree_state.expanded.insert(crate::sources::AnyNodeId::Db {
                 root: i,

@@ -7,10 +7,11 @@
 //! describe its domain (what's a node, what are its children, can it
 //! expand).
 //!
-//! Both `gfb` (file/db browser) and the embedded `bobtop-db` browser
-//! used to ship near-identical "walk and emit a flat row list" loops;
-//! this module retires that duplication. See `docs/gtop-refactor.md`
-//! §"Phase 2 · `tree` module in `gtui`".
+//! `gfb`'s filesystem tree-mode and database tree pane share this
+//! same flatten machinery — one [`flatten`] walker, two [`Catalog`]
+//! impls plugged into one [`MultiRootCatalog`](
+//! https://docs.rs/gfb/latest/gfb/sources/struct.MultiRootCatalog.html).
+//! See `docs/gtop-refactor.md` §"Phase 2 · `tree` module in `gtui`".
 //!
 //! # Quick example
 //!

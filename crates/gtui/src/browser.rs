@@ -1,7 +1,7 @@
 //! Two-pane tree + preview composition helper.
 //!
-//! Both `gfb` and `bobtop-db` ship the same UI shape: a tree on the
-//! left, a preview on the right. The tree pane is always a
+//! `gfb` ships a tree-on-the-left + preview-on-the-right shape for
+//! both filesystem and database browsing. The tree pane is always a
 //! [`crate::widgets::LiveTable`] in tree-glyph mode wrapped in a
 //! [`crate::widgets::BoxedPanel`]; the preview pane is domain-specific
 //! (file content, DB rows, table rows).

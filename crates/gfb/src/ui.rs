@@ -923,9 +923,10 @@ fn draw_db_preview(
         return;
     }
 
-    // Build columns. Labels need 'static — leak each on the
-    // hot path. Same approach the bobtop-db preview pane used; the
-    // alternative (Cow-typed labels in LiveTable) is a follow-up.
+    // Build columns. Labels need 'static — leak each on the hot
+    // path. The alternative (Cow-typed labels in LiveTable) is a
+    // follow-up; matters once a session churns through hundreds of
+    // tables.
     let columns: Vec<ColumnDef<usize>> = preview
         .columns
         .iter()

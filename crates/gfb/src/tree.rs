@@ -233,9 +233,7 @@ impl TableRowExt<FbCol> for TreeRow {
             }
             (AnyRow::Fs(e), FbCol::Modified) => Cell::plain(format_mtime(e.mtime)),
             (AnyRow::Db(d), FbCol::Name) => {
-                // Database / schema / endpoint glyphs mirror the ones
-                // bobtop-db ships so the visual language stays
-                // recognizable.
+                // Database / schema / endpoint glyphs.
                 let glyph = match d.kind {
                     NodeKind::Endpoint => "🔌",
                     NodeKind::Database => "🗄",

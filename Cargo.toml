@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/gtui",
     "crates/gtop",
-    "crates/bobtop-db",
     "crates/gfb",
 ]
 
@@ -18,7 +17,6 @@ authors = ["bobtop contributors"]
 [workspace.dependencies]
 # First-party crates (path-resolved within the workspace)
 gtui = { path = "crates/gtui" }
-bobtop-db = { path = "crates/bobtop-db" }
 gfb = { path = "crates/gfb" }
 
 # TUI rendering
@@ -31,10 +29,10 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
-# Postgres client (used by bobtop-db)
+# Postgres client (used by gfb's `postgres` feature)
 tokio-postgres = "0.7"
 
-# DuckDB client (used by bobtop-db). `bundled` builds libduckdb from
+# DuckDB client (used by gfb's `duckdb` feature). `bundled` builds libduckdb from
 # source so we don't depend on a system install — first compile is
 # slow (~2-3 min) but every subsequent build is incremental.
 #
