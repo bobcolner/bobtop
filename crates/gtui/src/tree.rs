@@ -104,10 +104,22 @@ pub struct TreeRow<I, R> {
 /// Bundle of per-tree mutable state: which nodes are expanded, plus a
 /// [`Nav`] cursor over the flattened row list. Apps that want to
 /// implement custom navigation can manage these fields directly.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TreeState<I: Eq + Hash> {
     pub expanded: HashSet<I>,
     pub nav: Nav,
+}
+
+// Manual `Default` so callers don't need `I: Default`. Useful when
+// the NodeId is an enum (no obvious zero value) — gfb's
+// multi-source tree hits this.
+impl<I: Eq + Hash> Default for TreeState<I> {
+    fn default() -> Self {
+        Self {
+            expanded: HashSet::new(),
+            nav: Nav::default(),
+        }
+    }
 }
 
 /// Outcome of [`TreeState::toggle_at`]. Lets callers distinguish a

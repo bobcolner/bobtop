@@ -516,15 +516,33 @@ pub struct App {
     /// dominant preview on the right). State below the line is only
     /// used in tree mode; toggling between modes preserves it.
     pub(crate) view_mode: ViewMode,
-    /// Tree-mode state: the expanded-directories set + cursor / scroll.
-    /// Tree view recursively walks every expanded subdir under cwd to
-    /// build its flattened row list.
-    pub(crate) tree_state: gtui::tree::TreeState<PathBuf>,
+    /// Tree-mode state: the expanded-nodes set + cursor / scroll.
+    /// Tree view stacks the cwd's filesystem children with each
+    /// `--connect`'d database endpoint as siblings at depth 0; the
+    /// expansion set keys on [`crate::sources::AnyNodeId`] so it
+    /// persists per-source across re-flattens.
+    pub(crate) tree_state: gtui::tree::TreeState<crate::sources::AnyNodeId>,
     /// Sort column for tree mode. Independent of `sort` (which is
     /// the miller-mode sort) so toggling between modes doesn't
     /// disrupt either.
     pub(crate) tree_sort: crate::tree::FbCol,
     pub(crate) tree_sort_descending: bool,
+    /// Database endpoints attached at startup via `--connect`.
+    /// Empty vec means filesystem-only browsing — tree mode behaves
+    /// exactly as it did pre-Phase-5.
+    pub(crate) connections: Vec<Box<dyn crate::sources::Connection>>,
+    /// Cached preview-row LiveTable for the currently-selected DB
+    /// table. Replaced lazily on selection change. `None` while idle
+    /// or when the selection is a filesystem entry.
+    pub(crate) db_preview: Option<DbPreview>,
+}
+
+/// Loaded preview rows for one DB table.
+#[derive(Debug, Clone)]
+pub(crate) struct DbPreview {
+    pub path: crate::sources::NodePath,
+    pub columns: Vec<crate::sources::ColumnSpec>,
+    pub rows: Vec<crate::sources::Row>,
 }
 
 /// Top-level view mode. Switched with `T`.
@@ -616,13 +634,14 @@ impl App {
     /// `new_with`; this entry point is kept for symmetric API.
     #[allow(dead_code)]
     pub fn new(start: PathBuf, theme: Theme) -> io::Result<Self> {
-        Self::new_with(start, theme, ImageBackendChoice::Auto)
+        Self::new_with(start, theme, ImageBackendChoice::Auto, Vec::new())
     }
 
     pub fn new_with(
         start: PathBuf,
         theme: Theme,
         backend_choice: ImageBackendChoice,
+        connections: Vec<Box<dyn crate::sources::Connection>>,
     ) -> io::Result<Self> {
         let cwd = start.canonicalize().unwrap_or(start);
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -683,7 +702,17 @@ impl App {
             tree_state: gtui::tree::TreeState::default(),
             tree_sort: crate::tree::FbCol::Name,
             tree_sort_descending: false,
+            connections,
+            db_preview: None,
         };
+        // Auto-expand each DB endpoint so the user immediately sees
+        // its database list — same UX bobtop-db ships when starting.
+        for i in 0..app.connections.len() {
+            app.tree_state.expanded.insert(crate::sources::AnyNodeId::Db {
+                root: i,
+                path: crate::sources::NodePath::endpoint(i),
+            });
+        }
         app.start_watcher();
         app.refresh()?;
         app.request_preview();
@@ -717,6 +746,14 @@ impl App {
 
     pub fn show_hidden(&self) -> bool {
         self.show_hidden
+    }
+
+    pub fn connections(&self) -> &[Box<dyn crate::sources::Connection>] {
+        &self.connections
+    }
+
+    pub fn db_preview(&self) -> Option<&DbPreview> {
+        self.db_preview.as_ref()
     }
 
     pub fn selected(&self) -> Option<&FsEntry> {
@@ -1092,6 +1129,54 @@ impl App {
     /// freshly-flattened tree and queue a preview for its path. The
     /// flatten cost is bounded — only `cwd` plus expanded subdirs are
     /// scanned — and only fires when the cursor moves.
+    /// Load (or refresh) the preview-rows cache for the DB node at
+    /// the cursor. Only fires for `Table`-kind rows; expanding
+    /// endpoints / databases / schemas is handled by tree
+    /// expansion, not preview. Failures are reported via the status
+    /// message and clear any prior preview.
+    fn request_db_preview(&mut self, id: crate::sources::AnyNodeId) {
+        let crate::sources::AnyNodeId::Db { root, path } = id else {
+            self.db_preview = None;
+            return;
+        };
+        if path.level() != crate::sources::NodeKind::Table {
+            // Endpoints / databases / schemas don't have a row preview.
+            self.db_preview = None;
+            return;
+        }
+        if matches!(&self.db_preview, Some(p) if p.path == path) {
+            return;
+        }
+        let Some(conn) = self.connections.get(root) else {
+            self.db_preview = None;
+            return;
+        };
+        let db = path.database.as_deref().unwrap_or_default();
+        let sch = path.schema.as_deref().unwrap_or_default();
+        let tbl = path.table.as_deref().unwrap_or_default();
+        let columns = match conn.columns(db, sch, tbl) {
+            Ok(c) => c,
+            Err(e) => {
+                self.db_preview = None;
+                self.flash_status(format!("columns({tbl}) failed: {e}"));
+                return;
+            }
+        };
+        let rows = match conn.preview_rows(db, sch, tbl, 100) {
+            Ok(r) => r,
+            Err(e) => {
+                self.db_preview = None;
+                self.flash_status(format!("preview_rows({tbl}) failed: {e}"));
+                return;
+            }
+        };
+        self.db_preview = Some(DbPreview {
+            path,
+            columns,
+            rows,
+        });
+    }
+
     fn request_tree_preview(&mut self) {
         let rows = crate::tree::flatten_tree(
             &self.cwd,
@@ -1100,13 +1185,30 @@ impl App {
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
+            &self.connections,
         );
         let Some(row) = rows.get(self.tree_state.nav.cursor).cloned() else {
             self.preview_state = PreviewState::None;
             self.preview_scroll = 0;
+            self.db_preview = None;
             return;
         };
-        let path = row.row.path;
+        // DB selections route to the table-preview pipeline; the file
+        // preview state stays as it was so flipping selection
+        // back to a file doesn't cost a re-render. DB-table preview
+        // load happens in `request_db_preview`.
+        let entry = match &row.row {
+            crate::sources::AnyRow::Fs(e) => e.clone(),
+            crate::sources::AnyRow::Db(_) => {
+                self.preview_state = PreviewState::None;
+                self.preview_scroll = 0;
+                self.request_db_preview(row.id.clone());
+                return;
+            }
+        };
+        // Filesystem-row path: same flow as before.
+        self.db_preview = None;
+        let path = entry.path;
         if matches!(&self.preview_state, PreviewState::Ready { path: p, .. } | PreviewState::Loading(p) | PreviewState::Error { path: p, .. } if *p == path)
         {
             return;
@@ -1147,6 +1249,7 @@ impl App {
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
+            &self.connections,
         )
         .len();
         let prior_cursor = self.tree_state.nav.cursor;
@@ -1179,12 +1282,11 @@ impl App {
                 self.tree_state.nav.end(total);
             }
             Action::EnterDir => {
-                // On a directory: expand it and step the cursor into
-                // the first child. On a file: leave the cursor where
-                // it is (the preview already shows the file's
-                // contents). The toolkit's `toggle_at` returns the
-                // expanded NodeId so we can detect a fresh expansion
-                // and step in only on that path.
+                // On an expandable row (filesystem directory or DB
+                // endpoint/database/schema): expand it and step the
+                // cursor into the first child. On a leaf (file or DB
+                // table): leave the cursor where it is — the preview
+                // already shows the leaf's contents.
                 let rows = crate::tree::flatten_tree(
                     &self.cwd,
                     &self.tree_state.expanded,
@@ -1192,6 +1294,7 @@ impl App {
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
+                    &self.connections,
                 );
                 let cursor = self.tree_state.nav.cursor;
                 if let gtui::tree::ToggleOutcome::Expanded(_) =
@@ -1201,9 +1304,9 @@ impl App {
                 }
             }
             Action::ParentDir => {
-                // On an expanded directory at the cursor: collapse
-                // it. Otherwise jump cursor to the parent dir row,
-                // or `cd ..` when at the root.
+                // On an expanded row at the cursor: collapse it.
+                // Otherwise jump cursor to the parent row, or
+                // `cd ..` when on the filesystem root level.
                 let rows = crate::tree::flatten_tree(
                     &self.cwd,
                     &self.tree_state.expanded,
@@ -1211,6 +1314,7 @@ impl App {
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
+                    &self.connections,
                 );
                 match self.tree_state.collapse_or_parent(&rows) {
                     gtui::tree::ParentOutcome::Collapsed(_)
@@ -1252,10 +1356,15 @@ impl App {
                     self.tree_sort_descending,
                     self.show_hidden,
                     self.filter.as_deref(),
+                    &self.connections,
                 );
                 if let Some(row) = rows.get(self.tree_state.nav.cursor) {
-                    if !row.row.is_dir() {
-                        self.pending_editor = Some(row.row.path.clone());
+                    if let crate::sources::AnyRow::Fs(ref e) = row.row {
+                        if !e.is_dir() {
+                            self.pending_editor = Some(e.path.clone());
+                        }
+                    } else {
+                        self.flash_status("edit: only filesystem entries can be edited");
                     }
                 }
             }

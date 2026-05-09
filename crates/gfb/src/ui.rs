@@ -101,6 +101,7 @@ fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         app.show_hidden(),
         &app.tree_state.expanded,
         app.filter(),
+        app.connections(),
     );
 
     let columns: Vec<ColumnDef<FbCol>> = vec![
@@ -332,6 +333,14 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
     // modal-fullscreen — the modal renderer handles that case.
     if app.editor().is_some() && !app.is_full_preview() {
         draw_editor_pane(app, frame, theme, area);
+        return;
+    }
+    // Tree mode + DB-table selection: render preview rows as a
+    // LiveTable instead of the file-content pipeline. Endpoints /
+    // databases / schemas don't have a row preview, so the panel
+    // just shows a hint.
+    if let Some(preview) = app.db_preview() {
+        draw_db_preview(preview, frame, theme, area);
         return;
     }
     let preview_title = app
@@ -881,6 +890,110 @@ fn format_relative_mtime(t: Option<SystemTime>) -> String {
     } else {
         format!("{}y{}", s / (86_400 * 365), suffix)
     }
+}
+
+/// Render the DB-table preview as a `LiveTable` of result rows. Used
+/// in tree mode when the cursor lands on a `NodeKind::Table` row.
+fn draw_db_preview(
+    preview: &crate::app::DbPreview,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+) {
+    use gtui::widgets::live_table::{
+        Cell, ColumnDef, LiveTable, TableEntry, TableRowExt, WidthSpec,
+    };
+    use gtui::widgets::{panel, CornerStyle};
+    let title = format!(
+        "{}.{}.{}",
+        preview.path.database.as_deref().unwrap_or("?"),
+        preview.path.schema.as_deref().unwrap_or("?"),
+        preview.path.table.as_deref().unwrap_or("?"),
+    );
+    let p = panel(
+        theme.panel_accents[1],
+        theme.title,
+        CornerStyle::default(),
+    )
+    .with_title(title)
+    .with_controls(format!("{} rows", preview.rows.len()));
+    frame.render_widget(&p, area);
+    let inner = p.inner(area);
+    if inner.width < 6 || inner.height < 2 {
+        return;
+    }
+
+    // Build columns. Labels need 'static — leak each on the
+    // hot path. Same approach the bobtop-db preview pane used; the
+    // alternative (Cow-typed labels in LiveTable) is a follow-up.
+    let columns: Vec<ColumnDef<usize>> = preview
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| ColumnDef {
+            id: i,
+            label: leak_column_label(c.name.as_str()),
+            width: WidthSpec::Fixed(column_width(
+                c.name.len(),
+                preview
+                    .rows
+                    .iter()
+                    .map(|r| r.cells.get(i).map(|s| s.len()).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0),
+            )),
+            align: align_for(c.data_type.as_str()),
+            sortable: false,
+        })
+        .collect();
+
+    struct PreviewRowView<'a> {
+        row: &'a crate::sources::Row,
+    }
+    impl<'a> TableRowExt<usize> for PreviewRowView<'a> {
+        fn cell(&self, col: usize) -> Cell {
+            Cell::plain(self.row.cells.get(col).cloned().unwrap_or_default())
+        }
+    }
+
+    let entries: Vec<TableEntry<PreviewRowView<'_>, ()>> = preview
+        .rows
+        .iter()
+        .map(|r| TableEntry::Item(PreviewRowView { row: r }))
+        .collect();
+
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let scroll = gtui::middle_anchor_scroll(0, preview.rows.len(), body_h);
+    let table = LiveTable::new(&entries, &columns, theme, 0)
+        .with_selection(Some(0), scroll)
+        .with_fade(false);
+    frame.render_widget(&table, inner);
+}
+
+fn align_for(data_type: &str) -> gtui::widgets::live_table::Align {
+    use gtui::widgets::live_table::Align;
+    let lower = data_type.to_ascii_lowercase();
+    if lower.contains("int")
+        || lower.contains("numeric")
+        || lower.contains("float")
+        || lower.contains("double")
+        || lower.contains("decimal")
+        || lower.contains("real")
+    {
+        Align::Right
+    } else {
+        Align::Left
+    }
+}
+
+fn column_width(header_len: usize, max_cell_len: usize) -> u16 {
+    // Fit content but cap at 32 cells so wide TEXT/UUID columns
+    // don't dominate. Caller can scroll horizontally in a follow-up.
+    header_len.max(max_cell_len).clamp(4, 32) as u16
+}
+
+fn leak_column_label(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
 }
 
 #[cfg(test)]

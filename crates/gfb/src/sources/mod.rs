@@ -19,10 +19,14 @@
 //! without spelling the inner module path.
 
 pub mod db;
+pub mod multi;
 
 pub use db::{
-    open, ColumnSpec, Connection, Database, DuckLakeAttach, Row, Schema, Table,
+    open, ColumnSpec, Connection, Database, DuckLakeAttach, NodeData, NodeKind, NodePath, Row,
+    Schema, Table,
 };
+pub use multi::{AnyNodeId, AnyRow};
+pub(crate) use multi::MultiRootCatalog;
 
 #[cfg(feature = "postgres")]
 pub mod pg;

@@ -25,7 +25,7 @@ use crate::state;
 #[command(
     name = "gfb",
     bin_name = "gfb",
-    about = "TUI file browser"
+    about = "TUI file (and database) browser"
 )]
 pub struct Cli {
     /// Directory to start in. Defaults to $PWD.
@@ -38,6 +38,25 @@ pub struct Cli {
     /// forces our internal rasterizer.
     #[arg(long, value_parser = ["auto", "native", "sextant"], default_value = "auto")]
     pub image_backend: String,
+    /// Database connection URL. Repeat to attach multiple endpoints —
+    /// each shows up as a sibling of the filesystem at depth 0 of the
+    /// tree. Accepted schemes: `mock` (built-in demo data),
+    /// `postgres://...` (needs `--features postgres`), `duckdb:///path`
+    /// (needs `--features duckdb`).
+    #[arg(long = "connect")]
+    pub connections: Vec<String>,
+    /// DuckLake catalog Postgres URL — used by the `duckdb://` backend
+    /// to attach a lake. Requires `--ducklake-path` and applies to
+    /// every `--connect duckdb://...` in this invocation.
+    #[arg(long)]
+    pub ducklake_catalog: Option<String>,
+    /// DuckLake data directory (Parquet files).
+    #[arg(long)]
+    pub ducklake_path: Option<PathBuf>,
+    /// Display name for the attached DuckLake catalog. Defaults to
+    /// `lake`.
+    #[arg(long, default_value = "lake")]
+    pub ducklake_name: String,
 }
 
 /// Parse args (clap), set up the terminal, and run the App. `args`
@@ -77,7 +96,30 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "sextant" => ImageBackendChoice::Sextant,
         _ => ImageBackendChoice::Auto,
     };
-    let mut app = App::new_with(start, theme, backend)?;
+
+    // Build the DB connection list. Each `--connect` URL goes through
+    // gfb::sources::open(); the DuckLake attach params apply to every
+    // `duckdb://` URL in the same invocation. A failed connect prints
+    // to stderr and continues — partial setups are useful for browse.
+    let mut connections: Vec<Box<dyn crate::sources::Connection>> = Vec::new();
+    for url in &cli.connections {
+        let ducklake = match (&cli.ducklake_catalog, &cli.ducklake_path) {
+            (Some(catalog), Some(path)) if url.starts_with("duckdb://") => {
+                Some(crate::sources::DuckLakeAttach {
+                    name: cli.ducklake_name.clone(),
+                    catalog_pg_url: catalog.clone(),
+                    data_path: path.to_string_lossy().into_owned(),
+                })
+            }
+            _ => None,
+        };
+        match crate::sources::open(url, ducklake, /* read_only */ true) {
+            Ok(c) => connections.push(c),
+            Err(e) => eprintln!("gfb: --connect {url} failed: {e:#}"),
+        }
+    }
+
+    let mut app = App::new_with(start, theme, backend, connections)?;
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;

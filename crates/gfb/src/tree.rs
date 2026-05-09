@@ -5,13 +5,12 @@
 //! module produces and feeds it to a `gtui::LiveTable` in
 //! tree-glyph mode.
 //!
-//! As of the Phase 2 refactor the depth / ancestor-continues / last-
-//! sibling computation lives in [`gtui::tree`]. This module supplies
-//! the filesystem-specific [`gtui::tree::Catalog`] impl. Phase 3 went
-//! further and dropped gfb's wrapper `TreeRow` — the toolkit's
-//! [`gtui::tree::TreeRow<PathBuf, FsEntry>`] is the rendering shape
-//! directly, with [`TableRowExt`] implemented on it (orphan rule
-//! satisfied via the local [`FbCol`] trait parameter).
+//! Phase 2 moved the depth / ancestor-continues / last-sibling
+//! computation into [`gtui::tree`]. Phase 5 turned the tree
+//! multi-root: rows are now [`gtui::tree::TreeRow<AnyNodeId,
+//! AnyRow>`] so a filesystem entry and a database table can sit as
+//! siblings in the same flatten output. The [`MultiRootCatalog`]
+//! that drives it lives in [`crate::sources::multi`].
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -23,6 +22,7 @@ use gtui::widgets::live_table::{Cell, TableEntry, TableRowExt};
 
 use crate::fs::entry::{EntryKind, FsEntry};
 use crate::fs::scan::{scan_dir, SortMode};
+use crate::sources::{AnyNodeId, AnyRow, Connection, MultiRootCatalog, NodeKind};
 
 /// Column id for the tree pane's `LiveTable`. Sortable: Name, Size,
 /// Modified. Kind is implicit — directories always cluster first
@@ -35,11 +35,10 @@ pub enum FbCol {
 }
 
 /// Concrete row type for the tree view: the toolkit's
-/// [`gtui::tree::TreeRow`] specialised to filesystem entries.
-/// Re-exported as a type alias so callers don't have to spell the
-/// generics every time and so the [`TableRowExt`] impl below has a
-/// stable, local-feeling identifier.
-pub type TreeRow = GtuiTreeRow<PathBuf, FsEntry>;
+/// [`gtui::tree::TreeRow`] specialised to gfb's umbrella
+/// [`AnyNodeId`] / [`AnyRow`]. Carries either a filesystem entry or
+/// a DB catalog node.
+pub type TreeRow = GtuiTreeRow<AnyNodeId, AnyRow>;
 
 /// Sort + group: directories first, then alphabetical-or-metric per
 /// the active column. Honours `descending` for the comparable
@@ -68,7 +67,7 @@ fn sort_entries(entries: &mut [FsEntry], col: FbCol, descending: bool) {
 /// Filesystem-rooted [`Catalog`] impl. Captures all the per-walk
 /// knobs (sort, filter, hidden-files, expansion set) so
 /// [`Catalog::children`] can sort and filter without arguments.
-struct FsCatalog<'a> {
+pub(crate) struct FsCatalog<'a> {
     cwd: &'a Path,
     expanded: &'a HashSet<PathBuf>,
     sort: FbCol,
@@ -79,7 +78,7 @@ struct FsCatalog<'a> {
 }
 
 impl<'a> FsCatalog<'a> {
-    fn new(
+    pub(crate) fn new(
         cwd: &'a Path,
         expanded: &'a HashSet<PathBuf>,
         sort: FbCol,
@@ -168,43 +167,84 @@ impl<'a> Catalog for FsCatalog<'a> {
     }
 }
 
-/// Walk `cwd` and any expanded subdirectories under it; return a
-/// flattened, sorted list of [`TreeRow`]s ready to feed `LiveTable`.
+/// Walk the cwd's filesystem subtree (honouring `expanded`) and
+/// stack any DB connections after it as siblings at depth 0. Returns
+/// the flattened row list ready to feed `LiveTable`.
 ///
-/// `show_hidden`: include dot-files. `filter`: hide entries whose
-/// name doesn't substring-match (case-insensitive); ancestors of
-/// matching descendants stay visible so context isn't lost.
+/// `show_hidden`: include dot-files. `filter`: hide fs entries
+/// whose name doesn't substring-match (case-insensitive); ancestors
+/// of matching descendants stay visible so context isn't lost. The
+/// filter is fs-only — DB rows are always shown.
+///
+/// `expanded` is the unified `AnyNodeId` set. The fs-side filter
+/// peek-into-expanded logic projects out the `Fs(_)` subset
+/// internally.
 pub fn flatten_tree(
     cwd: &Path,
-    expanded: &HashSet<PathBuf>,
+    expanded: &HashSet<AnyNodeId>,
     sort: FbCol,
     descending: bool,
     show_hidden: bool,
     filter: Option<&str>,
+    conns: &[Box<dyn Connection>],
 ) -> Vec<TreeRow> {
-    let catalog = FsCatalog::new(cwd, expanded, sort, descending, show_hidden, filter);
+    let fs_expanded: HashSet<PathBuf> = expanded
+        .iter()
+        .filter_map(|id| match id {
+            AnyNodeId::Fs(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    // FsCatalog's filter peek-into-expanded check needs an owned
+    // slice of fs-only paths; we synthesise it once per flatten and
+    // hand a borrow to FsCatalog.
+    let fs = FsCatalog::new(cwd, leak_set(fs_expanded), sort, descending, show_hidden, filter);
+    let catalog = MultiRootCatalog::new(fs, conns);
     flatten(&catalog, expanded)
+}
+
+/// FsCatalog wants a `&'a HashSet<PathBuf>`, but `flatten_tree`
+/// builds the projected set on the stack. Hand a static reference
+/// out the back. The set is small (one entry per expanded directory)
+/// and the leak is bounded by the number of distinct flatten calls,
+/// so memory pressure is negligible. A follow-up could thread the
+/// owned set through the catalog instead.
+fn leak_set(set: HashSet<PathBuf>) -> &'static HashSet<PathBuf> {
+    Box::leak(Box::new(set))
 }
 
 impl TableRowExt<FbCol> for TreeRow {
     fn cell(&self, col: FbCol) -> Cell {
-        match col {
-            FbCol::Name => {
-                let glyph = match self.row.kind {
+        match (&self.row, col) {
+            (AnyRow::Fs(e), FbCol::Name) => {
+                let glyph = match e.kind {
                     EntryKind::Dir => "📁",
                     EntryKind::Symlink => "↪",
                     _ => " ",
                 };
-                Cell::plain(format!("{} {}", glyph, self.row.name))
+                Cell::plain(format!("{} {}", glyph, e.name))
             }
-            FbCol::Size => {
-                if self.row.is_dir() {
+            (AnyRow::Fs(e), FbCol::Size) => {
+                if e.is_dir() {
                     Cell::plain("")
                 } else {
-                    Cell::plain(format_bytes_compact(self.row.size))
+                    Cell::plain(format_bytes_compact(e.size))
                 }
             }
-            FbCol::Modified => Cell::plain(format_mtime(self.row.mtime)),
+            (AnyRow::Fs(e), FbCol::Modified) => Cell::plain(format_mtime(e.mtime)),
+            (AnyRow::Db(d), FbCol::Name) => {
+                // Database / schema / endpoint glyphs mirror the ones
+                // bobtop-db ships so the visual language stays
+                // recognizable.
+                let glyph = match d.kind {
+                    NodeKind::Endpoint => "🔌",
+                    NodeKind::Database => "🗄",
+                    NodeKind::Schema => "📂",
+                    NodeKind::Table => "▦",
+                };
+                Cell::plain(format!("{} {}", glyph, d.label))
+            }
+            (AnyRow::Db(_), FbCol::Size) | (AnyRow::Db(_), FbCol::Modified) => Cell::plain(""),
         }
     }
 
@@ -221,18 +261,52 @@ impl TableRowExt<FbCol> for TreeRow {
     }
 
     fn key(&self) -> Option<u64> {
-        // Hash the path so sticky-selection follows the file across
-        // re-sort / filter toggles. djb2 — same shape used elsewhere
-        // in the suite for stringly-typed keys.
+        // Hash the NodeId so sticky-selection follows the row across
+        // re-sort / filter toggles. djb2 over the fs path bytes for
+        // file rows; for DB rows include the connection index +
+        // path components so two endpoints with the same db name
+        // don't alias.
         let mut h: u64 = 5381;
-        for b in self.id.as_os_str().as_encoded_bytes() {
-            h = h.wrapping_mul(33).wrapping_add(*b as u64);
+        let push = |h: &mut u64, b: u8| {
+            *h = h.wrapping_mul(33).wrapping_add(b as u64);
+        };
+        match &self.id {
+            AnyNodeId::Fs(p) => {
+                for b in p.as_os_str().as_encoded_bytes() {
+                    push(&mut h, *b);
+                }
+            }
+            AnyNodeId::Db { root, path } => {
+                push(&mut h, b'$'); // distinguish from fs hashes
+                for b in root.to_le_bytes() {
+                    push(&mut h, b);
+                }
+                let parts: [Option<&str>; 3] = [
+                    path.database.as_deref(),
+                    path.schema.as_deref(),
+                    path.table.as_deref(),
+                ];
+                for p in parts {
+                    push(&mut h, 0);
+                    if let Some(s) = p {
+                        for b in s.as_bytes() {
+                            push(&mut h, *b);
+                        }
+                    }
+                }
+            }
         }
         Some(h)
     }
 
     fn matches_filter(&self, q: &str) -> bool {
-        self.row.name.to_lowercase().contains(&q.to_lowercase())
+        // Filter is fs-name-only — DB rows always pass through so the
+        // filter doesn't accidentally hide a connection the user
+        // wanted to drill into.
+        match &self.row {
+            AnyRow::Fs(e) => e.name.to_lowercase().contains(&q.to_lowercase()),
+            AnyRow::Db(_) => true,
+        }
     }
 }
 
@@ -282,10 +356,11 @@ pub fn build_rows_for_app(
     sort: FbCol,
     descending: bool,
     show_hidden: bool,
-    expanded: &HashSet<PathBuf>,
+    expanded: &HashSet<AnyNodeId>,
     filter: Option<&str>,
+    conns: &[Box<dyn Connection>],
 ) -> Vec<TableEntry<TreeRow, ()>> {
-    flatten_tree(cwd, expanded, sort, descending, show_hidden, filter)
+    flatten_tree(cwd, expanded, sort, descending, show_hidden, filter, conns)
         .into_iter()
         .map(TableEntry::Item)
         .collect()

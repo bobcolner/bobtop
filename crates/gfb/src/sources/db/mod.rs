@@ -11,6 +11,87 @@ pub mod mock;
 
 use anyhow::Result;
 
+/// Tree node kind for the catalog browser. `Endpoint` is the
+/// connection root, `Database`/`Schema`/`Table` are the natural
+/// catalog levels Postgres + DuckDB share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeKind {
+    Endpoint,
+    Database,
+    Schema,
+    Table,
+}
+
+/// Path through the catalog tree, identifying a specific node. The
+/// `conn` index disambiguates between two endpoints with the same
+/// database name (e.g. two `--connect`s both exposing `ml_momo`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct NodePath {
+    pub conn: usize,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub table: Option<String>,
+}
+
+impl NodePath {
+    pub fn endpoint(conn: usize) -> Self {
+        Self {
+            conn,
+            ..Default::default()
+        }
+    }
+
+    pub fn database(conn: usize, db: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn schema(conn: usize, db: &str, sch: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            schema: Some(sch.to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn table(conn: usize, db: &str, sch: &str, tbl: &str) -> Self {
+        Self {
+            conn,
+            database: Some(db.to_string()),
+            schema: Some(sch.to_string()),
+            table: Some(tbl.to_string()),
+        }
+    }
+
+    /// What level of the catalog this path identifies.
+    pub fn level(&self) -> NodeKind {
+        match (
+            self.database.is_some(),
+            self.schema.is_some(),
+            self.table.is_some(),
+        ) {
+            (false, _, _) => NodeKind::Endpoint,
+            (true, false, _) => NodeKind::Database,
+            (true, true, false) => NodeKind::Schema,
+            (true, true, true) => NodeKind::Table,
+        }
+    }
+}
+
+/// Per-node payload the tree renderer carries. Captured separately
+/// from [`NodePath`] so the toolkit's [`crate::tree::Catalog`] impl
+/// can return `(NodePath, NodeData)` tuples without forcing the
+/// renderer to walk the path each time.
+#[derive(Debug, Clone)]
+pub struct NodeData {
+    pub kind: NodeKind,
+    pub label: String,
+}
+
 /// Top-level handle: owns the database list for a single endpoint.
 /// "Endpoint" = a Postgres server, a single DuckDB file, etc.
 ///
