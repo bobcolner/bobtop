@@ -1,11 +1,21 @@
-//! Custom widgets that build the gtop UI.
+//! Reusable widgets — the surface most consumers spend their time
+//! in. Builder-style on every widget; nothing renders until
+//! [`ratatui::Frame::render_widget`] is called.
 //!
-//! - [`braille_graph::BrailleGraph`] — area-fill graph with vertical gradient.
-//! - [`boxed::BoxedPanel`] — rounded-corner panel with btop-style title slots.
+//! Marquee primitives:
 //!
-//! Step 6 (layout) adds the meter / mini-meter / data table widgets. Their
-//! shapes are sketched in `crates/gtui/themes/NOTICE`-adjacent docs and
-//! the screenshot review notes in conversation memory.
+//! - [`live_table::LiveTable`] — sortable, groupable, tree-aware
+//!   table with sticky-by-key selection.
+//! - [`boxed::BoxedPanel`] — rounded-corner panel with btop-style
+//!   title + control-hint slots.
+//! - [`braille_graph::BrailleGraph`] — area-fill graph with
+//!   vertical gradient.
+//! - [`meter::Meter`] / [`mini_meter::MiniMeter`] — progress meters
+//!   in two sizes.
+//! - [`miller_columns::MillerColumns`] — three-pane Miller layout.
+//!
+//! Plus a constellation of smaller pieces (modals, forms, text
+//! views) listed in the per-module index below.
 
 pub mod boxed;
 pub mod action_bar;

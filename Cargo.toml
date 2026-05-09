@@ -7,17 +7,19 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bobcolner/bobtop"
-authors = ["bobtop contributors"]
+authors = ["gtop contributors"]
 
 [workspace.dependencies]
-# First-party crates (path-resolved within the workspace)
-gtui = { path = "crates/gtui" }
-gfb = { path = "crates/gfb" }
+# First-party crates. Both `path` (dev) and `version` (publish) —
+# `cargo publish` strips the path when packaging and pins the
+# crates.io version we declare here.
+gtui = { path = "crates/gtui", version = "0.3.0" }
+gfb = { path = "crates/gfb", version = "0.3.0" }
 
 # TUI rendering
 ratatui = "0.29"

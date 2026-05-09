@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # Per-crate check + test matrix. Each published crate must build
+  # and test cleanly in isolation — that's what catches cross-crate
+  # coupling that would die at `cargo publish`.
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [gtui, gtop, gfb]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libbpf-dev libpcap-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.crate }}
+      - run: cargo check -p ${{ matrix.crate }} --all-targets
+      - run: cargo test -p ${{ matrix.crate }} --all-targets
+
+  # gfb's optional DB sources are feature-gated, so the default build
+  # doesn't pull tokio-postgres / duckdb. Cover the full surface
+  # explicitly.
+  gfb-features:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "postgres", "duckdb", "all-sources"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gfb-${{ matrix.features }}
+      - name: cargo check
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check -p gfb --all-targets
+          else
+            cargo check -p gfb --all-targets --features "${{ matrix.features }}"
+          fi
+
+  # gtui has no first-party deps and must publish first; gtop / gfb
+  # depend on it. Dry-running gtop / gfb requires gtui to already exist
+  # on crates.io, so those dry-runs only make sense in a release
+  # workflow run after `cargo publish -p gtui` lands. The regular CI
+  # validates them via `cargo check` in the matrix above.
+  publish-dry-run-leaf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run -p gtui

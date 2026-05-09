@@ -1,10 +1,43 @@
-//! Ratatui rendering layer for building a shared terminal UI frame.
+//! Reusable Ratatui toolkit. Pulled out of the `gtop` system monitor
+//! and the `gfb` file/database browser; designed so a third TUI app
+//! on the same workspace would be cheap to add.
 //!
-//! - [`color`] — hex parsing and gradient interpolation primitives.
-//! - [`theme`] — built-in registry, `.theme` parser, loader, and runtime theme model.
-//! - [`layout`] — responsive frame splitting into named regions.
-//! - [`widgets`] — generic, reusable controls and panels.
-//! - [`prelude`] — the intended one-stop import for app code.
+//! ## Marquee modules
+//!
+//! - [`widgets`] — `LiveTable`, `BoxedPanel`, `BrailleGraph`,
+//!   `Meter`, `MillerColumns`, `ConfirmDialog`, `EditableText`,
+//!   and a pile of tighter primitives. Each is a thin Ratatui
+//!   `Widget` impl with a builder API.
+//! - [`tree`] — `Catalog` trait + `flatten()` walker + `TreeState`.
+//!   Plug a custom `Catalog` impl in to render any hierarchical
+//!   source as a flat row list with depth / ancestor-line metadata.
+//! - [`browser`] — `BrowserShell`, the render helper for the
+//!   tree-on-the-left + preview-on-the-right composition both
+//!   `gtop fb` and `gfb` use.
+//! - [`theme`] — btop's `.theme` format parser + 41 bundled themes.
+//! - [`keymap`] — `ScopeStack` for layered keymaps (modal overlays,
+//!   per-mode bindings).
+//! - [`layout`] — responsive frame-splitting given a per-panel
+//!   weight bitmap (`BoxesEnabled`).
+//! - [`prelude`] — one-stop import for the surfaces apps usually
+//!   touch.
+//!
+//! ## Helper modules
+//!
+//! [`color`], [`text`], [`util`] hold smaller primitives shared
+//! across the widgets — gradient math, byte / rate formatters, the
+//! `Nav` cursor type. Useful if you're building a custom widget that
+//! needs to look like the rest of the toolkit.
+//!
+//! ## Examples
+//!
+//! Run any of the bundled examples to see widgets in action:
+//!
+//! ```bash
+//! cargo run --example process_table   # sortable LiveTable
+//! cargo run --example two_pane_browser # Catalog + BrowserShell
+//! cargo run --example themes          # bundled-theme registry
+//! ```
 
 #![forbid(unsafe_code)]
 
