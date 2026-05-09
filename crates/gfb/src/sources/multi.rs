@@ -10,20 +10,37 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use gtui::tree::Catalog;
 
-use super::db::{Connection, NodeData, NodeKind, NodePath};
+use super::db::{NodeData, NodeKind, NodePath};
+use super::worker::{ConnectionWorker, LoadResult};
 use crate::fs::entry::FsEntry;
 use crate::tree::FsCatalog;
 
+/// State of a single DB-children cache entry.
+#[derive(Debug, Clone)]
+pub(crate) enum ChildrenState {
+    /// Worker thread is running the query — render the parent as
+    /// "expanded but empty" until the result lands.
+    Loading,
+    /// Query succeeded; serve from this Vec.
+    Ready(Vec<(NodePath, NodeData)>),
+    /// Query failed; we surface the error in the status bar and
+    /// treat the subtree as empty so the rest of the tree stays
+    /// usable.
+    #[allow(dead_code)]
+    Failed(String),
+}
+
 /// Per-session cache of DB-query children. Lives on `App` and is
 /// borrowed into a [`MultiRootCatalog`] for each flatten. Cache miss
-/// hits the wire (Connection trait); cache hit returns a clone of
-/// the stored Vec — fast even on busy keystrokes that re-flatten 2-4
-/// times per action. Refresh (`r`) clears the cache so users can
-/// pick up schema / table additions made outside the app.
-pub(crate) type DbCache = RefCell<HashMap<NodePath, Vec<(NodePath, NodeData)>>>;
+/// inserts `Loading` and fires an async query against the worker
+/// thread; the main loop transitions to `Ready` / `Failed` when the
+/// reply arrives. Hits return a clone — fast even on busy
+/// keystrokes that re-flatten several times.
+pub(crate) type DbCache = RefCell<HashMap<NodePath, ChildrenState>>;
 
 pub(crate) fn new_db_cache() -> DbCache {
     RefCell::new(HashMap::new())
@@ -75,30 +92,50 @@ pub enum AnyRow {
 /// it (yet).
 pub(crate) struct MultiRootCatalog<'a> {
     fs: FsCatalog<'a>,
-    conns: &'a [Box<dyn Connection>],
+    conns: &'a [ConnectionWorker],
     cache: &'a DbCache,
+    /// Reply channel for async children loads. Cloned per spawn.
+    /// `None` disables async — the catalog returns empty rather than
+    /// firing a request, useful for callers that don't have a
+    /// running render loop to drain results (e.g. tests, headless
+    /// snapshots). Most call sites pass `Some(app.db_load_tx())`.
+    load_tx: Option<&'a mpsc::Sender<LoadResult>>,
 }
 
 impl<'a> MultiRootCatalog<'a> {
     pub(crate) fn new(
         fs: FsCatalog<'a>,
-        conns: &'a [Box<dyn Connection>],
+        conns: &'a [ConnectionWorker],
         cache: &'a DbCache,
+        load_tx: Option<&'a mpsc::Sender<LoadResult>>,
     ) -> Self {
-        Self { fs, conns, cache }
+        Self {
+            fs,
+            conns,
+            cache,
+            load_tx,
+        }
     }
 
-    fn db_children(
-        &self,
-        path: &NodePath,
-        compute: impl FnOnce() -> Vec<(NodePath, NodeData)>,
-    ) -> Vec<(NodePath, NodeData)> {
-        if let Some(hit) = self.cache.borrow().get(path) {
-            return hit.clone();
+    /// Look up `path`'s children in the cache. On hit, return the
+    /// stored Vec (cloned). On miss, insert `Loading`, fire an
+    /// async request to the worker, return empty.
+    fn db_children(&self, path: &NodePath) -> Vec<(NodePath, NodeData)> {
+        match self.cache.borrow().get(path).cloned() {
+            Some(ChildrenState::Ready(v)) => return v,
+            Some(ChildrenState::Loading) | Some(ChildrenState::Failed(_)) => return Vec::new(),
+            None => {}
         }
-        let v = compute();
-        self.cache.borrow_mut().insert(path.clone(), v.clone());
-        v
+        // Cache miss — install Loading and dispatch a query.
+        self.cache
+            .borrow_mut()
+            .insert(path.clone(), ChildrenState::Loading);
+        if let Some(tx) = self.load_tx {
+            if let Some(worker) = self.conns.get(path.conn) {
+                worker.request_children(path.clone(), tx.clone());
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -136,90 +173,19 @@ impl<'a> Catalog for MultiRootCatalog<'a> {
                 .into_iter()
                 .map(|(p, e)| (AnyNodeId::Fs(p), AnyRow::Fs(e)))
                 .collect(),
-            AnyNodeId::Db { root, path } => {
-                let Some(conn) = self.conns.get(*root) else {
-                    return Vec::new();
-                };
-                let kids = self.db_children(path, || match path.level() {
-                    NodeKind::Endpoint => match conn.databases() {
-                        Ok(dbs) => dbs
-                            .into_iter()
-                            .map(|db| {
-                                (
-                                    NodePath::database(*root, &db.name),
-                                    NodeData {
-                                        kind: NodeKind::Database,
-                                        label: db.name,
-                                    },
-                                )
-                            })
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!("databases() failed for conn {root}: {e:#}");
-                            Vec::new()
-                        }
-                    },
-                    NodeKind::Database => {
-                        let db = path.database.as_deref().unwrap_or_default();
-                        match conn.schemas(db) {
-                            Ok(schemas) => schemas
-                                .into_iter()
-                                .map(|s| {
-                                    (
-                                        NodePath::schema(*root, db, &s.name),
-                                        NodeData {
-                                            kind: NodeKind::Schema,
-                                            label: s.name,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "schemas({db}) failed for conn {root}: {e:#}"
-                                );
-                                Vec::new()
-                            }
-                        }
-                    }
-                    NodeKind::Schema => {
-                        let db = path.database.as_deref().unwrap_or_default();
-                        let sch = path.schema.as_deref().unwrap_or_default();
-                        match conn.tables(db, sch) {
-                            Ok(tables) => tables
-                                .into_iter()
-                                .map(|t| {
-                                    (
-                                        NodePath::table(*root, db, sch, &t.name),
-                                        NodeData {
-                                            kind: NodeKind::Table,
-                                            label: t.name,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "tables({db},{sch}) failed for conn {root}: {e:#}"
-                                );
-                                Vec::new()
-                            }
-                        }
-                    }
-                    NodeKind::Table => Vec::new(),
-                });
-                kids.into_iter()
-                    .map(|(p, d)| {
-                        (
-                            AnyNodeId::Db {
-                                root: *root,
-                                path: p,
-                            },
-                            AnyRow::Db(d),
-                        )
-                    })
-                    .collect()
-            }
+            AnyNodeId::Db { root, path } => self
+                .db_children(path)
+                .into_iter()
+                .map(|(p, d)| {
+                    (
+                        AnyNodeId::Db {
+                            root: *root,
+                            path: p,
+                        },
+                        AnyRow::Db(d),
+                    )
+                })
+                .collect(),
         }
     }
 

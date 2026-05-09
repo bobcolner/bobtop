@@ -22,7 +22,7 @@ use gtui::widgets::live_table::{Cell, TableEntry, TableRowExt};
 
 use crate::fs::entry::{EntryKind, FsEntry};
 use crate::fs::scan::{scan_dir, SortMode};
-use crate::sources::{AnyNodeId, AnyRow, Connection, MultiRootCatalog, NodeKind};
+use crate::sources::{AnyNodeId, AnyRow, ConnectionWorker, LoadResult, MultiRootCatalog, NodeKind};
 
 /// Column id for the tree pane's `LiveTable`. Sortable: Name, Size,
 /// Modified. Kind is implicit — directories always cluster first
@@ -207,9 +207,10 @@ pub fn flatten_tree(
     descending: bool,
     show_hidden: bool,
     filter: Option<&str>,
-    conns: &[Box<dyn Connection>],
+    conns: &[ConnectionWorker],
     db_cache: &crate::sources::multi::DbCache,
     fs_cache: &crate::sources::multi::FsCache,
+    load_tx: Option<&std::sync::mpsc::Sender<LoadResult>>,
 ) -> Vec<TreeRow> {
     let fs_expanded: HashSet<PathBuf> = expanded
         .iter()
@@ -227,7 +228,7 @@ pub fn flatten_tree(
         filter,
         fs_cache,
     );
-    let catalog = MultiRootCatalog::new(fs, conns, db_cache);
+    let catalog = MultiRootCatalog::new(fs, conns, db_cache, load_tx);
     flatten(&catalog, expanded)
 }
 
@@ -375,9 +376,10 @@ pub fn build_rows_for_app(
     show_hidden: bool,
     expanded: &HashSet<AnyNodeId>,
     filter: Option<&str>,
-    conns: &[Box<dyn Connection>],
+    conns: &[ConnectionWorker],
     db_cache: &crate::sources::multi::DbCache,
     fs_cache: &crate::sources::multi::FsCache,
+    load_tx: Option<&std::sync::mpsc::Sender<LoadResult>>,
 ) -> Vec<TableEntry<TreeRow, ()>> {
     flatten_tree(
         cwd,
@@ -389,6 +391,7 @@ pub fn build_rows_for_app(
         conns,
         db_cache,
         fs_cache,
+        load_tx,
     )
         .into_iter()
         .map(TableEntry::Item)

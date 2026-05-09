@@ -530,18 +530,24 @@ pub struct App {
     /// Database endpoints attached at startup via `--connect`.
     /// Empty vec means filesystem-only browsing — tree mode behaves
     /// exactly as it did pre-Phase-5.
-    pub(crate) connections: Vec<Box<dyn crate::sources::Connection>>,
+    pub(crate) connections: Vec<crate::sources::ConnectionWorker>,
     /// Cached preview-row LiveTable for the currently-selected DB
     /// table. Replaced lazily on selection change. `None` while idle
     /// or when the selection is a filesystem entry.
     pub(crate) db_preview: Option<DbPreview>,
     /// Cache of `Connection::{databases,schemas,tables}` results.
-    /// Survives across the 2-5 flattens a single tree-mode keystroke
-    /// can trigger; cleared on `Refresh`.
+    /// Survives across the flattens a single tree-mode keystroke
+    /// triggers; cleared on `Refresh`. Cache misses now fire async
+    /// requests against the worker thread.
     pub(crate) db_cache: crate::sources::multi::DbCache,
     /// Cache of `scan_dir` results. Same shape as `db_cache` but for
     /// filesystem readdir + stat calls.
     pub(crate) fs_cache: crate::sources::multi::FsCache,
+    /// Reply channel: workers post `LoadResult` here when an async
+    /// children query completes. The main loop drains the receiver
+    /// after each event tick (see `drain_db_loads`).
+    pub(crate) db_load_tx: std::sync::mpsc::Sender<crate::sources::LoadResult>,
+    pub(crate) db_load_rx: std::sync::mpsc::Receiver<crate::sources::LoadResult>,
 }
 
 /// Loaded preview rows for one DB table.
@@ -648,7 +654,7 @@ impl App {
         start: PathBuf,
         theme: Theme,
         backend_choice: ImageBackendChoice,
-        connections: Vec<Box<dyn crate::sources::Connection>>,
+        connections: Vec<crate::sources::ConnectionWorker>,
     ) -> io::Result<Self> {
         let cwd = start.canonicalize().unwrap_or(start);
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -713,7 +719,23 @@ impl App {
             db_preview: None,
             db_cache: crate::sources::multi::new_db_cache(),
             fs_cache: crate::sources::multi::new_fs_cache(),
+            db_load_tx: {
+                let (tx, _) = std::sync::mpsc::channel();
+                tx
+            },
+            db_load_rx: {
+                // Replaced below — placeholder so the struct
+                // initializer doesn't choke on a forward reference.
+                let (_, rx) = std::sync::mpsc::channel();
+                rx
+            },
         };
+        // Real channel pair (the placeholder above gets dropped
+        // immediately). Keeping the struct-init shape simple — the
+        // overhead of dropping an unused channel is one allocation.
+        let (load_tx, load_rx) = std::sync::mpsc::channel();
+        app.db_load_tx = load_tx;
+        app.db_load_rx = load_rx;
         // Auto-expand each DB endpoint so the user immediately sees
         // its database list rather than a collapsed connection row.
         for i in 0..app.connections.len() {
@@ -757,8 +779,35 @@ impl App {
         self.show_hidden
     }
 
-    pub fn connections(&self) -> &[Box<dyn crate::sources::Connection>] {
+    pub fn connections(&self) -> &[crate::sources::ConnectionWorker] {
         &self.connections
+    }
+
+    /// Sender for async DB-children loads. Cloned per-flatten and
+    /// handed to the catalog so it can post results back when its
+    /// worker reply lands.
+    pub(crate) fn db_load_tx(&self) -> &std::sync::mpsc::Sender<crate::sources::LoadResult> {
+        &self.db_load_tx
+    }
+
+    /// Drain any worker-thread `LoadResult`s that landed since the
+    /// last tick; populate the cache and return whether a redraw is
+    /// warranted (true when at least one result arrived).
+    pub(crate) fn drain_db_loads(&mut self) -> bool {
+        use crate::sources::multi::ChildrenState;
+        let mut dirty = false;
+        while let Ok(load) = self.db_load_rx.try_recv() {
+            let state = match load.result {
+                Ok(rows) => ChildrenState::Ready(rows),
+                Err(e) => {
+                    self.flash_status(format!("db: {e}"));
+                    ChildrenState::Failed(format!("{e:#}"))
+                }
+            };
+            self.db_cache.borrow_mut().insert(load.path, state);
+            dirty = true;
+        }
+        dirty
     }
 
     pub fn db_preview(&self) -> Option<&DbPreview> {
@@ -1214,6 +1263,7 @@ impl App {
             &self.connections,
             &self.db_cache,
             &self.fs_cache,
+            Some(&self.db_load_tx),
         );
         let Some(row) = rows.get(self.tree_state.nav.cursor).cloned() else {
             self.preview_state = PreviewState::None;
@@ -1268,9 +1318,13 @@ impl App {
     /// `Miller` mode for now — extending them to tree mode is a
     /// follow-up.
     fn handle_tree(&mut self, action: Action) -> bool {
-        // Compute total visible rows once so movement actions can
-        // clamp without re-flattening.
-        let total = crate::tree::flatten_tree(
+        // One flatten covers cursor-clamp + every branch that needs
+        // to peek at the row at the cursor. Mutations to
+        // tree_state.expanded inside this fn invalidate the slice for
+        // any later peek — but the action arms that mutate (EnterDir,
+        // ParentDir's collapse path, refresh) don't read rows again
+        // afterwards in the same call.
+        let rows = crate::tree::flatten_tree(
             &self.cwd,
             &self.tree_state.expanded,
             self.tree_sort,
@@ -1280,8 +1334,9 @@ impl App {
             &self.connections,
             &self.db_cache,
             &self.fs_cache,
-        )
-        .len();
+            Some(&self.db_load_tx),
+        );
+        let total = rows.len();
         let prior_cursor = self.tree_state.nav.cursor;
         match action {
             Action::Quit => return true,
@@ -1317,17 +1372,6 @@ impl App {
                 // cursor into the first child. On a leaf (file or DB
                 // table): leave the cursor where it is — the preview
                 // already shows the leaf's contents.
-                let rows = crate::tree::flatten_tree(
-                    &self.cwd,
-                    &self.tree_state.expanded,
-                    self.tree_sort,
-                    self.tree_sort_descending,
-                    self.show_hidden,
-                    self.filter.as_deref(),
-                    &self.connections,
-                    &self.db_cache,
-                    &self.fs_cache,
-                );
                 let cursor = self.tree_state.nav.cursor;
                 if let gtui::tree::ToggleOutcome::Expanded(_) =
                     self.tree_state.toggle_at(&rows, cursor)
@@ -1339,17 +1383,6 @@ impl App {
                 // On an expanded row at the cursor: collapse it.
                 // Otherwise jump cursor to the parent row, or
                 // `cd ..` when on the filesystem root level.
-                let rows = crate::tree::flatten_tree(
-                    &self.cwd,
-                    &self.tree_state.expanded,
-                    self.tree_sort,
-                    self.tree_sort_descending,
-                    self.show_hidden,
-                    self.filter.as_deref(),
-                    &self.connections,
-                    &self.db_cache,
-                    &self.fs_cache,
-                );
                 match self.tree_state.collapse_or_parent(&rows) {
                     gtui::tree::ParentOutcome::Collapsed(_)
                     | gtui::tree::ParentOutcome::JumpedToParent(_) => {}
@@ -1383,17 +1416,6 @@ impl App {
                 self.finder = Some(FinderState::new());
             }
             Action::StartEditor => {
-                let rows = crate::tree::flatten_tree(
-                    &self.cwd,
-                    &self.tree_state.expanded,
-                    self.tree_sort,
-                    self.tree_sort_descending,
-                    self.show_hidden,
-                    self.filter.as_deref(),
-                    &self.connections,
-                    &self.db_cache,
-                    &self.fs_cache,
-                );
                 if let Some(row) = rows.get(self.tree_state.nav.cursor) {
                     if let crate::sources::AnyRow::Fs(ref e) = row.row {
                         if !e.is_dir() {
@@ -2167,6 +2189,12 @@ impl App {
                 e.tick();
             }
             self.drain_results();
+            // DB worker replies — populate the children cache for
+            // any async load that landed since the last frame. A
+            // returned `true` would normally mean "redraw", but the
+            // unconditional `terminal.draw` below already happens
+            // every tick so we don't need to gate on it.
+            let _ = self.drain_db_loads();
             if self.drain_fs_events() {
                 // The 120 ms event-poll tick acts as natural debounce
                 // — a burst of inotify events (cargo build can fire

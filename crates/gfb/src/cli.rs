@@ -97,11 +97,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
         _ => ImageBackendChoice::Auto,
     };
 
-    // Build the DB connection list. Each `--connect` URL goes through
-    // gfb::sources::open(); the DuckLake attach params apply to every
-    // `duckdb://` URL in the same invocation. A failed connect prints
-    // to stderr and continues — partial setups are useful for browse.
-    let mut connections: Vec<Box<dyn crate::sources::Connection>> = Vec::new();
+    // Build the DB connection workers. Each `--connect` URL spawns a
+    // dedicated worker thread that owns its `Connection` for the
+    // session — `duckdb::Connection` is `!Send`, so we can't move
+    // an open connection across threads or run queries from a tokio
+    // blocking pool. The worker pattern lets the catalog dispatch
+    // queries asynchronously without blocking the UI thread.
+    //
+    // DuckLake attach params apply to every `duckdb://` URL in the
+    // same invocation. A failed connect prints to stderr and
+    // continues — partial setups are useful for browse.
+    let mut connections: Vec<crate::sources::ConnectionWorker> = Vec::new();
     for url in &cli.connections {
         let ducklake = match (&cli.ducklake_catalog, &cli.ducklake_path) {
             (Some(catalog), Some(path)) if url.starts_with("duckdb://") => {
@@ -113,8 +119,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
             }
             _ => None,
         };
-        match crate::sources::open(url, ducklake, /* read_only */ true) {
-            Ok(c) => connections.push(c),
+        match crate::sources::ConnectionWorker::spawn(
+            url.clone(),
+            ducklake,
+            /* read_only */ true,
+        ) {
+            Ok(w) => connections.push(w),
             Err(e) => eprintln!("gfb: --connect {url} failed: {e:#}"),
         }
     }
