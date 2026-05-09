@@ -75,6 +75,11 @@ pub(crate) struct FsCatalog<'a> {
     show_hidden: bool,
     /// Pre-lowercased filter substring. `None` = no filter.
     filter: Option<String>,
+    /// Per-session readdir cache. The catalog can re-flatten 4-5
+    /// times per keystroke; without this every flatten re-scans the
+    /// cwd plus every expanded subtree. Cache lives on App and
+    /// clears on refresh (`r`) or an fs-watcher dirty signal.
+    cache: &'a crate::sources::multi::FsCache,
 }
 
 impl<'a> FsCatalog<'a> {
@@ -85,6 +90,7 @@ impl<'a> FsCatalog<'a> {
         descending: bool,
         show_hidden: bool,
         filter: Option<&str>,
+        cache: &'a crate::sources::multi::FsCache,
     ) -> Self {
         Self {
             cwd,
@@ -93,6 +99,7 @@ impl<'a> FsCatalog<'a> {
             descending,
             show_hidden,
             filter: filter.map(|s| s.to_lowercase()),
+            cache,
         }
     }
 
@@ -101,9 +108,7 @@ impl<'a> FsCatalog<'a> {
     /// in expanded subtrees). Errors are silently swallowed — the
     /// surfaced action bar is the user-visible reporting path.
     fn read_visible(&self, dir: &Path) -> Vec<FsEntry> {
-        let Ok(mut entries) = scan_dir(dir, self.show_hidden, SortMode::Name) else {
-            return Vec::new();
-        };
+        let mut entries = self.scan_cached(dir);
         sort_entries(&mut entries, self.sort, self.descending);
         let visible = self.compute_visible(&entries);
         entries
@@ -111,6 +116,22 @@ impl<'a> FsCatalog<'a> {
             .zip(visible)
             .filter_map(|(e, v)| if v { Some(e) } else { None })
             .collect()
+    }
+
+    /// Cached form of [`scan_dir`]. Stores the *unsorted, unfiltered*
+    /// result keyed on `(dir, show_hidden)` (encoded by also dropping
+    /// the cache when `show_hidden` toggles upstream); subsequent
+    /// flattens within the same render tick get a clone instead of
+    /// a fresh readdir + per-entry stat.
+    fn scan_cached(&self, dir: &Path) -> Vec<FsEntry> {
+        if let Some(hit) = self.cache.borrow().get(dir) {
+            return hit.clone();
+        }
+        let entries = scan_dir(dir, self.show_hidden, SortMode::Name).unwrap_or_default();
+        self.cache
+            .borrow_mut()
+            .insert(dir.to_path_buf(), entries.clone());
+        entries
     }
 
     /// Visibility mask. With no filter, every entry is visible.
@@ -129,9 +150,8 @@ impl<'a> FsCatalog<'a> {
                     return true;
                 }
                 if e.is_dir() && self.expanded.contains(&e.path) {
-                    if let Ok(children) = scan_dir(&e.path, self.show_hidden, SortMode::Name) {
-                        return children.iter().any(|c| c.name.to_lowercase().contains(q));
-                    }
+                    let children = self.scan_cached(&e.path);
+                    return children.iter().any(|c| c.name.to_lowercase().contains(q));
                 }
                 false
             })
@@ -179,6 +199,7 @@ impl<'a> Catalog for FsCatalog<'a> {
 /// `expanded` is the unified `AnyNodeId` set. The fs-side filter
 /// peek-into-expanded logic projects out the `Fs(_)` subset
 /// internally.
+#[allow(clippy::too_many_arguments)]
 pub fn flatten_tree(
     cwd: &Path,
     expanded: &HashSet<AnyNodeId>,
@@ -187,6 +208,8 @@ pub fn flatten_tree(
     show_hidden: bool,
     filter: Option<&str>,
     conns: &[Box<dyn Connection>],
+    db_cache: &crate::sources::multi::DbCache,
+    fs_cache: &crate::sources::multi::FsCache,
 ) -> Vec<TreeRow> {
     let fs_expanded: HashSet<PathBuf> = expanded
         .iter()
@@ -195,22 +218,17 @@ pub fn flatten_tree(
             _ => None,
         })
         .collect();
-    // FsCatalog's filter peek-into-expanded check needs an owned
-    // slice of fs-only paths; we synthesise it once per flatten and
-    // hand a borrow to FsCatalog.
-    let fs = FsCatalog::new(cwd, leak_set(fs_expanded), sort, descending, show_hidden, filter);
-    let catalog = MultiRootCatalog::new(fs, conns);
+    let fs = FsCatalog::new(
+        cwd,
+        &fs_expanded,
+        sort,
+        descending,
+        show_hidden,
+        filter,
+        fs_cache,
+    );
+    let catalog = MultiRootCatalog::new(fs, conns, db_cache);
     flatten(&catalog, expanded)
-}
-
-/// FsCatalog wants a `&'a HashSet<PathBuf>`, but `flatten_tree`
-/// builds the projected set on the stack. Hand a static reference
-/// out the back. The set is small (one entry per expanded directory)
-/// and the leak is bounded by the number of distinct flatten calls,
-/// so memory pressure is negligible. A follow-up could thread the
-/// owned set through the catalog instead.
-fn leak_set(set: HashSet<PathBuf>) -> &'static HashSet<PathBuf> {
-    Box::leak(Box::new(set))
 }
 
 impl TableRowExt<FbCol> for TreeRow {
@@ -349,6 +367,7 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 /// Convenience wrapper: use the sort/expand state on `App` to build
 /// the flattened row list. Defined here (not on `App`) so the data
 /// path stays trait-impl-only and easy to test.
+#[allow(clippy::too_many_arguments)]
 pub fn build_rows_for_app(
     cwd: &Path,
     sort: FbCol,
@@ -357,8 +376,20 @@ pub fn build_rows_for_app(
     expanded: &HashSet<AnyNodeId>,
     filter: Option<&str>,
     conns: &[Box<dyn Connection>],
+    db_cache: &crate::sources::multi::DbCache,
+    fs_cache: &crate::sources::multi::FsCache,
 ) -> Vec<TableEntry<TreeRow, ()>> {
-    flatten_tree(cwd, expanded, sort, descending, show_hidden, filter, conns)
+    flatten_tree(
+        cwd,
+        expanded,
+        sort,
+        descending,
+        show_hidden,
+        filter,
+        conns,
+        db_cache,
+        fs_cache,
+    )
         .into_iter()
         .map(TableEntry::Item)
         .collect()

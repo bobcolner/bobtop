@@ -535,6 +535,13 @@ pub struct App {
     /// table. Replaced lazily on selection change. `None` while idle
     /// or when the selection is a filesystem entry.
     pub(crate) db_preview: Option<DbPreview>,
+    /// Cache of `Connection::{databases,schemas,tables}` results.
+    /// Survives across the 2-5 flattens a single tree-mode keystroke
+    /// can trigger; cleared on `Refresh`.
+    pub(crate) db_cache: crate::sources::multi::DbCache,
+    /// Cache of `scan_dir` results. Same shape as `db_cache` but for
+    /// filesystem readdir + stat calls.
+    pub(crate) fs_cache: crate::sources::multi::FsCache,
 }
 
 /// Loaded preview rows for one DB table.
@@ -704,6 +711,8 @@ impl App {
             tree_sort_descending: false,
             connections,
             db_preview: None,
+            db_cache: crate::sources::multi::new_db_cache(),
+            fs_cache: crate::sources::multi::new_fs_cache(),
         };
         // Auto-expand each DB endpoint so the user immediately sees
         // its database list rather than a collapsed connection row.
@@ -754,6 +763,22 @@ impl App {
 
     pub fn db_preview(&self) -> Option<&DbPreview> {
         self.db_preview.as_ref()
+    }
+
+    pub fn db_cache(&self) -> &crate::sources::multi::DbCache {
+        &self.db_cache
+    }
+
+    pub fn fs_cache(&self) -> &crate::sources::multi::FsCache {
+        &self.fs_cache
+    }
+
+    /// Drop both per-tree caches. Called on `Refresh` and on cwd /
+    /// expand mutations that change the visible row set, so the next
+    /// flatten reads from the source of truth.
+    pub(crate) fn invalidate_tree_caches(&self) {
+        self.db_cache.borrow_mut().clear();
+        self.fs_cache.borrow_mut().clear();
     }
 
     pub fn selected(&self) -> Option<&FsEntry> {
@@ -886,6 +911,7 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> io::Result<()> {
+        self.invalidate_tree_caches();
         self.all_entries = scan_dir(&self.cwd, self.show_hidden, self.sort)?;
         self.apply_filter();
         self.refresh_parent();
@@ -1186,6 +1212,8 @@ impl App {
             self.show_hidden,
             self.filter.as_deref(),
             &self.connections,
+            &self.db_cache,
+            &self.fs_cache,
         );
         let Some(row) = rows.get(self.tree_state.nav.cursor).cloned() else {
             self.preview_state = PreviewState::None;
@@ -1250,6 +1278,8 @@ impl App {
             self.show_hidden,
             self.filter.as_deref(),
             &self.connections,
+            &self.db_cache,
+            &self.fs_cache,
         )
         .len();
         let prior_cursor = self.tree_state.nav.cursor;
@@ -1295,6 +1325,8 @@ impl App {
                     self.show_hidden,
                     self.filter.as_deref(),
                     &self.connections,
+                    &self.db_cache,
+                    &self.fs_cache,
                 );
                 let cursor = self.tree_state.nav.cursor;
                 if let gtui::tree::ToggleOutcome::Expanded(_) =
@@ -1315,6 +1347,8 @@ impl App {
                     self.show_hidden,
                     self.filter.as_deref(),
                     &self.connections,
+                    &self.db_cache,
+                    &self.fs_cache,
                 );
                 match self.tree_state.collapse_or_parent(&rows) {
                     gtui::tree::ParentOutcome::Collapsed(_)
@@ -1357,6 +1391,8 @@ impl App {
                     self.show_hidden,
                     self.filter.as_deref(),
                     &self.connections,
+                    &self.db_cache,
+                    &self.fs_cache,
                 );
                 if let Some(row) = rows.get(self.tree_state.nav.cursor) {
                     if let crate::sources::AnyRow::Fs(ref e) = row.row {

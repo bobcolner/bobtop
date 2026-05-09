@@ -7,6 +7,8 @@
 //! shared [`gtui::tree::Catalog`] / [`gtui::tree::flatten`] machinery
 //! drive both source kinds without bifurcating the renderer.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gtui::tree::Catalog;
@@ -14,6 +16,30 @@ use gtui::tree::Catalog;
 use super::db::{Connection, NodeData, NodeKind, NodePath};
 use crate::fs::entry::FsEntry;
 use crate::tree::FsCatalog;
+
+/// Per-session cache of DB-query children. Lives on `App` and is
+/// borrowed into a [`MultiRootCatalog`] for each flatten. Cache miss
+/// hits the wire (Connection trait); cache hit returns a clone of
+/// the stored Vec — fast even on busy keystrokes that re-flatten 2-4
+/// times per action. Refresh (`r`) clears the cache so users can
+/// pick up schema / table additions made outside the app.
+pub(crate) type DbCache = RefCell<HashMap<NodePath, Vec<(NodePath, NodeData)>>>;
+
+pub(crate) fn new_db_cache() -> DbCache {
+    RefCell::new(HashMap::new())
+}
+
+/// Per-session cache of filesystem scans. Same shape as [`DbCache`]
+/// but keyed on the directory path. Each `scan_dir` call is a
+/// readdir + stat-per-entry — cheap individually, but a tree-mode
+/// keystroke can trigger 5-10 scans across an expanded subtree.
+/// Cache lives until refresh (`r`) or an `fs_dirty` notification
+/// from the watcher.
+pub(crate) type FsCache = RefCell<HashMap<PathBuf, Vec<FsEntry>>>;
+
+pub(crate) fn new_fs_cache() -> FsCache {
+    RefCell::new(HashMap::new())
+}
 
 /// Stable identifier for a row in the unified tree. Filesystem rows
 /// key on their absolute path; DB rows key on the connection index
@@ -50,11 +76,29 @@ pub enum AnyRow {
 pub(crate) struct MultiRootCatalog<'a> {
     fs: FsCatalog<'a>,
     conns: &'a [Box<dyn Connection>],
+    cache: &'a DbCache,
 }
 
 impl<'a> MultiRootCatalog<'a> {
-    pub(crate) fn new(fs: FsCatalog<'a>, conns: &'a [Box<dyn Connection>]) -> Self {
-        Self { fs, conns }
+    pub(crate) fn new(
+        fs: FsCatalog<'a>,
+        conns: &'a [Box<dyn Connection>],
+        cache: &'a DbCache,
+    ) -> Self {
+        Self { fs, conns, cache }
+    }
+
+    fn db_children(
+        &self,
+        path: &NodePath,
+        compute: impl FnOnce() -> Vec<(NodePath, NodeData)>,
+    ) -> Vec<(NodePath, NodeData)> {
+        if let Some(hit) = self.cache.borrow().get(path) {
+            return hit.clone();
+        }
+        let v = compute();
+        self.cache.borrow_mut().insert(path.clone(), v.clone());
+        v
     }
 }
 
@@ -96,20 +140,17 @@ impl<'a> Catalog for MultiRootCatalog<'a> {
                 let Some(conn) = self.conns.get(*root) else {
                     return Vec::new();
                 };
-                match path.level() {
+                let kids = self.db_children(path, || match path.level() {
                     NodeKind::Endpoint => match conn.databases() {
                         Ok(dbs) => dbs
                             .into_iter()
                             .map(|db| {
                                 (
-                                    AnyNodeId::Db {
-                                        root: *root,
-                                        path: NodePath::database(*root, &db.name),
-                                    },
-                                    AnyRow::Db(NodeData {
+                                    NodePath::database(*root, &db.name),
+                                    NodeData {
                                         kind: NodeKind::Database,
                                         label: db.name,
-                                    }),
+                                    },
                                 )
                             })
                             .collect(),
@@ -125,14 +166,11 @@ impl<'a> Catalog for MultiRootCatalog<'a> {
                                 .into_iter()
                                 .map(|s| {
                                     (
-                                        AnyNodeId::Db {
-                                            root: *root,
-                                            path: NodePath::schema(*root, db, &s.name),
-                                        },
-                                        AnyRow::Db(NodeData {
+                                        NodePath::schema(*root, db, &s.name),
+                                        NodeData {
                                             kind: NodeKind::Schema,
                                             label: s.name,
-                                        }),
+                                        },
                                     )
                                 })
                                 .collect(),
@@ -152,14 +190,11 @@ impl<'a> Catalog for MultiRootCatalog<'a> {
                                 .into_iter()
                                 .map(|t| {
                                     (
-                                        AnyNodeId::Db {
-                                            root: *root,
-                                            path: NodePath::table(*root, db, sch, &t.name),
-                                        },
-                                        AnyRow::Db(NodeData {
+                                        NodePath::table(*root, db, sch, &t.name),
+                                        NodeData {
                                             kind: NodeKind::Table,
                                             label: t.name,
-                                        }),
+                                        },
                                     )
                                 })
                                 .collect(),
@@ -172,7 +207,18 @@ impl<'a> Catalog for MultiRootCatalog<'a> {
                         }
                     }
                     NodeKind::Table => Vec::new(),
-                }
+                });
+                kids.into_iter()
+                    .map(|(p, d)| {
+                        (
+                            AnyNodeId::Db {
+                                root: *root,
+                                path: p,
+                            },
+                            AnyRow::Db(d),
+                        )
+                    })
+                    .collect()
             }
         }
     }

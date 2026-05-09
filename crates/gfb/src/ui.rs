@@ -102,6 +102,8 @@ fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         &app.tree_state.expanded,
         app.filter(),
         app.connections(),
+        app.db_cache(),
+        app.fs_cache(),
     );
 
     let columns: Vec<ColumnDef<FbCol>> = vec![
