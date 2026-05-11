@@ -65,7 +65,7 @@ pub struct Cli {
 /// `gfb` binary and the bundled `gtop fb …` subcommand call
 /// this with their respective slices.
 pub fn run(args: Vec<String>) -> Result<()> {
-    let cli = match Cli::try_parse_from(args) {
+    let mut cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
             // `--help` / `--version` are reported as Errors by clap;
@@ -97,6 +97,20 @@ pub fn run(args: Vec<String>) -> Result<()> {
         _ => ImageBackendChoice::Auto,
     };
 
+    // ENV fallback: if no --connect flags were given, check GFB_CONNECT
+    // (space-separated URLs) and GFB_DUCKLAKE_* for auto-connect.
+    if cli.connections.is_empty() {
+        if let Ok(env) = std::env::var("GFB_CONNECT") {
+            cli.connections = env.split_whitespace().map(String::from).collect();
+        }
+    }
+    if cli.ducklake_catalog.is_none() {
+        cli.ducklake_catalog = std::env::var("GFB_DUCKLAKE_CATALOG").ok();
+    }
+    if cli.ducklake_path.is_none() {
+        cli.ducklake_path = std::env::var("GFB_DUCKLAKE_PATH").ok().map(PathBuf::from);
+    }
+
     // Build the DB connection workers. Each `--connect` URL spawns a
     // dedicated worker thread that owns its `Connection` for the
     // session — `duckdb::Connection` is `!Send`, so we can't move
@@ -122,7 +136,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         match crate::sources::ConnectionWorker::spawn(
             url.clone(),
             ducklake,
-            /* read_only */ true,
+            /* read_only */ false,
         ) {
             Ok(w) => connections.push(w),
             Err(e) => eprintln!("gfb: --connect {url} failed: {e:#}"),

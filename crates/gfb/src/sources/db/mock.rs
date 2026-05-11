@@ -254,4 +254,18 @@ impl Connection for MockConnection {
             })
             .unwrap_or_default())
     }
+
+    fn execute_query(&self, _sql: &str) -> Result<(Vec<String>, Vec<Row>)> {
+        Ok((
+            vec!["result".to_string(), "value".to_string()],
+            vec![
+                Row { cells: vec!["row1".to_string(), "42".to_string()] },
+                Row { cells: vec!["row2".to_string(), "99".to_string()] },
+            ],
+        ))
+    }
+
+    fn drop_object(&self, _db: &str, _schema: &str, _table: Option<&str>, _cascade: bool) -> Result<()> {
+        anyhow::bail!("mock connection does not support drop")
+    }
 }

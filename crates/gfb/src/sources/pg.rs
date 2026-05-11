@@ -214,6 +214,68 @@ impl Connection for PgConnection {
             })
             .collect())
     }
+
+    fn approximate_row_count(&self, db: &str, schema: &str, table: &str) -> Option<u64> {
+        if db != self.db_name {
+            return None;
+        }
+        let client = self.client.lock().ok()?;
+        let rows = self.block(client.query(
+            "SELECT GREATEST(reltuples::bigint, 0) \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = $1 AND n.nspname = $2",
+            &[&table, &schema],
+        )).ok()?;
+        let v: i64 = rows.first()?.get(0);
+        if v <= 0 { None } else { Some(v as u64) }
+    }
+
+    fn execute_query(&self, sql: &str) -> Result<(Vec<String>, Vec<Row>)> {
+        use tokio_postgres::SimpleQueryMessage;
+        let client = self.client.lock().expect("client mutex poisoned");
+        // simple_query uses the text protocol — every value comes back as
+        // an &str regardless of the underlying Postgres type, so we never
+        // hit a type-conversion error on numeric, timestamp, jsonb, etc.
+        let messages = self
+            .block(client.simple_query(sql))
+            .with_context(|| format!("execute query: {}", sql.chars().take(80).collect::<String>()))?;
+        let mut col_names: Vec<String> = Vec::new();
+        let mut result_rows: Vec<Row> = Vec::new();
+        for msg in messages {
+            match msg {
+                SimpleQueryMessage::Row(row) => {
+                    if col_names.is_empty() {
+                        col_names = row.columns().iter().map(|c| c.name().to_string()).collect();
+                    }
+                    let cells = (0..row.columns().len())
+                        .map(|i| row.get(i).unwrap_or("—").to_string())
+                        .collect();
+                    result_rows.push(Row { cells });
+                }
+                _ => {}
+            }
+        }
+        Ok((col_names, result_rows))
+    }
+
+    fn drop_object(&self, _db: &str, schema: &str, table: Option<&str>, cascade: bool) -> Result<()> {
+        let cas = if cascade { " CASCADE" } else { "" };
+        let sql = match table {
+            Some(t) => format!(
+                "DROP TABLE IF EXISTS {}.{}{}",
+                quote_ident(schema), quote_ident(t), cas
+            ),
+            None => format!(
+                "DROP SCHEMA IF EXISTS {}{}",
+                quote_ident(schema), cas
+            ),
+        };
+        let client = self.client.lock().expect("client mutex poisoned");
+        self.block(client.execute(sql.as_str(), &[]))
+            .with_context(|| format!("drop_object: {sql}"))?;
+        Ok(())
+    }
 }
 
 /// Quote a SQL identifier — wrap in double quotes and escape embedded

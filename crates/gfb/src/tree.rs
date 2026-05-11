@@ -254,7 +254,7 @@ impl TableRowExt<FbCol> for TreeRow {
             (AnyRow::Db(d), FbCol::Name) => {
                 // Database / schema / endpoint glyphs.
                 let glyph = match d.kind {
-                    NodeKind::Endpoint => "🔌",
+                    NodeKind::Endpoint => "⛁",
                     NodeKind::Database => "🗄",
                     NodeKind::Schema => "📂",
                     NodeKind::Table => "▦",

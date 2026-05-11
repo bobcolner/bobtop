@@ -35,6 +35,17 @@ pub(crate) struct LoadResult {
     pub result: Result<Vec<(NodePath, NodeData)>>,
 }
 
+/// Result of an async SQL query execution.
+#[derive(Debug)]
+pub(crate) struct QueryExecResult {
+    /// Generation token for stale-result discard.
+    pub gen: u64,
+    pub columns: Vec<String>,
+    pub rows: Vec<super::db::Row>,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
 enum Request {
     LoadChildren {
         path: NodePath,
@@ -52,6 +63,24 @@ enum Request {
         table: String,
         limit: usize,
         reply: mpsc::Sender<Result<Vec<Row>>>,
+    },
+    RowCount {
+        db: String,
+        schema: String,
+        table: String,
+        reply: mpsc::Sender<Option<u64>>,
+    },
+    DropObject {
+        db: String,
+        schema: String,
+        table: Option<String>,
+        cascade: bool,
+        reply: mpsc::Sender<Result<()>>,
+    },
+    ExecQuery {
+        sql: String,
+        gen: u64,
+        reply: mpsc::SyncSender<QueryExecResult>,
     },
     Shutdown,
 }
@@ -130,7 +159,40 @@ impl ConnectionWorker {
         rrx.recv()?
     }
 
+    pub fn drop_object(&self, db: &str, schema: &str, table: Option<&str>, cascade: bool) -> Result<()> {
+        let (rtx, rrx) = mpsc::channel();
+        self.tx.send(Request::DropObject {
+            db: db.into(),
+            schema: schema.into(),
+            table: table.map(String::from),
+            cascade,
+            reply: rtx,
+        })?;
+        rrx.recv()?
+    }
+
+    /// Catalog-stats row count estimate — no table scan. Returns `None`
+    /// when the backend can't provide a cheap estimate.
+    pub fn approximate_row_count(&self, db: &str, schema: &str, table: &str) -> Option<u64> {
+        let (rtx, rrx) = mpsc::channel();
+        self.tx.send(Request::RowCount {
+            db: db.into(),
+            schema: schema.into(),
+            table: table.into(),
+            reply: rtx,
+        }).ok()?;
+        rrx.recv().ok()?
+    }
+
+    /// Async query execution. Fires the request and returns; the worker
+    /// runs the SQL, records elapsed time, and sends a `QueryExecResult`
+    /// on `reply`. The main loop drains the reply channel each tick.
+    pub fn exec_query_async(&self, sql: String, gen: u64, reply: mpsc::SyncSender<QueryExecResult>) {
+        let _ = self.tx.send(Request::ExecQuery { sql, gen, reply });
+    }
+
     /// Sync preview-rows fetch, same blocking shape as `columns`.
+    #[allow(dead_code)]
     pub fn preview_rows(
         &self,
         db: &str,
@@ -197,6 +259,29 @@ fn worker_main(
                 reply,
             } => {
                 let _ = reply.send(conn.preview_rows(&db, &schema, &table, limit));
+            }
+            Request::RowCount { db, schema, table, reply } => {
+                let _ = reply.send(conn.approximate_row_count(&db, &schema, &table));
+            }
+            Request::DropObject { db, schema, table, cascade, reply } => {
+                let _ = reply.send(conn.drop_object(&db, &schema, table.as_deref(), cascade));
+            }
+            Request::ExecQuery { sql, gen, reply } => {
+                let t0 = std::time::Instant::now();
+                let result = conn.execute_query(&sql);
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                let (columns, rows, error) = match result {
+                    Ok((cols, rows)) => (cols, rows, None),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let _ = std::fs::write("/tmp/gfb-query-error.log", &msg);
+                        (Vec::new(), Vec::new(), Some(msg))
+                    }
+                };
+                let send_result = reply.try_send(QueryExecResult { gen, columns, rows, elapsed_ms, error });
+                if send_result.is_err() {
+                    let _ = std::fs::write("/tmp/gfb-debug.log", "worker: reply channel full or closed\n");
+                }
             }
             Request::Shutdown => return,
         }

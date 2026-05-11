@@ -127,6 +127,24 @@ pub trait Connection {
         table: &str,
         limit: usize,
     ) -> Result<Vec<Row>>;
+
+    /// Cheaply-estimated row count from catalog statistics — no full
+    /// scan. Returns `None` when a fast estimate isn't available for
+    /// this backend. Postgres reads `pg_class.reltuples` (updated by
+    /// VACUUM/ANALYZE); other backends may return `None`.
+    fn approximate_row_count(&self, _db: &str, _schema: &str, _table: &str) -> Option<u64> {
+        None
+    }
+
+    /// Execute an arbitrary SQL statement and return the result set.
+    /// Column names are returned separately so the renderer can label
+    /// the table header without a schema lookup. Cells are stringified
+    /// by the backend — the renderer stays type-agnostic.
+    fn execute_query(&self, sql: &str) -> Result<(Vec<String>, Vec<Row>)>;
+
+    /// Drop a table (`table = Some`) or schema (`table = None`).
+    /// If `cascade` is true, appends `CASCADE` to drop dependent objects too.
+    fn drop_object(&self, db: &str, schema: &str, table: Option<&str>, cascade: bool) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]

@@ -50,12 +50,19 @@ pub enum Action {
     /// Flip between Miller and Tree view modes (`T`). Each mode
     /// keeps its own cursor/sort state so toggling is non-destructive.
     ToggleViewMode,
+    /// Toggle the dedicated database browser (`D`). Switches between
+    /// the file browser (Miller/Tree) and the DB-only tree view.
+    ToggleDatabaseMode,
     /// Tree-mode only: cycle to the next sortable column (`.`).
     TreeCycleSortNext,
     /// Tree-mode only: cycle to the previous sortable column (`,`).
     TreeCycleSortPrev,
     /// Tree-mode only: flip sort direction (`R`).
     TreeReverseSort,
+    /// Open the command palette (`:` key).
+    StartCommandPalette,
+    /// Show file/directory info panel (`i` key).
+    ShowInfo,
     Noop,
 }
 
@@ -89,8 +96,8 @@ pub fn map(ev: KeyEvent) -> Action {
         // makes manual refresh rarely needed anyway).
         KeyCode::Char('r') => Action::Rename,
         KeyCode::F(5) => Action::Refresh,
-        KeyCode::Char('d') => Action::Trash,
-        KeyCode::Char('D') => Action::HardDelete,
+        KeyCode::Char('x') => Action::Trash,
+        KeyCode::Char('X') => Action::HardDelete,
         KeyCode::Char('a') => Action::Touch,
         KeyCode::Char('f') => Action::StartFind,
         KeyCode::Char('e') => Action::StartEditor,
@@ -101,6 +108,7 @@ pub fn map(ev: KeyEvent) -> Action {
         // View mode toggle. `T` is unbound in miller mode today and
         // unique enough to not collide with anything muscle memory.
         KeyCode::Char('T') => Action::ToggleViewMode,
+        KeyCode::Char('D') => Action::ToggleDatabaseMode,
         // Tree-mode-only sort cycling. `s` / `S` advance / step back
         // through the sortable columns; `R` flips direction. (`.`
         // would have been more mnemonic but it's already bound to
@@ -108,6 +116,8 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('s') => Action::TreeCycleSortNext,
         KeyCode::Char('S') => Action::TreeCycleSortPrev,
         KeyCode::Char('R') => Action::TreeReverseSort,
+        KeyCode::Char(':') => Action::StartCommandPalette,
+        KeyCode::Char('i') => Action::ShowInfo,
         _ => Action::Noop,
     }
 }

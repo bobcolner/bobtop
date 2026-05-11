@@ -62,7 +62,7 @@ tokio-postgres = { workspace = true, optional = true }
 duckdb = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["all-sources"]
 postgres = ["dep:tokio-postgres"]
 duckdb = ["dep:duckdb"]
 all-sources = ["postgres", "duckdb"]

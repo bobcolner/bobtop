@@ -17,7 +17,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
-use crate::app::{App, Focus, ImageBackend, InputModal};
+use crate::app::{App, DirContent, Focus, ImageBackend, InputModal};
 use crate::find::FindResult;
 
 /// Three-column miller layout shared between the renderer and the
@@ -59,96 +59,52 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
             }
         }
     }
-    let (top, bottom) = split_top_bottom(area, 1);
+    // Full-screen preview/editor takes over the entire viewport.
+    if app.is_full_preview() {
+        if app.editor().is_some() {
+            draw_editor_fullscreen(app, frame, theme, area);
+        } else {
+            draw_preview_fullscreen(app, frame, theme, area);
+        }
+        if let Some(modal) = app.input_modal() {
+            draw_input_modal(modal, frame, theme, area);
+        }
+        return;
+    }
+    let (breadcrumb_rect, rest) = split_top(area, 1);
+    let (top, bottom) = split_top_bottom(rest, 1);
+    draw_breadcrumb(app, frame, theme, breadcrumb_rect);
     match app.view_mode {
-        crate::app::ViewMode::Miller => {
+        crate::app::ViewMode::Database => {
+            draw_db_mode(app, frame, theme, top);
+            draw_action_bar(app, frame, theme, bottom);
+        }
+        crate::app::ViewMode::Miller | crate::app::ViewMode::Table => {
             let rects = split_main_columns(top, app.preview_size().weight());
             draw_parent_pane(app, frame, theme, rects[0]);
             draw_list_pane(app, frame, theme, rects[1]);
             draw_preview_pane(app, frame, theme, rects[2]);
             draw_action_bar(app, frame, theme, bottom);
-            if app.is_full_preview() {
-                if app.editor().is_some() {
-                    draw_editor_modal(app, frame, theme, area);
-                } else {
-                    draw_preview_modal(app, frame, theme, area);
-                }
-            }
         }
         crate::app::ViewMode::Tree => {
-            draw_tree_view(app, frame, theme, top);
+            let rects = split_main_columns(top, app.preview_size().weight());
+            draw_parent_pane(app, frame, theme, rects[0]);
+            draw_tree_center(app, frame, theme, rects[1]);
+            draw_preview_pane(app, frame, theme, rects[2]);
             draw_action_bar(app, frame, theme, bottom);
         }
     }
     if let Some(modal) = app.input_modal() {
         draw_input_modal(modal, frame, theme, area);
     }
+    if app.is_command_palette_active() {
+        draw_command_palette(app, frame, theme, area);
+    }
+    if app.is_info_panel_active() {
+        draw_info_panel(app, frame, theme, area);
+    }
 }
 
-/// Two-pane layout for `ViewMode::Tree`: tree (left ~30%) +
-/// preview (right ~70%). Tree pane uses [`gtui::LiveTable`]
-/// in tree-glyph mode; preview pane reuses the same renderer the
-/// miller-mode side preview uses, just with a much bigger area.
-fn draw_tree_view(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
-    use crate::tree::{build_rows_for_app, FbCol};
-    use gtui::browser::BrowserShell;
-    use gtui::widgets::live_table::{Align, ColumnDef, WidthSpec};
-
-    let rows = build_rows_for_app(
-        app.cwd(),
-        app.tree_sort,
-        app.tree_sort_descending,
-        app.show_hidden(),
-        &app.tree_state.expanded,
-        app.filter(),
-        app.connections(),
-        app.db_cache(),
-        app.fs_cache(),
-        Some(app.db_load_tx()),
-    );
-
-    let columns: Vec<ColumnDef<FbCol>> = vec![
-        ColumnDef {
-            id: FbCol::Name,
-            label: "Name",
-            width: WidthSpec::Flex,
-            align: Align::Left,
-            sortable: true,
-        },
-        ColumnDef {
-            id: FbCol::Size,
-            label: "Size",
-            width: WidthSpec::Fixed(7),
-            align: Align::Right,
-            sortable: true,
-        },
-        ColumnDef {
-            id: FbCol::Modified,
-            label: "Modified",
-            width: WidthSpec::Fixed(16),
-            align: Align::Left,
-            sortable: true,
-        },
-    ];
-
-    let preview_rect = BrowserShell::<FbCol>::new()
-        .with_title(format!("tree · {}", app.cwd_display()))
-        .with_accent(theme.panel_accents[3])
-        .with_sort_state(app.tree_sort, app.tree_sort_descending)
-        .render(
-            frame,
-            area,
-            &rows,
-            &columns,
-            theme,
-            FbCol::Name,
-            app.tree_state.nav.cursor,
-        );
-
-    // Preview pane — reuse the miller-mode preview renderer against
-    // the bigger right-hand rect.
-    draw_preview_pane(app, frame, theme, preview_rect);
-}
 
 fn target_name(p: &std::path::Path) -> String {
     p.file_name()
@@ -188,6 +144,45 @@ fn draw_input_modal(modal: &InputModal, frame: &mut Frame<'_>, theme: &Theme, ar
             ],
             "y delete  •  any other key cancel",
         ),
+        InputModal::ConfirmDropDbObject { path, cascade, .. } => {
+            use crate::sources::NodeKind;
+            let schema = path.schema.as_deref().unwrap_or("?");
+            let tbl = path.table.as_deref().unwrap_or("?");
+            let (title, detail, warning) = if *cascade {
+                let obj = match path.level() {
+                    NodeKind::Table => format!("{schema}.{tbl}"),
+                    _ => schema.to_string(),
+                };
+                (
+                    "drop cascade?",
+                    format!("{obj}"),
+                    "Other objects depend on this — CASCADE will drop them too.",
+                )
+            } else {
+                match path.level() {
+                    NodeKind::Table => (
+                        "drop table?",
+                        format!("{schema}.{tbl}"),
+                        "This cannot be undone.",
+                    ),
+                    NodeKind::Schema => (
+                        "drop schema?",
+                        format!("{schema}  (all tables inside will be dropped)"),
+                        "This cannot be undone.",
+                    ),
+                    _ => ("drop?", String::new(), ""),
+                }
+            };
+            (
+                title,
+                vec![
+                    Line::from(detail),
+                    Line::from(""),
+                    Line::from(warning),
+                ],
+                "y / Enter  confirm  •  any other key cancel",
+            )
+        }
     };
     ConfirmDialog::new(theme, title)
         .with_body(body_lines)
@@ -213,6 +208,343 @@ fn split_top_bottom(area: Rect, bottom_h: u16) -> (Rect, Rect) {
     let top = Rect::new(area.x, area.y, area.width, h - bottom_h);
     let bot = Rect::new(area.x, area.y + h - bottom_h, area.width, bottom_h);
     (top, bot)
+}
+
+/// Carve `h` rows off the top of `area`. Returns (top_strip, remainder).
+fn split_top(area: Rect, h: u16) -> (Rect, Rect) {
+    if area.height <= h {
+        return (area, Rect::new(area.x, area.y + area.height, area.width, 0));
+    }
+    let strip = Rect::new(area.x, area.y, area.width, h);
+    let rest = Rect::new(area.x, area.y + h, area.width, area.height - h);
+    (strip, rest)
+}
+
+fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use std::path::PathBuf;
+    use ratatui::style::Modifier;
+
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // In DB mode show a simple "database" indicator instead of a filesystem path.
+    if matches!(app.view_mode, crate::app::ViewMode::Database) {
+        let count = app.connections().len();
+        let label = if count == 1 { "database  ·  1 connection".to_string() }
+                    else { format!("database  ·  {} connections", count) };
+        let lines = vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled(label, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+        ])];
+        let widget = ScrollableText::new(&lines, theme);
+        frame.render_widget(&widget, area);
+        return;
+    }
+
+    let cwd = app.cwd();
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+
+    let display_path = match &home {
+        Some(h) if cwd.starts_with(h) => {
+            let rel = cwd.strip_prefix(h).unwrap_or(cwd);
+            let mut p = PathBuf::from("~");
+            p.push(rel);
+            p
+        }
+        _ => cwd.to_path_buf(),
+    };
+
+    let components: Vec<String> = display_path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    let sep_style = Style::default().fg(theme.div_line);
+    let dim_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+    let last_style = Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
+    let n = components.len();
+    for (i, comp) in components.into_iter().enumerate() {
+        let style = if i + 1 == n { last_style } else { dim_style };
+        spans.push(Span::styled(comp, style));
+        if i + 1 < n {
+            spans.push(Span::styled(" / ", sep_style));
+        }
+    }
+
+    let lines = vec![Line::from(spans)];
+    let widget = ScrollableText::new(&lines, theme);
+    frame.render_widget(&widget, area);
+}
+
+/// Full-screen DB browser: tree on the left (~40%), preview on the right.
+/// Only DB nodes are shown — no filesystem entries.
+fn draw_db_mode(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use crate::sources::AnyRow;
+    use crate::tree::{FbCol, build_rows_for_app};
+    use gtui::browser::BrowserShell;
+    use gtui::widgets::live_table::{Align, ColumnDef, TableEntry, WidthSpec};
+
+    if app.connections().is_empty() {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No database connections.",
+                Style::default().fg(theme.hi_fg),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Set GFB_CONNECT in your environment or use --connect <url>.",
+                Style::default().fg(theme.main_fg),
+            )),
+        ];
+        let widget = ScrollableText::new(&lines, theme);
+        frame.render_widget(&widget, area);
+        return;
+    }
+
+    let all_rows = build_rows_for_app(
+        app.cwd(),
+        app.tree_sort,
+        app.tree_sort_descending,
+        app.show_hidden(),
+        &app.db_state().expanded,
+        app.filter(),
+        app.connections(),
+        app.db_cache(),
+        app.fs_cache(),
+        Some(app.db_load_tx()),
+    );
+    let db_rows: Vec<_> = all_rows
+        .into_iter()
+        .filter(|e| matches!(e, TableEntry::Item(r) if matches!(r.row, AnyRow::Db(_))))
+        .collect();
+
+    let columns: Vec<ColumnDef<FbCol>> = vec![ColumnDef {
+        id: FbCol::Name,
+        label: "Name",
+        width: WidthSpec::Flex,
+        align: Align::Left,
+        sortable: false,
+    }];
+
+    let cursor = app.db_state().nav.cursor;
+    let tree_pct = if app.is_query_editor_active() { 30 } else { 40 };
+    let preview_rect = BrowserShell::<FbCol>::new()
+        .with_title("database")
+        .with_accent(theme.panel_accents[1])
+        .with_tree_percent(tree_pct)
+        .render(frame, area, &db_rows, &columns, theme, FbCol::Name, cursor);
+
+    if app.is_query_editor_active() {
+        draw_query_pane(app, frame, theme, preview_rect);
+    } else {
+        draw_preview_pane(app, frame, theme, preview_rect);
+    }
+}
+
+/// Render the tree as a LiveTable with tree glyphs in the given `area`
+/// (center column). Unlike the old `draw_tree_view`, this does NOT
+/// split `area` into tree + preview — the caller owns the split.
+fn draw_tree_center(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use crate::tree::{build_rows_for_app, FbCol};
+    use gtui::widgets::live_table::{Align, ColumnDef, LiveTable, WidthSpec};
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let rows = build_rows_for_app(
+        app.cwd(),
+        app.tree_sort,
+        app.tree_sort_descending,
+        app.show_hidden(),
+        &app.tree_state.expanded,
+        app.filter(),
+        &[],
+        app.db_cache(),
+        app.fs_cache(),
+        Some(app.db_load_tx()),
+    );
+
+    // Inner width after the BoxedPanel bubble-title border (4 rows eaten,
+    // 2 cols per side). Use it to decide which columns to show so the
+    // Name column always has enough room for tree glyphs + a filename.
+    let inner_w = area.width.saturating_sub(2);
+    let mut columns: Vec<ColumnDef<FbCol>> = vec![ColumnDef {
+        id: FbCol::Name,
+        label: "Name",
+        width: WidthSpec::Flex,
+        align: Align::Left,
+        sortable: true,
+    }];
+    if inner_w >= 48 {
+        columns.push(ColumnDef {
+            id: FbCol::Modified,
+            label: "Modified",
+            width: WidthSpec::Fixed(16),
+            align: Align::Left,
+            sortable: true,
+        });
+    }
+    if inner_w >= 36 {
+        columns.push(ColumnDef {
+            id: FbCol::Size,
+            label: "Size",
+            width: WidthSpec::Fixed(7),
+            align: Align::Right,
+            sortable: true,
+        });
+    }
+
+    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
+        .with_title(format!("tree · {}", app.cwd_display()));
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.height < 1 || inner.width < 4 {
+        return;
+    }
+
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let scroll = gtui::middle_anchor_scroll(app.tree_state.nav.cursor, rows.len(), body_h);
+    let table = LiveTable::new(&rows, &columns, theme, FbCol::Name)
+        .with_selection(Some(app.tree_state.nav.cursor), scroll)
+        .with_tree_glyphs(true)
+        .with_fade(false)
+        .with_sort(Some(app.tree_sort), app.tree_sort_descending);
+    frame.render_widget(&table, inner);
+}
+
+fn draw_command_palette(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use ratatui::style::Modifier;
+
+    let Some(state) = app.command_palette_state() else {
+        return;
+    };
+    let suggestions = app.palette_suggestions();
+
+    let modal_w = (area.width * 2 / 3).max(52).min(area.width.saturating_sub(4));
+    let suggestion_rows = suggestions.len() as u16;
+    let modal_h = (suggestion_rows + 4).min(area.height.saturating_sub(4));
+    let bg = theme.main_bg.unwrap_or(ratatui::style::Color::Black);
+
+    let panel = BoxedPanel::new(theme.panel_accents[2], theme.title)
+        .with_title("command")
+        .with_controls("↑↓  Enter  Esc")
+        .flat();
+    let shell = ModalShell::new(panel, modal_w, modal_h)
+        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
+    let Some(body) = shell.render(frame, area) else {
+        return;
+    };
+
+    let input_style = Style::default()
+        .fg(theme.hi_fg)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+    let sel_style = Style::default().bg(theme.selected_bg).fg(theme.hi_fg);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(": {}▏", state.input),
+        input_style,
+    )));
+    lines.push(Line::from(""));
+
+    for (i, entry) in suggestions.iter().enumerate() {
+        let (cmd_style, d_style) = if i == state.selected {
+            (sel_style, sel_style)
+        } else {
+            (Style::default().fg(theme.hi_fg), desc_style)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<22}", entry.cmd), cmd_style),
+            Span::styled(entry.description.to_string(), d_style),
+        ]));
+    }
+
+    if suggestions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no matching commands",
+            desc_style,
+        )));
+    }
+
+    let widget = ScrollableText::new(&lines, theme);
+    frame.render_widget(&widget, body);
+}
+
+fn draw_info_panel(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use ratatui::style::Modifier;
+    let Some(panel) = app.info_panel() else { return };
+
+    let dim = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+    let val = Style::default().fg(theme.hi_fg);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let push = |lines: &mut Vec<Line<'static>>, label: &'static str, value: String| {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<12}"), dim),
+            Span::styled(value, val),
+        ]));
+    };
+
+    push(&mut lines, "name", panel.name.clone());
+
+    let kind_str = match panel.kind {
+        crate::fs::entry::EntryKind::Dir => "directory",
+        crate::fs::entry::EntryKind::File => "file",
+        crate::fs::entry::EntryKind::Symlink => "symlink",
+        crate::fs::entry::EntryKind::Other => "other",
+    };
+    push(&mut lines, "type", kind_str.to_string());
+
+    if let Some(mtime) = panel.mtime {
+        use std::time::UNIX_EPOCH;
+        let secs = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let (y, mo, d, h, mi, s) = epoch_to_ymd_hms(secs);
+        push(&mut lines, "modified", format!("{y}-{mo:02}-{d:02}  {h:02}:{mi:02}:{s:02}"));
+    }
+
+    match &panel.dir_content {
+        None => {
+            // Plain file — show size.
+            push(&mut lines, "size", format_bytes_compact(panel.size));
+        }
+        Some(DirContent::Calculating) => {
+            push(&mut lines, "files", "calculating…".to_string());
+            push(&mut lines, "size", "calculating…".to_string());
+        }
+        Some(DirContent::Ready { files, dirs, total_bytes }) => {
+            push(&mut lines, "files", format!("{files}"));
+            push(&mut lines, "dirs", format!("{dirs}"));
+            push(&mut lines, "total size", format_bytes_compact(*total_bytes));
+        }
+        Some(DirContent::Error(e)) => {
+            push(&mut lines, "files", format!("error: {e}"));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  any key to close",
+        Style::default().fg(theme.div_line).add_modifier(Modifier::DIM),
+    )));
+
+    let modal_w = (area.width / 2).max(42).min(area.width.saturating_sub(4));
+    let modal_h = (lines.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let bg = theme.main_bg.unwrap_or(Color::Black);
+    let panel_widget = BoxedPanel::new(theme.panel_accents[1], theme.title)
+        .with_title("info")
+        .flat();
+    let shell = ModalShell::new(panel_widget, modal_w, modal_h)
+        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
+    let Some(body) = shell.render(frame, area) else { return };
+    let widget = ScrollableText::new(&lines, theme);
+    frame.render_widget(&widget, body);
 }
 
 fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
@@ -488,65 +820,41 @@ fn render_editor_body(app: &App, frame: &mut Frame<'_>, theme: &Theme, inner: Re
     frame.render_widget(&widget, inner);
 }
 
-fn draw_editor_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+fn draw_editor_fullscreen(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     let Some(editor) = app.editor() else { return };
+    let (content, bar_rect) = split_top_bottom(area, 1);
     let dirty_mark = if editor.dirty { " ●" } else { "" };
-    let title = format!("✎ {}{}", editor.name(), dirty_mark);
     let controls = format!(
-        "Ln {}  Col {}  ·  ^S save  ^X exit",
+        "Ln {}  Col {}  ·  ^S save  ^X exit  ·  Space close",
         editor.cursor.0 + 1,
         editor.cursor.1 + 1
     );
-    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
-        .with_title(title)
-        .with_controls(controls)
-        .flat();
-    let modal_w = ((area.width as u32 * 9 / 10) as u16).max(20);
-    let modal_h = ((area.height as u32 * 9 / 10) as u16).max(8);
-    let bg = theme.main_bg.unwrap_or(Color::Black);
-    let shell = ModalShell::new(panel, modal_w, modal_h)
-        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
-    let Some(body) = shell.render(frame, area) else {
-        return;
-    };
-    if body.height == 0 {
-        return;
-    }
-    render_editor_body(app, frame, theme, body);
+    let bar = ActionBar::new(vec![
+        (format!("✎ {}{}", editor.name(), dirty_mark), controls),
+    ])
+    .with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+    frame.render_widget(&bar, bar_rect);
+    render_editor_body(app, frame, theme, content);
 }
 
-fn draw_preview_modal(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
-    let title = app
+fn draw_preview_fullscreen(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    let (content, bar_rect) = split_top_bottom(area, 1);
+    let name = app
         .selected()
         .map(|e| e.name.clone())
         .unwrap_or_else(|| "preview".to_string());
-    let panel = BoxedPanel::new(theme.panel_accents[3], theme.title)
-        .with_title(title)
-        .with_controls("j/k scroll  •  Space/Esc close")
-        .flat();
-    let modal_w = ((area.width as u32 * 9 / 10) as u16).max(20);
-    let modal_h = ((area.height as u32 * 9 / 10) as u16).max(8);
-    // ModalShell only patches the fill bg onto border/chrome cells if
-    // the fill style has a Some(bg). Use the theme's main_bg when set;
-    // otherwise fall back to Black so the modal reads as a solid layer
-    // and the panes behind don't bleed through the borders or any
-    // gaps that ratatui's diff renderer leaves.
-    let modal_bg = theme.main_bg.unwrap_or(Color::Black);
-    let shell = ModalShell::new(panel, modal_w, modal_h)
-        .with_fill(Style::default().bg(modal_bg).fg(theme.main_fg));
-    let Some(body) = shell.render(frame, area) else {
-        return;
-    };
-    if body.height == 0 {
-        return;
-    }
-    // Re-derive the lines for this rect — we can't borrow the closure
-    // result from draw_preview_pane.
-    let fallback = lines_for_modal(app);
-    render_preview_body(app, frame, theme, body, fallback, app.modal_scroll());
+    let bar = ActionBar::new(vec![
+        (name, String::new()),
+        ("↑↓".into(), "scroll".into()),
+        ("Space/Esc".into(), "close".into()),
+    ])
+    .with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+    frame.render_widget(&bar, bar_rect);
+    let fallback = lines_for_fullscreen(app);
+    render_preview_body(app, frame, theme, content, fallback, app.modal_scroll());
 }
 
-fn lines_for_modal(app: &App) -> Vec<Line<'static>> {
+fn lines_for_fullscreen(app: &App) -> Vec<Line<'static>> {
     match app.preview_state() {
         crate::preview::PreviewState::None => vec![Line::from("(no selection)")],
         crate::preview::PreviewState::Loading(_) => vec![Line::from("…")],
@@ -559,6 +867,174 @@ fn lines_for_modal(app: &App) -> Vec<Line<'static>> {
             crate::preview::PreviewBody::Lines(v) => v.clone(),
             crate::preview::PreviewBody::Image(_) => Vec::new(),
         },
+    }
+}
+
+/// Split `area` vertically at `num/den` of its height.
+/// Returns (top strip, remainder).
+fn split_at_fraction(area: Rect, num: u16, den: u16) -> (Rect, Rect) {
+    let top_h = ((area.height as u32 * num as u32) / den as u32) as u16;
+    let top_h = top_h.max(1).min(area.height.saturating_sub(1));
+    let top = Rect::new(area.x, area.y, area.width, top_h);
+    let bot = Rect::new(area.x, area.y + top_h, area.width, area.height.saturating_sub(top_h));
+    (top, bot)
+}
+
+/// Render the query editor right-panel inside DB mode.
+/// The panel layout is controlled by `qe.layout` and cycled by Tab.
+fn draw_query_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use gtui::widgets::{panel, CornerStyle};
+    let Some(qe) = app.query_editor() else { return };
+    if area.width == 0 || area.height == 0 { return; }
+
+    let (editor_area, results_area) = match qe.layout {
+        crate::app::QueryPaneLayout::EditorOnly =>
+            (area, Rect::new(area.x, area.y + area.height, area.width, 0)),
+        crate::app::QueryPaneLayout::ResultsOnly =>
+            (Rect::new(area.x, area.y, area.width, 0), area),
+        crate::app::QueryPaneLayout::Split =>
+            split_at_fraction(area, 35, 100),
+    };
+
+    let accent = theme.panel_accents[2];
+
+    // ── SQL editor panel ─────────────────────────────────────────────
+    if editor_area.height > 0 {
+        let layout_hint = match qe.layout {
+            crate::app::QueryPaneLayout::EditorOnly => "Tab → split",
+            crate::app::QueryPaneLayout::Split => "Tab → results",
+            crate::app::QueryPaneLayout::ResultsOnly => "",
+        };
+        let p = panel(accent, theme.title, CornerStyle::default())
+            .with_title("query")
+            .with_controls(layout_hint.to_string());
+        frame.render_widget(&p, editor_area);
+        let inner = p.inner(editor_area);
+        if inner.height > 0 && inner.width > 0 {
+            let widget = EditableText::new(&qe.sql, qe.cursor, theme)
+                .with_scroll(qe.scroll_row, 0)
+                .with_line_numbers(true);
+            if let Some((cx, cy)) = widget.cursor_screen_xy(inner) {
+                frame.set_cursor_position((cx, cy));
+            }
+            frame.render_widget(&widget, inner);
+        }
+    }
+
+    // ── Results panel ────────────────────────────────────────────────
+    if results_area.height > 0 {
+        let (title, controls) = match &qe.result {
+            crate::app::QueryResultState::None =>
+                ("results".to_string(), "^R to run".to_string()),
+            crate::app::QueryResultState::Running =>
+                ("results".to_string(), "running…".to_string()),
+            crate::app::QueryResultState::Error(_) =>
+                ("results".to_string(), "error".to_string()),
+            crate::app::QueryResultState::Ready { rows, elapsed_ms, columns } => {
+                let n = rows.len();
+                let row_label = if n == 1 { "1 row".to_string() } else { format!("{n} rows") };
+                let col_info = if columns.len() > 1 {
+                    format!("col {}/{}", qe.col_scroll + 1, columns.len())
+                } else {
+                    format!("{} col", columns.len())
+                };
+                let scroll_hint = if matches!(qe.layout, crate::app::QueryPaneLayout::ResultsOnly) {
+                    "  ·  ←→ cols  ·  Tab → editor"
+                } else {
+                    "  ·  Tab → editor"
+                };
+                (
+                    col_info,
+                    format!("{row_label}  ·  {elapsed_ms}ms{scroll_hint}"),
+                )
+            }
+        };
+        let p = panel(accent, theme.title, CornerStyle::default())
+            .with_title(title)
+            .with_controls(controls);
+        frame.render_widget(&p, results_area);
+        let inner = p.inner(results_area);
+        if inner.height > 0 && inner.width > 0 {
+            render_query_results(qe, frame, theme, inner);
+        }
+    }
+}
+
+fn render_query_results(
+    qe: &crate::app::QueryEditorState,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+) {
+    use ratatui::style::Modifier;
+    match &qe.result {
+        crate::app::QueryResultState::None => {
+            let lines = vec![Line::from(Span::styled(
+                "  ^R to run",
+                Style::default().fg(theme.div_line).add_modifier(Modifier::DIM),
+            ))];
+            frame.render_widget(&ScrollableText::new(&lines, theme), area);
+        }
+        crate::app::QueryResultState::Running => {
+            let lines = vec![Line::from(Span::styled(
+                "  running…",
+                Style::default().fg(theme.div_line).add_modifier(Modifier::DIM),
+            ))];
+            frame.render_widget(&ScrollableText::new(&lines, theme), area);
+        }
+        crate::app::QueryResultState::Error(msg) => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            for l in msg.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {l}"),
+                    Style::default().fg(theme.main_fg),
+                )));
+            }
+            frame.render_widget(&ScrollableText::new(&lines, theme), area);
+        }
+        crate::app::QueryResultState::Ready { columns, rows, .. } => {
+            if columns.is_empty() {
+                let lines = vec![Line::from(Span::styled(
+                    "  (no columns)",
+                    Style::default().fg(theme.div_line).add_modifier(Modifier::DIM),
+                ))];
+                frame.render_widget(&ScrollableText::new(&lines, theme), area);
+                return;
+            }
+            // Pick a comfortable per-column width based on the widest header
+            // or cell value, capped so narrow terminals still work.
+            let col_w = columns_natural_width(columns, rows, area.width);
+            // Determine which columns fit starting from col_scroll.
+            let col_start = qe.col_scroll.min(columns.len().saturating_sub(1));
+            let mut visible_cols = 0usize;
+            let mut used = 0u16;
+            for w in columns.iter().skip(col_start).map(|_| col_w) {
+                if used + w > area.width { break; }
+                used += w;
+                visible_cols += 1;
+            }
+            visible_cols = visible_cols.max(1);
+            let col_end = (col_start + visible_cols).min(columns.len());
+
+            let gtui_cols: Vec<gtui::Column> = columns[col_start..col_end]
+                .iter()
+                .map(|name| gtui::Column::new(name.as_str(), col_w))
+                .collect();
+            let gtui_rows: Vec<gtui::Row<'static>> = rows
+                .iter()
+                .skip(qe.result_scroll)
+                .map(|r| {
+                    let cells: Vec<Cell<'static>> = r.cells
+                        .iter()
+                        .skip(col_start)
+                        .take(col_end - col_start)
+                        .map(|c| Cell::new(c.clone()))
+                        .collect();
+                    gtui::Row::data(cells)
+                })
+                .collect();
+            frame.render_widget(&gtui::Table::new(&gtui_cols, &gtui_rows, theme), area);
+        }
     }
 }
 
@@ -731,6 +1207,47 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     if area.height == 0 {
         return;
     }
+    if matches!(app.view_mode, crate::app::ViewMode::Database) {
+        let bar = if let Some(msg) = app.status_message() {
+            ActionBar::new(vec![("·".into(), msg.to_string())])
+        } else if app.is_query_editor_active() {
+            let qe = app.query_editor().unwrap();
+            let layout_label = match qe.layout {
+                crate::app::QueryPaneLayout::EditorOnly => "split",
+                crate::app::QueryPaneLayout::Split => "results",
+                crate::app::QueryPaneLayout::ResultsOnly => "editor",
+            };
+            let row_hint = match &qe.result {
+                crate::app::QueryResultState::Ready { rows, elapsed_ms, .. } =>
+                    format!("{}  {}ms", rows.len(), elapsed_ms),
+                crate::app::QueryResultState::Running => "running…".into(),
+                _ => String::new(),
+            };
+            let mut chips = vec![
+                ("^R".into(), "run".into()),
+                ("Tab".into(), layout_label.into()),
+            ];
+            if !row_hint.is_empty() {
+                chips.push(("·".into(), row_hint));
+            }
+            chips.push(("Esc".into(), "close query".into()));
+            chips.push(("q".into(), "quit".into()));
+            ActionBar::new(chips)
+        } else {
+            ActionBar::new(vec![
+                ("l/Enter".into(), "expand/schema".into()),
+                ("h".into(), "collapse".into()),
+                ("e".into(), "query".into()),
+                ("d".into(), "drop".into()),
+                ("R".into(), "refresh".into()),
+                ("D/Esc".into(), "files".into()),
+                ("q".into(), "quit".into()),
+            ])
+        };
+        let bar = bar.with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+        frame.render_widget(&bar, area);
+        return;
+    }
     if let Some(editor) = app.editor() {
         // Editor-specific bar: nano-style hints. Flash overrides the
         // hints while a status (e.g. "wrote ...") is active.
@@ -779,34 +1296,55 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         frame.render_widget(&bar, area);
         return;
     }
+    if matches!(app.view_mode, crate::app::ViewMode::Tree) {
+        let actions = vec![
+            ("Space".into(), "fullscreen".into()),
+            ("i".into(), "info".into()),
+            ("/".into(), "filter".into()),
+            (":".into(), "cmd".into()),
+            ("T".into(), "miller".into()),
+            ("D".into(), "db".into()),
+            ("s/S".into(), "sort col".into()),
+            ("R".into(), "reverse".into()),
+            ("e".into(), "edit".into()),
+            (".".into(), "hidden".into()),
+            ("g…".into(), "jump".into()),
+            ("q".into(), "quit".into()),
+        ];
+        let bar = ActionBar::new(actions)
+            .with_colors(theme.div_line, theme.hi_fg, theme.main_fg, theme.selected_bg);
+        frame.render_widget(&bar, area);
+        return;
+    }
     let actions: Vec<(String, String)> = if app.jump_pending() {
         // While the chord is pending the action bar shifts to a hint
         // for which keys are valid second-presses. Mirrors what yazi
         // does to make the chord feel discoverable.
         vec![
             ("g…".into(), "jump:".into()),
+            ("g".into(), "top".into()),
+            ("G".into(), "bottom".into()),
             ("h".into(), "home".into()),
             ("/".into(), "/".into()),
             ("t".into(), "/tmp".into()),
             ("r".into(), "repo".into()),
-            ("g".into(), "top".into()),
             ("Esc".into(), "cancel".into()),
         ]
     } else {
         vec![
-            ("Tab".into(), "focus".into()),
-            ("Space".into(), "full".into()),
-            ("[/]".into(), "preview size".into()),
+            ("Space".into(), "fullscreen".into()),
+            ("i".into(), "info".into()),
             ("/".into(), "filter".into()),
-            ("g_".into(), "jump".into()),
-            ("h/l".into(), "parent/open".into()),
-            ("j/k".into(), move_label.into()),
-            ("f".into(), "find".into()),
-            ("e".into(), "edit".into()),
-            ("a".into(), "new".into()),
+            (":".into(), "cmd".into()),
+            ("T".into(), "tree".into()),
+            ("D".into(), "db".into()),
+            ("x".into(), "trash".into()),
             ("r".into(), "rename".into()),
-            ("d/D".into(), "trash/del".into()),
-            ("q/b".into(), "quit".into()),
+            ("a".into(), "new".into()),
+            ("e".into(), "edit".into()),
+            (".".into(), "hidden".into()),
+            ("g…".into(), "jump".into()),
+            ("q".into(), "quit".into()),
         ]
     };
     let bar = ActionBar::new(actions).with_colors(
@@ -895,110 +1433,102 @@ fn format_relative_mtime(t: Option<SystemTime>) -> String {
     }
 }
 
-/// Render the DB-table preview as a `LiveTable` of result rows. Used
-/// in tree mode when the cursor lands on a `NodeKind::Table` row.
+/// Schema preview for a DB table: column names and types, plus an
+/// optional catalog-stats row count. No row data is fetched.
 fn draw_db_preview(
     preview: &crate::app::DbPreview,
     frame: &mut Frame<'_>,
     theme: &Theme,
     area: Rect,
 ) {
-    use gtui::widgets::live_table::{
-        Cell, ColumnDef, LiveTable, TableEntry, TableRowExt, WidthSpec,
-    };
     use gtui::widgets::{panel, CornerStyle};
+
     let title = format!(
         "{}.{}.{}",
         preview.path.database.as_deref().unwrap_or("?"),
         preview.path.schema.as_deref().unwrap_or("?"),
         preview.path.table.as_deref().unwrap_or("?"),
     );
-    let p = panel(
-        theme.panel_accents[1],
-        theme.title,
-        CornerStyle::default(),
-    )
-    .with_title(title)
-    .with_controls(format!("{} rows", preview.rows.len()));
+    let controls = match preview.row_count {
+        Some(n) => format!("{} cols  ·  ~{} rows", preview.columns.len(), format_count(n)),
+        None => format!("{} cols", preview.columns.len()),
+    };
+    let p = panel(theme.panel_accents[1], theme.title, CornerStyle::default())
+        .with_title(title)
+        .with_controls(controls);
     frame.render_widget(&p, area);
     let inner = p.inner(area);
-    if inner.width < 6 || inner.height < 2 {
+    if inner.width < 8 || inner.height < 2 {
         return;
     }
 
-    // Build columns. Labels need 'static — leak each on the hot
-    // path. The alternative (Cow-typed labels in LiveTable) is a
-    // follow-up; matters once a session churns through hundreds of
-    // tables.
-    let columns: Vec<ColumnDef<usize>> = preview
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, c)| ColumnDef {
-            id: i,
-            label: leak_column_label(c.name.as_str()),
-            width: WidthSpec::Fixed(column_width(
-                c.name.len(),
-                preview
-                    .rows
-                    .iter()
-                    .map(|r| r.cells.get(i).map(|s| s.len()).unwrap_or(0))
-                    .max()
-                    .unwrap_or(0),
-            )),
-            align: align_for(c.data_type.as_str()),
-            sortable: false,
-        })
-        .collect();
+    // Two-column layout: name (flex) | type (right, capped at 24)
+    let type_w = (inner.width / 3).min(24).max(8);
+    let name_w = inner.width.saturating_sub(type_w + 1);
 
-    struct PreviewRowView<'a> {
-        row: &'a crate::sources::Row,
-    }
-    impl<'a> TableRowExt<usize> for PreviewRowView<'a> {
-        fn cell(&self, col: usize) -> Cell {
-            Cell::plain(self.row.cells.get(col).cloned().unwrap_or_default())
-        }
-    }
+    let cols = vec![
+        Column::new("column", name_w),
+        Column::new("type", type_w).right_aligned(true),
+    ];
+    let rows: Vec<Row<'static>> = preview.columns.iter().map(|c| {
+        Row::data(vec![
+            Cell::new(c.name.clone()),
+            Cell::new(c.data_type.clone()),
+        ])
+    }).collect();
 
-    let entries: Vec<TableEntry<PreviewRowView<'_>, ()>> = preview
-        .rows
-        .iter()
-        .map(|r| TableEntry::Item(PreviewRowView { row: r }))
-        .collect();
-
-    let body_h = inner.height.saturating_sub(1) as usize;
-    let scroll = gtui::middle_anchor_scroll(0, preview.rows.len(), body_h);
-    let table = LiveTable::new(&entries, &columns, theme, 0)
-        .with_selection(Some(0), scroll)
-        .with_fade(false);
+    let table = Table::new(&cols, &rows, theme);
     frame.render_widget(&table, inner);
 }
 
-fn align_for(data_type: &str) -> gtui::widgets::live_table::Align {
-    use gtui::widgets::live_table::Align;
-    let lower = data_type.to_ascii_lowercase();
-    if lower.contains("int")
-        || lower.contains("numeric")
-        || lower.contains("float")
-        || lower.contains("double")
-        || lower.contains("decimal")
-        || lower.contains("real")
-    {
-        Align::Right
+/// Decompose a Unix epoch second into (year, month, day, hour, min, sec).
+/// Proleptic Gregorian; good enough for display without pulling in chrono.
+/// Choose a column width that fits content without wasting space.
+/// Looks at header names and up to 50 rows, caps at 40, floors at 8.
+fn columns_natural_width(
+    columns: &[String],
+    rows: &[crate::sources::db::Row],
+    area_width: u16,
+) -> u16 {
+    let max_header = columns.iter().map(|c| c.len()).max().unwrap_or(8);
+    let max_cell = rows.iter().take(50).flat_map(|r| r.cells.iter().map(|c| c.len())).max().unwrap_or(0);
+    let natural = max_header.max(max_cell).max(8).min(40) as u16;
+    // If all columns would fit at natural width, use it; otherwise keep it so
+    // the user can scroll to see them at full fidelity.
+    natural.max(8).min(area_width.saturating_sub(2))
+}
+
+fn epoch_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    // Days since 1970-01-01 → Gregorian date (Fliegel–Van Flandern style).
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y as u32, mo as u32, d as u32, h as u32, m as u32, s as u32)
+}
+
+fn format_count(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
     } else {
-        Align::Left
+        n.to_string()
     }
 }
 
-fn column_width(header_len: usize, max_cell_len: usize) -> u16 {
-    // Fit content but cap at 32 cells so wide TEXT/UUID columns
-    // don't dominate. Caller can scroll horizontally in a follow-up.
-    header_len.max(max_cell_len).clamp(4, 32) as u16
-}
-
-fn leak_column_label(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
-}
 
 #[cfg(test)]
 mod tests {

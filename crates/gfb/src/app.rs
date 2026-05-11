@@ -350,6 +350,162 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Recursively walk `path`, counting files, subdirs, and total bytes.
+/// Returns `(files, dirs, total_bytes, error)`. Best-effort — read
+/// errors are accumulated and returned as a single joined message.
+fn dir_scan(path: &std::path::Path) -> (u64, u64, u64, Option<String>) {
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    let mut total_bytes = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(e) => { errors.push(format!("{}: {e}", dir.display())); continue; }
+        };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                dirs += 1;
+                stack.push(entry.path());
+            } else {
+                files += 1;
+                total_bytes += meta.len();
+            }
+        }
+    }
+    let error = if errors.is_empty() { None } else { Some(errors.join("; ")) };
+    (files, dirs, total_bytes, error)
+}
+
+/// Quote a SQL identifier for the query editor pre-fill SQL.
+fn quote_db_ident(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' { out.push('"'); }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Handle a keypress in the SQL editor buffer of the query editor.
+fn sql_edit_key(qe: &mut QueryEditorState, key: crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ensure sql buffer is never empty and cursor is in bounds.
+    if qe.sql.is_empty() { qe.sql.push(String::new()); }
+    let n_rows = qe.sql.len();
+    if qe.cursor.0 >= n_rows { qe.cursor.0 = n_rows - 1; }
+    if qe.cursor.1 > qe.sql[qe.cursor.0].chars().count() { qe.cursor.1 = qe.sql[qe.cursor.0].chars().count(); }
+    let (row, col) = qe.cursor;
+
+    match key.code {
+        KeyCode::Up => {
+            if row > 0 {
+                let new_row = row - 1;
+                let new_col = col.min(qe.sql[new_row].chars().count());
+                qe.cursor = (new_row, new_col);
+            }
+        }
+        KeyCode::Down => {
+            if row + 1 < n_rows {
+                let new_row = row + 1;
+                let new_col = col.min(qe.sql[new_row].chars().count());
+                qe.cursor = (new_row, new_col);
+            }
+        }
+        KeyCode::Left => {
+            if col > 0 {
+                qe.cursor = (row, col - 1);
+            } else if row > 0 {
+                let prev_len = qe.sql[row - 1].chars().count();
+                qe.cursor = (row - 1, prev_len);
+            }
+        }
+        KeyCode::Right => {
+            let line_len = qe.sql[row].chars().count();
+            if col < line_len {
+                qe.cursor = (row, col + 1);
+            } else if row + 1 < n_rows {
+                qe.cursor = (row + 1, 0);
+            }
+        }
+        KeyCode::Home | KeyCode::Char('a') if ctrl => {
+            qe.cursor = (row, 0);
+        }
+        KeyCode::End | KeyCode::Char('e') if ctrl => {
+            let line_len = qe.sql[row].chars().count();
+            qe.cursor = (row, line_len);
+        }
+        KeyCode::Char('k') if ctrl => {
+            // Kill to end of line.
+            let line = &mut qe.sql[row];
+            let byte_pos: usize = line.char_indices().nth(col).map(|(b, _)| b).unwrap_or(line.len());
+            line.truncate(byte_pos);
+        }
+        KeyCode::Enter => {
+            let line = &qe.sql[row];
+            let (before, after) = split_at_char(line, col);
+            qe.sql[row] = before;
+            qe.sql.insert(row + 1, after);
+            qe.cursor = (row + 1, 0);
+        }
+        KeyCode::Backspace => {
+            if col > 0 {
+                let line = &mut qe.sql[row];
+                let new_col = col - 1;
+                remove_char(line, new_col);
+                qe.cursor = (row, new_col);
+            } else if row > 0 {
+                let current = qe.sql.remove(row);
+                let prev_len = qe.sql[row - 1].chars().count();
+                qe.sql[row - 1].push_str(&current);
+                qe.cursor = (row - 1, prev_len);
+            }
+        }
+        KeyCode::Delete => {
+            let line_len = qe.sql[row].chars().count();
+            if col < line_len {
+                remove_char(&mut qe.sql[row], col);
+            } else if row + 1 < qe.sql.len() {
+                let next = qe.sql.remove(row + 1);
+                qe.sql[row].push_str(&next);
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            insert_char(&mut qe.sql[row], col, c);
+            qe.cursor = (row, col + 1);
+        }
+        _ => {}
+    }
+    // Keep cursor visible — clamp both top and bottom.
+    let vh = qe.editor_viewport_h.max(1);
+    if qe.cursor.0 < qe.scroll_row {
+        qe.scroll_row = qe.cursor.0;
+    } else if qe.cursor.0 >= qe.scroll_row + vh {
+        qe.scroll_row = qe.cursor.0 + 1 - vh;
+    }
+}
+
+fn split_at_char(s: &str, char_idx: usize) -> (String, String) {
+    let byte = s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len());
+    (s[..byte].to_string(), s[byte..].to_string())
+}
+
+fn remove_char(s: &mut String, char_idx: usize) {
+    if let Some((byte, ch)) = s.char_indices().nth(char_idx) {
+        s.drain(byte..byte + ch.len_utf8());
+    }
+}
+
+fn insert_char(s: &mut String, char_idx: usize, c: char) {
+    let byte = s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len());
+    s.insert(byte, c);
+}
+
 /// Push a SetTitle escape to the terminal so window managers / tab
 /// strips show "gfb: <basename>". Best-effort — terminals that
 /// don't honor the OSC sequence simply ignore it.
@@ -509,6 +665,8 @@ pub struct App {
     /// As each modal is migrated, it'll push a real `Scope` here so
     /// the cascade collapses into a single dispatch site.
     scopes: gtui::ScopeStack<Action>,
+    /// Command palette state. `Some` while the `:` modal is open.
+    command_palette: Option<CommandPaletteState>,
 
     /// Active view mode. Default [`ViewMode::Miller`] preserves the
     /// existing yazi-style three-pane layout exactly. Press `T` to
@@ -527,6 +685,10 @@ pub struct App {
     /// disrupt either.
     pub(crate) tree_sort: crate::tree::FbCol,
     pub(crate) tree_sort_descending: bool,
+    /// Cursor + expansion state for the dedicated database browser
+    /// (`ViewMode::Database`). Independent of `tree_state` so the two
+    /// modes keep separate cursors and expansion sets.
+    pub(crate) db_state: gtui::tree::TreeState<crate::sources::AnyNodeId>,
     /// Database endpoints attached at startup via `--connect`.
     /// Empty vec means filesystem-only browsing — tree mode behaves
     /// exactly as it did pre-Phase-5.
@@ -548,26 +710,125 @@ pub struct App {
     /// after each event tick (see `drain_db_loads`).
     pub(crate) db_load_tx: std::sync::mpsc::Sender<crate::sources::LoadResult>,
     pub(crate) db_load_rx: std::sync::mpsc::Receiver<crate::sources::LoadResult>,
+    /// SQL query editor state. `Some` while the editor is open.
+    pub(crate) query_editor: Option<QueryEditorState>,
+    /// Reply channel for async query execution results.
+    pub(crate) query_result_tx: std::sync::mpsc::SyncSender<crate::sources::worker::QueryExecResult>,
+    pub(crate) query_result_rx: std::sync::mpsc::Receiver<crate::sources::worker::QueryExecResult>,
+    /// Info panel for the selected entry. `Some` while `i` is active.
+    pub(crate) info_panel: Option<InfoPanel>,
+    /// Reply channel for async directory-size scans.
+    pub(crate) dir_info_tx: mpsc::Sender<DirInfoResult>,
+    pub(crate) dir_info_rx: mpsc::Receiver<DirInfoResult>,
 }
 
-/// Loaded preview rows for one DB table.
+/// Schema-only preview for one DB table — no row data fetched.
 #[derive(Debug, Clone)]
 pub(crate) struct DbPreview {
     pub path: crate::sources::NodePath,
     pub columns: Vec<crate::sources::ColumnSpec>,
-    pub rows: Vec<crate::sources::Row>,
+    /// Fast catalog-stats estimate; `None` when not cheaply available.
+    pub row_count: Option<u64>,
 }
 
-/// Top-level view mode. Switched with `T`.
+/// Content of a directory info scan — loaded asynchronously.
+#[derive(Debug, Clone)]
+pub enum DirContent {
+    Calculating,
+    Ready { files: u64, dirs: u64, total_bytes: u64 },
+    Error(String),
+}
+
+/// Info panel state for the currently-selected entry.
+#[derive(Debug, Clone)]
+pub struct InfoPanel {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub kind: crate::fs::entry::EntryKind,
+    pub size: u64,
+    pub mtime: Option<std::time::SystemTime>,
+    /// `None` for plain files; `Some` for directories (async scan).
+    pub dir_content: Option<DirContent>,
+}
+
+/// Token returned from an async dir-info scan.
+#[derive(Debug)]
+pub(crate) struct DirInfoResult {
+    pub path: std::path::PathBuf,
+    pub files: u64,
+    pub dirs: u64,
+    pub total_bytes: u64,
+    pub error: Option<String>,
+}
+
+/// Layout of the query pane (right side of DB mode).
+/// Cycled by Tab: EditorOnly → Split → ResultsOnly → EditorOnly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPaneLayout {
+    /// Full right pane = SQL editor only.
+    EditorOnly,
+    /// Right pane split: editor top (~35%), results bottom (~65%).
+    Split,
+    /// Full right pane = results only.
+    ResultsOnly,
+}
+
+/// Result state for the query editor pane.
+#[derive(Debug, Clone)]
+pub enum QueryResultState {
+    None,
+    Running,
+    Ready {
+        columns: Vec<String>,
+        rows: Vec<crate::sources::db::Row>,
+        elapsed_ms: u64,
+    },
+    Error(String),
+}
+
+/// State for the full-screen SQL query editor.
+#[derive(Debug, Clone)]
+pub struct QueryEditorState {
+    /// Which `ConnectionWorker` to run queries against.
+    pub conn_root: usize,
+    /// SQL buffer lines.
+    pub sql: Vec<String>,
+    /// Cursor position (row, col in chars).
+    pub cursor: (usize, usize),
+    pub scroll_row: usize,
+    /// Current right-pane layout. Tab cycles through variants.
+    pub layout: QueryPaneLayout,
+    pub result: QueryResultState,
+    pub result_scroll: usize,
+    /// Monotonic counter — stale results (from a previous run) are
+    /// discarded when their gen doesn't match.
+    pub query_gen: u64,
+    /// Viewport height of the SQL editor pane from the last draw.
+    /// Used to keep the cursor visible during editing.
+    pub editor_viewport_h: usize,
+    /// Horizontal column offset for the results table.
+    pub col_scroll: usize,
+}
+
+/// Top-level view mode. Switched with `T` (cycles Miller ↔ Tree).
+/// `Table` is auto-activated when the selection is 2-D data (DB table, CSV).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    /// The original yazi-flavored layout: parent / current / preview
-    /// miller columns plus the optional full-screen preview modal.
+    /// Three-pane miller layout: parent / current-list / preview.
     Miller,
-    /// Single tree pane on the left, dominant preview on the right.
-    /// Tree expands inline; no full-screen preview because the side
-    /// preview is already most of the screen.
+    /// Three-pane layout with a tree in the center column instead of a
+    /// flat list. Left parent column stays visible as the navigation
+    /// anchor. `T` toggles between Miller and Tree.
     Tree,
+    /// Two/three-pane layout where the center (and optionally right)
+    /// pane shows a full table widget. Auto-activates on DB tables,
+    /// CSV files, and other 2-D data; `T` exits back to Miller.
+    #[allow(dead_code)]
+    Table,
+    /// Full-screen database browser. Shows only the connected DB
+    /// endpoints — no filesystem entries. Toggle with `D`; Esc or
+    /// `D` again returns to the previous file-browser mode.
+    Database,
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +845,31 @@ pub enum InputModal {
     /// Confirm permanent deletion of `target` — `y` deletes, anything
     /// else cancels.
     ConfirmHardDelete { target: PathBuf },
+    /// Confirm dropping a DB table or schema.
+    ConfirmDropDbObject {
+        root: usize,
+        path: crate::sources::NodePath,
+        cascade: bool,
+    },
+}
+
+/// State for the command palette modal (opened with `:`).
+#[derive(Debug, Clone)]
+pub struct CommandPaletteState {
+    pub input: String,
+    pub selected: usize,
+}
+
+impl Default for CommandPaletteState {
+    fn default() -> Self {
+        Self { input: String::new(), selected: 0 }
+    }
+}
+
+/// A single command shown in the palette suggestion list.
+pub struct PaletteEntry {
+    pub cmd: &'static str,
+    pub description: &'static str,
 }
 
 /// Which rasterization path the renderer should use for image bodies.
@@ -711,10 +997,12 @@ impl App {
             status_message: None,
             status_message_ticks: 0,
             scopes: gtui::ScopeStack::new(Box::new(BaseScope)),
+            command_palette: None,
             view_mode: ViewMode::Miller,
             tree_state: gtui::tree::TreeState::default(),
             tree_sort: crate::tree::FbCol::Name,
             tree_sort_descending: false,
+            db_state: gtui::tree::TreeState::default(),
             connections,
             db_preview: None,
             db_cache: crate::sources::multi::new_db_cache(),
@@ -729,13 +1017,31 @@ impl App {
                 let (_, rx) = std::sync::mpsc::channel();
                 rx
             },
+            query_editor: None,
+            query_result_tx: {
+                let (tx, _) = std::sync::mpsc::sync_channel(1);
+                tx
+            },
+            query_result_rx: {
+                let (_, rx) = std::sync::mpsc::sync_channel(1);
+                rx
+            },
+            info_panel: None,
+            dir_info_tx: { let (tx, _) = mpsc::channel(); tx },
+            dir_info_rx: { let (_, rx) = mpsc::channel(); rx },
         };
-        // Real channel pair (the placeholder above gets dropped
+        // Real channel pairs (the placeholders above get dropped
         // immediately). Keeping the struct-init shape simple — the
-        // overhead of dropping an unused channel is one allocation.
+        // overhead of dropping unused channels is a couple allocations.
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         app.db_load_tx = load_tx;
         app.db_load_rx = load_rx;
+        let (query_tx, query_rx) = std::sync::mpsc::sync_channel(1);
+        app.query_result_tx = query_tx;
+        app.query_result_rx = query_rx;
+        let (dir_info_tx, dir_info_rx) = mpsc::channel();
+        app.dir_info_tx = dir_info_tx;
+        app.dir_info_rx = dir_info_rx;
         // Auto-expand each DB endpoint so the user immediately sees
         // its database list rather than a collapsed connection row.
         for i in 0..app.connections.len() {
@@ -814,6 +1120,227 @@ impl App {
         self.db_preview.as_ref()
     }
 
+    // ── Query editor ──────────────────────────────────────────────────────
+
+    pub fn is_query_editor_active(&self) -> bool {
+        self.query_editor.is_some()
+    }
+
+    pub fn query_editor(&self) -> Option<&QueryEditorState> {
+        self.query_editor.as_ref()
+    }
+
+    /// Open the SQL query editor, pre-filling SQL based on the currently
+    /// selected DB node (table → SELECT *, otherwise empty).
+    pub(crate) fn open_query_editor(&mut self) {
+        let rows = self.db_rows();
+        let cursor = self.db_state.nav.cursor;
+        let (conn_root, pre_sql) = if let Some(row) = rows.get(cursor) {
+            if let crate::sources::AnyNodeId::Db { root, path } = &row.id {
+                let sql = match path.level() {
+                    crate::sources::NodeKind::Table => {
+                        let db = path.database.as_deref().unwrap_or("");
+                        let sch = path.schema.as_deref().unwrap_or("");
+                        let tbl = path.table.as_deref().unwrap_or("");
+                        format!(
+                            "SELECT *\nFROM {}.{}.{}\nLIMIT 100",
+                            quote_db_ident(db),
+                            quote_db_ident(sch),
+                            quote_db_ident(tbl),
+                        )
+                    }
+                    crate::sources::NodeKind::Schema => {
+                        let sch = path.schema.as_deref().unwrap_or("");
+                        format!("-- schema: {sch}\n")
+                    }
+                    _ => String::new(),
+                };
+                (*root, sql)
+            } else {
+                (0, String::new())
+            }
+        } else {
+            (0, String::new())
+        };
+        let sql_lines: Vec<String> = if pre_sql.is_empty() {
+            vec![String::new()]
+        } else {
+            pre_sql.lines().map(|l| l.to_string()).collect()
+        };
+        self.query_editor = Some(QueryEditorState {
+            conn_root,
+            cursor: (0, 0),
+            scroll_row: 0,
+            layout: QueryPaneLayout::EditorOnly,
+            result: QueryResultState::None,
+            result_scroll: 0,
+            query_gen: 0,
+            sql: sql_lines,
+            editor_viewport_h: 10,
+            col_scroll: 0,
+        });
+    }
+
+    pub(crate) fn close_query_editor(&mut self) {
+        self.query_editor = None;
+    }
+
+    /// Fire an async query against the current connection. The result
+    /// arrives on `query_result_rx` and is drained each tick.
+    pub(crate) fn run_query(&mut self) {
+        let Some(qe) = self.query_editor.as_mut() else {
+            let _ = std::fs::write("/tmp/gfb-debug.log", "run_query: no query editor\n");
+            return;
+        };
+        let sql = qe.sql.join("\n");
+        qe.query_gen += 1;
+        let gen = qe.query_gen;
+        qe.result = QueryResultState::Running;
+        qe.result_scroll = 0;
+        qe.col_scroll = 0;
+        let conn_root = qe.conn_root;
+        let _ = std::fs::write(
+            "/tmp/gfb-debug.log",
+            format!("run_query: conn={conn_root} gen={gen} sql={sql:?}\n"),
+        );
+        if let Some(conn) = self.connections.get(conn_root) {
+            conn.exec_query_async(sql, gen, self.query_result_tx.clone());
+        } else {
+            let _ = std::fs::write("/tmp/gfb-debug.log", format!("run_query: no connection at index {conn_root}\n"));
+        }
+    }
+
+    /// Drain any query results that arrived since the last tick.
+    pub(crate) fn drain_query_results(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(res) = self.query_result_rx.try_recv() {
+            if let Some(qe) = self.query_editor.as_mut() {
+                if res.gen == qe.query_gen {
+                    qe.result = match res.error {
+                        Some(msg) => {
+                            let _ = std::fs::write("/tmp/gfb-query-error.log", &msg);
+                            QueryResultState::Error(msg)
+                        }
+                        None => QueryResultState::Ready {
+                            columns: res.columns,
+                            rows: res.rows,
+                            elapsed_ms: res.elapsed_ms,
+                        },
+                    };
+                    // Auto-switch to Split so results are visible.
+                    if matches!(qe.layout, QueryPaneLayout::EditorOnly) {
+                        qe.layout = QueryPaneLayout::Split;
+                    }
+                    dirty = true;
+                }
+            }
+        }
+        dirty
+    }
+
+    // ── Info panel ────────────────────────────────────────────────────────
+
+    pub fn info_panel(&self) -> Option<&InfoPanel> {
+        self.info_panel.as_ref()
+    }
+
+    pub fn is_info_panel_active(&self) -> bool {
+        self.info_panel.is_some()
+    }
+
+    /// Open the info panel for the currently selected entry. For
+    /// directories, fires an async recursive scan for file count + size.
+    pub(crate) fn open_info_panel(&mut self) {
+        let Some(entry) = self.selected().cloned() else { return };
+        let is_dir = entry.is_dir();
+        let panel = InfoPanel {
+            name: entry.name.clone(),
+            path: entry.path.clone(),
+            kind: entry.kind,
+            size: entry.size,
+            mtime: entry.mtime,
+            dir_content: if is_dir { Some(DirContent::Calculating) } else { None },
+        };
+        self.info_panel = Some(panel);
+        if is_dir {
+            let tx = self.dir_info_tx.clone();
+            let scan_path = entry.path.clone();
+            self.rt.spawn_blocking(move || {
+                let (files, dirs, total_bytes, error) = dir_scan(&scan_path);
+                let _ = tx.send(DirInfoResult { path: scan_path, files, dirs, total_bytes, error });
+            });
+        }
+    }
+
+    pub(crate) fn close_info_panel(&mut self) {
+        self.info_panel = None;
+    }
+
+    /// Drain any dir-info scan results that landed since the last tick.
+    pub(crate) fn drain_dir_info(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(res) = self.dir_info_rx.try_recv() {
+            if let Some(panel) = self.info_panel.as_mut() {
+                if panel.path == res.path {
+                    panel.dir_content = Some(match res.error {
+                        Some(e) => DirContent::Error(e),
+                        None => DirContent::Ready {
+                            files: res.files,
+                            dirs: res.dirs,
+                            total_bytes: res.total_bytes,
+                        },
+                    });
+                    dirty = true;
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Handle a keypress while the query editor is active.
+    pub(crate) fn handle_query_editor_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Global shortcuts work in all layout modes.
+        match key.code {
+            KeyCode::Esc => { self.close_query_editor(); return; }
+            KeyCode::Tab => {
+                if let Some(qe) = self.query_editor.as_mut() {
+                    qe.layout = match qe.layout {
+                        QueryPaneLayout::EditorOnly => QueryPaneLayout::Split,
+                        QueryPaneLayout::Split => QueryPaneLayout::ResultsOnly,
+                        QueryPaneLayout::ResultsOnly => QueryPaneLayout::EditorOnly,
+                    };
+                }
+                return;
+            }
+            KeyCode::Enter if ctrl => { self.run_query(); return; }
+            KeyCode::Char('r') if ctrl => { self.run_query(); return; }
+            _ => {}
+        }
+        let Some(qe) = self.query_editor.as_mut() else { return };
+        match qe.layout {
+            QueryPaneLayout::ResultsOnly => {
+                let max_cols = match &qe.result {
+                    QueryResultState::Ready { columns, .. } => columns.len().saturating_sub(1),
+                    _ => 0,
+                };
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down  => qe.result_scroll = qe.result_scroll.saturating_add(1),
+                    KeyCode::Char('k') | KeyCode::Up    => qe.result_scroll = qe.result_scroll.saturating_sub(1),
+                    KeyCode::PageDown                   => qe.result_scroll = qe.result_scroll.saturating_add(20),
+                    KeyCode::PageUp                     => qe.result_scroll = qe.result_scroll.saturating_sub(20),
+                    KeyCode::Right                      => qe.col_scroll = (qe.col_scroll + 1).min(max_cols),
+                    KeyCode::Left                       => qe.col_scroll = qe.col_scroll.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            QueryPaneLayout::EditorOnly | QueryPaneLayout::Split => {
+                sql_edit_key(qe, key);
+            }
+        }
+    }
+
     pub fn db_cache(&self) -> &crate::sources::multi::DbCache {
         &self.db_cache
     }
@@ -877,6 +1404,58 @@ impl App {
 
     pub fn is_finder_active(&self) -> bool {
         self.finder.is_some()
+    }
+
+    pub fn db_state(&self) -> &gtui::tree::TreeState<crate::sources::AnyNodeId> {
+        &self.db_state
+    }
+
+    /// Flatten the full tree and filter to DB-only rows. Used by both
+    /// the DB-mode key handler and the DB-mode renderer.
+    pub(crate) fn db_rows(&self) -> Vec<crate::tree::TreeRow> {
+        crate::tree::flatten_tree(
+            &self.cwd,
+            &self.db_state.expanded,
+            self.tree_sort,
+            self.tree_sort_descending,
+            self.show_hidden,
+            self.filter.as_deref(),
+            &self.connections,
+            &self.db_cache,
+            &self.fs_cache,
+            Some(&self.db_load_tx),
+        )
+        .into_iter()
+        .filter(|r| matches!(r.row, crate::sources::AnyRow::Db(_)))
+        .collect()
+    }
+
+    pub fn is_command_palette_active(&self) -> bool {
+        self.command_palette.is_some()
+    }
+
+    pub fn command_palette_state(&self) -> Option<&CommandPaletteState> {
+        self.command_palette.as_ref()
+    }
+
+    pub fn palette_suggestions(&self) -> Vec<PaletteEntry> {
+        let all = [
+            PaletteEntry { cmd: "sort name", description: "sort by name" },
+            PaletteEntry { cmd: "sort size", description: "sort by file size" },
+            PaletteEntry { cmd: "sort modified", description: "sort by date modified" },
+            PaletteEntry { cmd: "filter", description: "filter entries  e.g. filter *.rs" },
+            PaletteEntry { cmd: "hidden", description: "toggle hidden files" },
+            PaletteEntry { cmd: "refresh", description: "re-scan current directory" },
+        ];
+        let input = self.command_palette.as_ref()
+            .map(|s| s.input.as_str())
+            .unwrap_or("");
+        if input.is_empty() {
+            return all.into_iter().collect();
+        }
+        all.into_iter()
+            .filter(|e| e.cmd.starts_with(input))
+            .collect()
     }
 
     pub fn editor(&self) -> Option<&crate::editor::EditorState> {
@@ -1195,8 +1774,9 @@ impl App {
     /// Called from action handlers and the mode-toggle path.
     pub(crate) fn request_preview_for_active_mode(&mut self) {
         match self.view_mode {
-            ViewMode::Miller => self.request_preview(),
+            ViewMode::Miller | ViewMode::Table => self.request_preview(),
             ViewMode::Tree => self.request_tree_preview(),
+            ViewMode::Database => self.request_db_mode_preview(),
         }
     }
 
@@ -1237,19 +1817,8 @@ impl App {
                 return;
             }
         };
-        let rows = match conn.preview_rows(db, sch, tbl, 100) {
-            Ok(r) => r,
-            Err(e) => {
-                self.db_preview = None;
-                self.flash_status(format!("preview_rows({tbl}) failed: {e}"));
-                return;
-            }
-        };
-        self.db_preview = Some(DbPreview {
-            path,
-            columns,
-            rows,
-        });
+        let row_count = conn.approximate_row_count(db, sch, tbl);
+        self.db_preview = Some(DbPreview { path, columns, row_count });
     }
 
     fn request_tree_preview(&mut self) {
@@ -1260,7 +1829,7 @@ impl App {
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
-            &self.connections,
+            &[],
             &self.db_cache,
             &self.fs_cache,
             Some(&self.db_load_tx),
@@ -1310,6 +1879,94 @@ impl App {
         });
     }
 
+    fn request_db_mode_preview(&mut self) {
+        let rows = self.db_rows();
+        let Some(row) = rows.get(self.db_state.nav.cursor).cloned() else {
+            self.preview_state = PreviewState::None;
+            self.preview_scroll = 0;
+            self.db_preview = None;
+            return;
+        };
+        self.preview_state = PreviewState::None;
+        self.preview_scroll = 0;
+        self.request_db_preview(row.id.clone());
+    }
+
+    fn handle_db_mode(&mut self, action: Action) -> bool {
+        let rows = self.db_rows();
+        let total = rows.len();
+        let prior = self.db_state.nav.cursor;
+        match action {
+            Action::Quit => return true,
+            Action::Cancel => {
+                self.db_preview = None;
+                self.view_mode = ViewMode::Miller;
+                self.request_preview();
+                return false;
+            }
+            Action::MoveUp => self.db_state.nav.move_by(-1, total),
+            Action::MoveDown => self.db_state.nav.move_by(1, total),
+            Action::PageUp => self.db_state.nav.move_by(-10, total),
+            Action::PageDown => self.db_state.nav.move_by(10, total),
+            Action::Top => self.db_state.nav.home(),
+            Action::Bottom => self.db_state.nav.end(total),
+            Action::EnterDir => {
+                let cursor = self.db_state.nav.cursor;
+                let outcome = self.db_state.toggle_at(&rows, cursor);
+                match outcome {
+                    gtui::tree::ToggleOutcome::Expanded(_) => {
+                        // Expandable node (endpoint/db/schema): expand and
+                        // step into it. No schema to load.
+                        self.db_state.nav.move_by(1, total + 1);
+                    }
+                    gtui::tree::ToggleOutcome::NotExpandable => {
+                        // Leaf node (table): load schema on demand.
+                        self.request_db_mode_preview();
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            Action::ParentDir => {
+                self.db_state.collapse_or_parent(&rows);
+            }
+            Action::Refresh => {
+                self.db_cache = crate::sources::multi::new_db_cache();
+                self.db_preview = None;
+            }
+            Action::Trash => {
+                // `d` in DB mode opens a drop confirmation for tables and schemas.
+                let cursor = self.db_state.nav.cursor;
+                if let Some(row) = rows.get(cursor) {
+                    if let crate::sources::AnyNodeId::Db { root, path } = &row.id {
+                        use crate::sources::NodeKind;
+                        match path.level() {
+                            NodeKind::Table | NodeKind::Schema => {
+                                self.input_modal = Some(InputModal::ConfirmDropDbObject {
+                                    root: *root,
+                                    path: path.clone(),
+                                    cascade: false,
+                                });
+                            }
+                            _ => self.flash_status("drop: only tables and schemas can be dropped"),
+                        }
+                    }
+                }
+            }
+            Action::StartEditor => {
+                self.open_query_editor();
+                return false;
+            }
+            _ => {}
+        }
+        // Clear stale preview when cursor moves — schema is loaded
+        // explicitly via Enter/l, not automatically.
+        if self.db_state.nav.cursor != prior {
+            self.db_preview = None;
+        }
+        false
+    }
+
     /// Tree-mode action dispatch — minimal v1 covering navigation,
     /// expand/collapse, sort cycling, and the modals that work
     /// without per-mode special-casing (filter, find, editor open).
@@ -1331,7 +1988,7 @@ impl App {
             self.tree_sort_descending,
             self.show_hidden,
             self.filter.as_deref(),
-            &self.connections,
+            &[],
             &self.db_cache,
             &self.fs_cache,
             Some(&self.db_load_tx),
@@ -1460,7 +2117,11 @@ impl App {
                     Some("file ops: switch to Miller mode (T) for now".to_string());
                 self.status_message_ticks = 24;
             }
-            Action::Noop => {}
+            Action::ShowInfo => {
+                self.open_info_panel();
+                return false;
+            }
+            Action::Noop | Action::StartCommandPalette | Action::ToggleDatabaseMode => {}
         }
         if self.tree_state.nav.cursor != prior_cursor {
             self.request_tree_preview();
@@ -1552,11 +2213,28 @@ impl App {
             self.view_mode = match self.view_mode {
                 ViewMode::Miller => ViewMode::Tree,
                 ViewMode::Tree => ViewMode::Miller,
+                ViewMode::Table | ViewMode::Database => ViewMode::Miller,
             };
-            // Refresh preview against whichever mode's cursor is now
-            // active so the right-hand pane updates immediately.
             self.request_preview_for_active_mode();
             return false;
+        }
+        if matches!(action, Action::StartCommandPalette) {
+            self.command_palette = Some(CommandPaletteState::default());
+            return false;
+        }
+        if matches!(action, Action::ToggleDatabaseMode) {
+            self.view_mode = match self.view_mode {
+                ViewMode::Database => {
+                    self.db_preview = None;
+                    ViewMode::Miller
+                }
+                _ => ViewMode::Database,
+            };
+            self.request_preview_for_active_mode();
+            return false;
+        }
+        if matches!(self.view_mode, ViewMode::Database) {
+            return self.handle_db_mode(action);
         }
         if matches!(self.view_mode, ViewMode::Tree) {
             return self.handle_tree(action);
@@ -1757,10 +2435,16 @@ impl App {
             // Tree-mode-specific actions are dispatched in
             // `handle_tree`; reaching them here means we're in
             // miller mode and they should be no-ops.
+            Action::ShowInfo => {
+                self.open_info_panel();
+                return false;
+            }
             Action::ToggleViewMode
             | Action::TreeCycleSortNext
             | Action::TreeCycleSortPrev
-            | Action::TreeReverseSort => {}
+            | Action::TreeReverseSort
+            | Action::StartCommandPalette
+            | Action::ToggleDatabaseMode => {}
             Action::Noop => {}
         }
         // Any movement / refresh / cd may have changed the selected
@@ -1977,6 +2661,86 @@ impl App {
 
     /// Process a key while an input/confirm modal is open. Returns
     /// false (never quits) — the run loop only quits via Action::Quit.
+    fn handle_command_palette_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.command_palette = None;
+            }
+            KeyCode::Enter => {
+                let suggestions = self.palette_suggestions();
+                let cmd = {
+                    let state = match self.command_palette.as_ref() {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    if !suggestions.is_empty() {
+                        let sel = state.selected.min(suggestions.len() - 1);
+                        suggestions[sel].cmd.to_string()
+                    } else if !state.input.is_empty() {
+                        state.input.clone()
+                    } else {
+                        self.command_palette = None;
+                        return;
+                    }
+                };
+                self.command_palette = None;
+                self.execute_palette_command(&cmd);
+            }
+            KeyCode::Up => {
+                if let Some(s) = self.command_palette.as_mut() {
+                    s.selected = s.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let max = self.palette_suggestions().len().saturating_sub(1);
+                if let Some(s) = self.command_palette.as_mut() {
+                    s.selected = (s.selected + 1).min(max);
+                }
+            }
+            _ => {
+                let new_input = {
+                    let state = match self.command_palette.as_ref() {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    edit_buffer(state.input.clone(), key.modifiers, key.code)
+                };
+                if let Some(s) = self.command_palette.as_mut() {
+                    s.input = new_input;
+                    s.selected = 0;
+                }
+            }
+        }
+    }
+
+    fn execute_palette_command(&mut self, input: &str) {
+        let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
+        let cmd = parts.first().copied().unwrap_or("");
+        let arg = parts.get(1).copied().unwrap_or("").trim();
+        match cmd {
+            "sort" => {
+                self.sort = match arg {
+                    "size" => SortMode::Size,
+                    "modified" | "mtime" => SortMode::Mtime,
+                    _ => SortMode::Name,
+                };
+                let _ = self.refresh();
+            }
+            "filter" => {
+                self.filter = if arg.is_empty() { None } else { Some(arg.to_string()) };
+                self.apply_filter();
+            }
+            "hidden" => {
+                self.show_hidden = !self.show_hidden;
+                let _ = self.refresh();
+            }
+            "refresh" => {
+                let _ = self.refresh();
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_input_modal_key(&mut self, key: KeyEvent) {
         let Some(modal) = self.input_modal.take() else {
             return;
@@ -2023,6 +2787,52 @@ impl App {
                     self.input_modal = Some(InputModal::Touch { buffer: new_buf });
                 }
             },
+            InputModal::ConfirmDropDbObject { root, path, cascade } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.run_drop_db_object(root, &path, cascade);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn run_drop_db_object(&mut self, root: usize, path: &crate::sources::NodePath, cascade: bool) {
+        use crate::sources::NodeKind;
+        let Some(conn) = self.connections.get(root) else {
+            self.flash_status("drop: connection not found");
+            return;
+        };
+        let db = path.database.as_deref().unwrap_or_default();
+        let schema = path.schema.as_deref().unwrap_or_default();
+        let table = path.table.as_deref();
+        let label = match path.level() {
+            NodeKind::Table => format!("{}.{}", schema, table.unwrap_or("?")),
+            NodeKind::Schema => format!("{}", schema),
+            _ => return,
+        };
+        match conn.drop_object(db, schema, table, cascade) {
+            Ok(()) => {
+                self.db_cache = crate::sources::multi::new_db_cache();
+                self.db_preview = None;
+                self.flash_status(format!("dropped {label}"));
+            }
+            Err(e) => {
+                // Sanitize: Postgres error messages include DETAIL/HINT
+                // lines with embedded newlines that corrupt the action bar.
+                let raw = format!("{e:#}");
+                let first_line = raw.lines().next().unwrap_or(&raw).trim().to_string();
+                let is_dependency = raw.contains("depend") || raw.contains("constraint");
+                if is_dependency && !cascade {
+                    // Re-open confirmation with cascade flag set.
+                    self.input_modal = Some(InputModal::ConfirmDropDbObject {
+                        root,
+                        path: path.clone(),
+                        cascade: true,
+                    });
+                } else {
+                    self.flash_status(format!("drop failed: {first_line}"));
+                }
+            }
         }
     }
 
@@ -2195,6 +3005,8 @@ impl App {
             // unconditional `terminal.draw` below already happens
             // every tick so we don't need to gate on it.
             let _ = self.drain_db_loads();
+            let _ = self.drain_query_results();
+            let _ = self.drain_dir_info();
             if self.drain_fs_events() {
                 // The 120 ms event-poll tick acts as natural debounce
                 // — a burst of inotify events (cargo build can fire
@@ -2212,6 +3024,14 @@ impl App {
                 // height so PgUp/PgDn step by the modal's screen-full.
                 let pane_h = area.height.saturating_sub(1).saturating_sub(4) as usize;
                 self.list_viewport_h = pane_h;
+                // Update query editor viewport height so scroll clamping works.
+                if let Some(qe) = self.query_editor.as_mut() {
+                    let content_h = area.height.saturating_sub(2); // minus breadcrumb + action bar
+                    qe.editor_viewport_h = match qe.layout {
+                        QueryPaneLayout::Split => (content_h * 35 / 100) as usize,
+                        _ => content_h as usize,
+                    };
+                }
                 self.preview_viewport_h = if self.full_preview {
                     let modal_h = (area.height as u32 * 9 / 10) as u16;
                     (modal_h.saturating_sub(4) as usize).max(1)
@@ -2295,6 +3115,21 @@ impl App {
                             self.handle_finder_key(key);
                         } else if self.is_filter_input() {
                             self.handle_filter_key(key);
+                        } else if self.is_info_panel_active() {
+                            // Any key closes the info panel.
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.close_info_panel();
+                        } else if self.is_query_editor_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_query_editor_key(key);
                         } else if self.is_full_preview() {
                             // Modal preempts chord/history routing —
                             // jump out of the special interceptors so
@@ -2304,6 +3139,13 @@ impl App {
                                     return Ok(());
                                 }
                             }
+                        } else if self.is_command_palette_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_command_palette_key(key);
                         } else if self.jump_pending() {
                             self.handle_jump_key(key);
                         } else if is_jump_prefix(key) {
