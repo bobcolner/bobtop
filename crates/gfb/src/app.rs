@@ -350,6 +350,113 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Run `git diff HEAD -- <path>` and return colored lines for the preview pane.
+fn git_diff_lines(path: &Path, repo_root: &Path) -> Vec<ratatui::text::Line<'static>> {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    let out = std::process::Command::new("git")
+        .args(["diff", "HEAD", "--", path.to_string_lossy().as_ref()])
+        .current_dir(repo_root)
+        .output();
+
+    let text = match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => return vec![Line::from(format!("git diff failed: {e}"))],
+    };
+
+    if text.is_empty() {
+        // File is untracked or added — show the full content as additions.
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        return content.lines().map(|l| {
+            Line::from(Span::styled(
+                format!("+{l}"),
+                Style::default().fg(Color::Green),
+            ))
+        }).collect();
+    }
+
+    text.lines().map(|l| {
+        let style = if l.starts_with('+') && !l.starts_with("+++") {
+            Style::default().fg(Color::Green)
+        } else if l.starts_with('-') && !l.starts_with("---") {
+            Style::default().fg(Color::Red)
+        } else if l.starts_with("@@") {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+        } else if l.starts_with("diff ") || l.starts_with("index ") {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        Line::from(Span::styled(l.to_string(), style))
+    }).collect()
+}
+
+/// Run `git status --porcelain` and `git rev-parse` in a background thread,
+/// returning a `GitScanResult` with per-file status and branch info.
+fn run_git_scan(cwd: &Path) -> GitScanResult {
+    use std::collections::HashMap;
+    // Find repo root.
+    let root = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(cwd)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                Some(PathBuf::from(s))
+            }
+            _ => return GitScanResult { repo_root: None, branch: None, is_dirty: false, files: HashMap::new() },
+        }
+    };
+    let repo_root = root.unwrap();
+
+    // Branch name.
+    let branch = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_root)
+            .output();
+        out.ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    };
+
+    // File status via `git status --porcelain`.
+    let mut files: HashMap<PathBuf, GitFileStatus> = HashMap::new();
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-u"])
+        .current_dir(&repo_root)
+        .output();
+    if let Ok(o) = out {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            if line.len() < 4 { continue; }
+            let xy = line.get(..2).unwrap_or("  ");
+            let x = xy.chars().next().unwrap_or(' '); // staged
+            let y = xy.chars().nth(1).unwrap_or(' '); // unstaged
+            let path_str = line[3..].trim_matches('"');
+            // Handle renames: `old -> new` format
+            let path_str = path_str.split(" -> ").last().unwrap_or(path_str);
+            let abs = repo_root.join(path_str);
+            let status = match (x, y) {
+                ('R', _) | (_, 'R') => GitFileStatus::Renamed,
+                ('A', _)            => GitFileStatus::Added,
+                ('D', _) | (_, 'D') => GitFileStatus::Deleted,
+                ('M', ' ') | ('M', '\0') => GitFileStatus::Staged,
+                ('M', _) | (_, 'M') => GitFileStatus::Modified,
+                ('?', '?')           => GitFileStatus::Untracked,
+                _                    => GitFileStatus::Modified,
+            };
+            files.insert(abs, status);
+        }
+    }
+    let is_dirty = !files.is_empty();
+    GitScanResult { repo_root: Some(repo_root), branch, is_dirty, files }
+}
+
 /// Recursively walk `path`, counting files, subdirs, and total bytes.
 /// Returns `(files, dirs, total_bytes, error)`. Best-effort — read
 /// errors are accumulated and returned as a single joined message.
@@ -722,6 +829,52 @@ pub struct App {
     /// Reply channel for async directory-size scans.
     pub(crate) dir_info_tx: mpsc::Sender<DirInfoResult>,
     pub(crate) dir_info_rx: mpsc::Receiver<DirInfoResult>,
+    /// Git integration state — branch, dirty flag, per-file status.
+    pub(crate) git: GitState,
+    /// Reply channel for async git scans.
+    pub(crate) git_scan_tx: mpsc::Sender<GitScanResult>,
+    pub(crate) git_scan_rx: mpsc::Receiver<GitScanResult>,
+    /// Branch overlay (`B` key). `None` when closed.
+    pub(crate) branch_overlay: Option<BranchOverlay>,
+}
+
+/// Per-file git status (most-visible status wins when both staged and
+/// unstaged changes are present for the same file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFileStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Untracked,
+    Staged,
+}
+
+/// Git state for the current working directory — populated asynchronously
+/// by `request_git_scan()` and drained via `drain_git_scan()`.
+#[derive(Debug, Clone, Default)]
+pub struct GitState {
+    pub repo_root: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub is_dirty: bool,
+    pub files: std::collections::HashMap<PathBuf, GitFileStatus>,
+}
+
+/// Result returned from the async git scan worker.
+#[derive(Debug)]
+pub(crate) struct GitScanResult {
+    pub repo_root: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub is_dirty: bool,
+    pub files: std::collections::HashMap<PathBuf, GitFileStatus>,
+}
+
+/// State for the branch-list overlay (`B` key).
+#[derive(Debug, Clone)]
+pub struct BranchOverlay {
+    pub branches: Vec<String>,
+    pub current: Option<String>,
+    pub selected: usize,
 }
 
 /// Schema-only preview for one DB table — no row data fetched.
@@ -1185,6 +1338,10 @@ impl App {
             info_panel: None,
             dir_info_tx: { let (tx, _) = mpsc::channel(); tx },
             dir_info_rx: { let (_, rx) = mpsc::channel(); rx },
+            git: GitState::default(),
+            git_scan_tx: { let (tx, _) = mpsc::channel(); tx },
+            git_scan_rx: { let (_, rx) = mpsc::channel(); rx },
+            branch_overlay: None,
         };
         // Real channel pairs (the placeholders above get dropped
         // immediately). Keeping the struct-init shape simple — the
@@ -1198,6 +1355,9 @@ impl App {
         let (dir_info_tx, dir_info_rx) = mpsc::channel();
         app.dir_info_tx = dir_info_tx;
         app.dir_info_rx = dir_info_rx;
+        let (git_tx, git_rx) = mpsc::channel();
+        app.git_scan_tx = git_tx;
+        app.git_scan_rx = git_rx;
         // Auto-expand each DB endpoint so the user immediately sees
         // its database list rather than a collapsed connection row.
         for i in 0..app.connections.len() {
@@ -1208,6 +1368,7 @@ impl App {
         }
         app.start_watcher();
         app.refresh()?;
+        app.request_git_scan();
         app.request_preview();
         update_terminal_title(&app.cwd);
         Ok(app)
@@ -1446,6 +1607,117 @@ impl App {
             }
         }
         dirty
+    }
+
+    // ── Git integration ───────────────────────────────────────────────────
+
+    pub fn git_state(&self) -> &GitState {
+        &self.git
+    }
+
+    pub fn branch_overlay(&self) -> Option<&BranchOverlay> {
+        self.branch_overlay.as_ref()
+    }
+
+    pub fn is_branch_overlay_active(&self) -> bool {
+        self.branch_overlay.is_some()
+    }
+
+    /// Spawn an async git status scan for the current cwd.
+    pub(crate) fn request_git_scan(&mut self) {
+        let cwd = self.cwd.clone();
+        let tx = self.git_scan_tx.clone();
+        self.rt.spawn_blocking(move || {
+            let result = run_git_scan(&cwd);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Drain any completed git scan results.
+    pub(crate) fn drain_git_scan(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(res) = self.git_scan_rx.try_recv() {
+            self.git = GitState {
+                repo_root: res.repo_root,
+                branch: res.branch,
+                is_dirty: res.is_dirty,
+                files: res.files,
+            };
+            dirty = true;
+        }
+        dirty
+    }
+
+    /// Open the branch overlay by running `git branch`.
+    pub(crate) fn open_branch_overlay(&mut self) {
+        let Some(ref root) = self.git.repo_root.clone() else { return };
+        let output = std::process::Command::new("git")
+            .args(["branch"])
+            .current_dir(root)
+            .output();
+        let Ok(out) = output else { return };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut current: Option<String> = None;
+        let mut branches: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let is_current = line.starts_with('*');
+            let name = line.trim_start_matches(['*', ' ']).to_string();
+            if is_current { current = Some(name.clone()); }
+            branches.push(name);
+        }
+        // Put current branch first.
+        if let Some(ref cur) = current {
+            if let Some(pos) = branches.iter().position(|b| b == cur) {
+                branches.remove(pos);
+                branches.insert(0, cur.clone());
+            }
+        }
+        self.branch_overlay = Some(BranchOverlay { branches, current, selected: 0 });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn close_branch_overlay(&mut self) {
+        self.branch_overlay = None;
+    }
+
+    pub(crate) fn handle_branch_overlay_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        let Some(ov) = self.branch_overlay.as_mut() else { return };
+        let n = ov.branches.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down  => ov.selected = (ov.selected + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') | KeyCode::Up    => ov.selected = ov.selected.saturating_sub(1),
+            KeyCode::Esc                         => { self.branch_overlay = None; }
+            KeyCode::Enter => {
+                let branch = {
+                    let ov = self.branch_overlay.as_ref().unwrap();
+                    ov.branches.get(ov.selected).cloned()
+                };
+                self.branch_overlay = None;
+                if let Some(b) = branch {
+                    if let Some(ref root) = self.git.repo_root.clone() {
+                        let res = std::process::Command::new("git")
+                            .args(["checkout", &b])
+                            .current_dir(root)
+                            .output();
+                        match res {
+                            Ok(o) if o.status.success() => {
+                                self.flash_status(format!("switched to {b}"));
+                                let _ = self.refresh();
+                                self.request_git_scan();
+                                self.request_preview();
+                            }
+                            Ok(o) => {
+                                let msg = String::from_utf8_lossy(&o.stderr);
+                                self.flash_status(format!("checkout failed: {}", msg.lines().next().unwrap_or("?")));
+                            }
+                            Err(e) => self.flash_status(format!("git: {e}")),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Handle a keypress while the query editor is active.
@@ -1735,6 +2007,7 @@ impl App {
         self.all_entries = scan_dir(&self.cwd, self.show_hidden, self.sort)?;
         self.apply_filter();
         self.refresh_parent();
+        self.request_git_scan();
         Ok(())
     }
 
@@ -2426,6 +2699,10 @@ impl App {
                 self.open_info_panel();
                 return false;
             }
+            Action::ToggleBranchOverlay => {
+                self.open_branch_overlay();
+                return false;
+            }
             Action::Noop | Action::StartCommandPalette | Action::ToggleDatabaseMode => {}
         }
         if self.tree_state.nav.cursor != prior_cursor {
@@ -2460,14 +2737,33 @@ impl App {
         let gen = self.preview_gen;
         self.preview_state = PreviewState::Loading(path.clone());
         let tx = self.preview_tx.clone();
+
+        // If the file has a git status, show the diff instead of file content.
+        let is_git_changed = !entry.is_dir()
+            && self.git.files.contains_key(&path)
+            && self.git.repo_root.is_some();
+        if is_git_changed {
+            let repo_root = self.git.repo_root.clone().unwrap();
+            let task_path = path.clone();
+            self.rt.spawn_blocking(move || {
+                let lines = git_diff_lines(&task_path, &repo_root);
+                let outcome = Ok(crate::preview::Preview {
+                    kind: crate::preview::PreviewKind::Text,
+                    body: crate::preview::PreviewBody::Lines(lines),
+                    source_lines: 0,
+                    note: Some("git diff".to_string()),
+                });
+                let _ = tx.send(PreviewResult { generation: gen, path: task_path, outcome });
+            });
+            return;
+        }
+
         let limits = self.preview_limits;
         let sort = self.sort;
         let show_hidden = self.show_hidden;
         let task_path = path.clone();
         self.rt.spawn_blocking(move || {
             let outcome = preview::render_blocking(&task_path, limits, sort, show_hidden);
-            // If the receiver is gone, the App was dropped — that's
-            // fine, we just drop the result.
             let _ = tx.send(PreviewResult {
                 generation: gen,
                 path: task_path,
@@ -2742,6 +3038,10 @@ impl App {
             // miller mode and they should be no-ops.
             Action::ShowInfo => {
                 self.open_info_panel();
+                return false;
+            }
+            Action::ToggleBranchOverlay => {
+                self.open_branch_overlay();
                 return false;
             }
             Action::ToggleViewMode
@@ -3312,6 +3612,7 @@ impl App {
             let _ = self.drain_db_loads();
             let _ = self.drain_query_results();
             let _ = self.drain_dir_info();
+            let _ = self.drain_git_scan();
             if self.drain_fs_events() {
                 // The 120 ms event-poll tick acts as natural debounce
                 // — a burst of inotify events (cargo build can fire
@@ -3420,6 +3721,13 @@ impl App {
                             self.handle_finder_key(key);
                         } else if self.is_filter_input() {
                             self.handle_filter_key(key);
+                        } else if self.is_branch_overlay_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_branch_overlay_key(key);
                         } else if self.is_info_panel_active() {
                             // Any key closes the info panel.
                             if matches!(key.code, KeyCode::Char('c'))

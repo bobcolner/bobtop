@@ -103,6 +103,9 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
     if app.is_info_panel_active() {
         draw_info_panel(app, frame, theme, area);
     }
+    if app.is_branch_overlay_active() {
+        draw_branch_overlay(app, frame, theme, area);
+    }
 }
 
 
@@ -303,6 +306,20 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         if i + 1 < n {
             spans.push(Span::styled(" / ", sep_style));
         }
+    }
+
+    // Git branch badge: `  [main ✦]` — ✦ only when dirty.
+    let git = app.git_state();
+    if let Some(ref branch) = git.branch {
+        spans.push(Span::styled("  [", Style::default().fg(theme.div_line)));
+        spans.push(Span::styled(
+            branch.clone(),
+            Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+        ));
+        if git.is_dirty {
+            spans.push(Span::styled(" ✦", Style::default().fg(theme.panel_accents[2])));
+        }
+        spans.push(Span::styled("]", Style::default().fg(theme.div_line)));
     }
 
     let lines = vec![Line::from(spans)];
@@ -711,6 +728,47 @@ fn draw_info_panel(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     frame.render_widget(&widget, body);
 }
 
+fn draw_branch_overlay(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use ratatui::style::Modifier;
+    let Some(ov) = app.branch_overlay() else { return };
+
+    let modal_w = (area.width * 2 / 3).max(40).min(area.width.saturating_sub(4));
+    let modal_h = (ov.branches.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let bg = theme.main_bg.unwrap_or(Color::Black);
+
+    let panel = BoxedPanel::new(theme.panel_accents[1], theme.title)
+        .with_title("branches")
+        .with_controls("↑↓ select  ·  Enter checkout  ·  Esc close")
+        .flat();
+    let shell = ModalShell::new(panel, modal_w, modal_h)
+        .with_fill(Style::default().bg(bg).fg(theme.main_fg));
+    let Some(body) = shell.render(frame, area) else { return };
+
+    let sel_style = Style::default().bg(theme.selected_bg).fg(theme.hi_fg);
+    let dim_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+    let cur_style = Style::default().fg(theme.panel_accents[1]);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, branch) in ov.branches.iter().enumerate() {
+        let is_selected = i == ov.selected;
+        let is_current = ov.current.as_deref() == Some(branch.as_str());
+        let prefix = if is_selected { "▸ " } else { "  " };
+        let suffix = if is_current { "  (current)" } else { "" };
+        let (base_style, suf_style) = if is_selected {
+            (sel_style, sel_style)
+        } else if is_current {
+            (cur_style, dim_style)
+        } else {
+            (Style::default().fg(theme.main_fg), dim_style)
+        };
+        lines.push(Line::from(vec![
+            ratatui::text::Span::styled(format!("{prefix}{branch}"), base_style),
+            ratatui::text::Span::styled(suffix.to_string(), suf_style),
+        ]));
+    }
+    frame.render_widget(&ScrollableText::new(&lines, theme), body);
+}
+
 fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -741,7 +799,7 @@ fn draw_list_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         return;
     }
     let columns = list_columns(inner.width);
-    let rows = build_rows(app.entries());
+    let rows = build_rows(app.entries(), app.git_state());
     let table = Table::new(&columns, &rows, theme)
         .with_selection(Some(app.nav().cursor), app.nav().scroll);
     frame.render_widget(&table, inner);
@@ -1446,7 +1504,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         frame.render_widget(&bar, area);
         return;
     }
-    let move_label: &str = match app.focus() {
+    let _move_label: &str = match app.focus() {
         Focus::List => "move",
         Focus::Preview => "scroll",
     };
@@ -1499,6 +1557,7 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         vec![
             ("Space".into(), "fullscreen".into()),
             ("i".into(), "info".into()),
+            ("B".into(), "branches".into()),
             ("/".into(), "filter".into()),
             (":".into(), "cmd".into()),
             ("T".into(), "tree".into()),
@@ -1539,7 +1598,10 @@ fn list_columns(width: u16) -> Vec<Column<'static>> {
     }
 }
 
-fn build_rows(entries: &[crate::fs::entry::FsEntry]) -> Vec<Row<'static>> {
+fn build_rows(
+    entries: &[crate::fs::entry::FsEntry],
+    git: &crate::app::GitState,
+) -> Vec<Row<'static>> {
     entries
         .iter()
         .map(|e| {
@@ -1550,8 +1612,9 @@ fn build_rows(entries: &[crate::fs::entry::FsEntry]) -> Vec<Row<'static>> {
                 format_bytes_compact(e.size)
             };
             let mtime = format_relative_mtime(e.mtime);
+            let name_cell = git_name_cell(name, &e.path, git);
             Row::data(vec![
-                Cell::new(name).with_style(Style::default()),
+                name_cell,
                 Cell::new(size),
                 Cell::new(mtime),
             ])
@@ -1564,6 +1627,31 @@ fn build_rows_name_only(entries: &[crate::fs::entry::FsEntry]) -> Vec<Row<'stati
         .iter()
         .map(|e| Row::data(vec![Cell::new(decorated_name(e))]))
         .collect()
+}
+
+/// Build a Name cell with a colored git-status prefix glyph.
+/// Uses `with_style` to color the whole cell since `table::Cell` holds plain text.
+fn git_name_cell(
+    name: String,
+    path: &std::path::Path,
+    git: &crate::app::GitState,
+) -> Cell<'static> {
+    use crate::app::GitFileStatus;
+    match git.files.get(path) {
+        None => Cell::new(name),
+        Some(status) => {
+            let (glyph, color) = match status {
+                GitFileStatus::Modified  => ("M ", Color::Yellow),
+                GitFileStatus::Added     => ("A ", Color::Green),
+                GitFileStatus::Deleted   => ("D ", Color::Red),
+                GitFileStatus::Renamed   => ("R ", Color::Cyan),
+                GitFileStatus::Untracked => ("? ", Color::DarkGray),
+                GitFileStatus::Staged    => ("S ", Color::LightGreen),
+            };
+            Cell::new(format!("{glyph}{name}"))
+                .with_style(Style::default().fg(color))
+        }
+    }
 }
 
 fn decorated_name(e: &crate::fs::entry::FsEntry) -> String {

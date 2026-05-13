@@ -63,6 +63,8 @@ pub enum Action {
     StartCommandPalette,
     /// Show file/directory info panel (`i` key).
     ShowInfo,
+    /// Open the git branch overlay (`B` key).
+    ToggleBranchOverlay,
     Noop,
 }
 
@@ -118,6 +120,7 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('R') => Action::TreeReverseSort,
         KeyCode::Char(':') => Action::StartCommandPalette,
         KeyCode::Char('i') => Action::ShowInfo,
+        KeyCode::Char('B') => Action::ToggleBranchOverlay,
         _ => Action::Noop,
     }
 }
