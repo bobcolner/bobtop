@@ -65,6 +65,11 @@ pub enum Action {
     ShowInfo,
     /// Open the git branch overlay (`B` key).
     ToggleBranchOverlay,
+    /// Suspend / resume crossterm mouse capture (`M` key). With capture
+    /// off the terminal handles drag-selection natively so users can
+    /// copy text the usual way; the trade-off is that wheel scroll
+    /// stops feeding the app until capture is re-enabled.
+    ToggleMouseCapture,
     Noop,
 }
 
@@ -121,6 +126,7 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char(':') => Action::StartCommandPalette,
         KeyCode::Char('i') => Action::ShowInfo,
         KeyCode::Char('B') => Action::ToggleBranchOverlay,
+        KeyCode::Char('M') => Action::ToggleMouseCapture,
         _ => Action::Noop,
     }
 }

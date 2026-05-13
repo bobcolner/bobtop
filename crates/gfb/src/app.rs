@@ -82,7 +82,11 @@ impl PreviewSize {
 /// restore propagate; spawning the editor itself is best-effort —
 /// most editors only fail in pathological setups (PATH unset etc.)
 /// and we'd rather come back to a working browser than panic.
-fn open_in_editor<B: Backend>(terminal: &mut ratatui::Terminal<B>, path: &Path) -> Result<()>
+fn open_in_editor<B: Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    path: &Path,
+    mouse_capture: bool,
+) -> Result<()>
 where
     B: ratatui::backend::Backend + std::io::Write,
 {
@@ -104,7 +108,10 @@ where
 
     enable_raw_mode().ok();
     let backend = terminal.backend_mut();
-    execute!(backend, EnterAlternateScreen, EnableMouseCapture).ok();
+    execute!(backend, EnterAlternateScreen).ok();
+    if mouse_capture {
+        execute!(backend, EnableMouseCapture).ok();
+    }
     // Ratatui's diff renderer assumes the alt-screen contents match
     // its prior buffer; the editor scribbled all over that, so force
     // a full redraw on the next tick.
@@ -674,6 +681,16 @@ pub struct App {
     /// The run loop consumes this after `handle()` returns to suspend
     /// the TUI and spawn `$EDITOR`.
     pending_editor: Option<PathBuf>,
+    /// Tracks whether crossterm's mouse capture is currently enabled.
+    /// Toggling capture off lets users use their terminal's native
+    /// click-and-drag text selection (and thus copy) at the cost of
+    /// in-app wheel scrolling.
+    mouse_capture: bool,
+    /// Set when the user triggers `Action::ToggleMouseCapture`. The
+    /// run loop drains this after `handle()` returns so the crossterm
+    /// command runs once per dispatch, with the new state matching
+    /// `self.mouse_capture`.
+    pending_mouse_toggle: bool,
     show_hidden: bool,
     sort: SortMode,
     /// Per-directory cursor memory. Whenever we leave a directory we
@@ -1268,6 +1285,8 @@ impl App {
             filter: None,
             filter_input: None,
             pending_editor: None,
+            mouse_capture: false,
+            pending_mouse_toggle: false,
             show_hidden: false,
             sort: SortMode::Name,
             cursor_memory: HashMap::new(),
@@ -2483,23 +2502,7 @@ impl App {
             // more useful in this context, and matches what most DB
             // browsers map `r` to.
             Action::Refresh | Action::Rename => {
-                self.db_cache = crate::sources::multi::new_db_cache();
-                self.db_preview = None;
-                // Re-fire loads for every Children-level in the stack
-                // so all panes repopulate, not just the focused one.
-                let sources: Vec<(usize, crate::sources::NodePath)> = self
-                    .db_miller
-                    .levels
-                    .iter()
-                    .filter_map(|l| match &l.source {
-                        DbLevelSource::Children { root, path } => Some((*root, path.clone())),
-                        _ => None,
-                    })
-                    .collect();
-                for (root, path) in sources {
-                    self.ensure_db_children_loaded(root, &path);
-                }
-                self.on_db_cursor_changed();
+                self.reload_db_catalog();
                 return false;
             }
             Action::Trash => {
@@ -2703,7 +2706,10 @@ impl App {
                 self.open_branch_overlay();
                 return false;
             }
-            Action::Noop | Action::StartCommandPalette | Action::ToggleDatabaseMode => {}
+            Action::Noop
+            | Action::StartCommandPalette
+            | Action::ToggleDatabaseMode
+            | Action::ToggleMouseCapture => {}
         }
         if self.tree_state.nav.cursor != prior_cursor {
             self.request_tree_preview();
@@ -2821,6 +2827,16 @@ impl App {
         }
         if matches!(action, Action::StartCommandPalette) {
             self.command_palette = Some(CommandPaletteState::default());
+            return false;
+        }
+        if matches!(action, Action::ToggleMouseCapture) {
+            self.mouse_capture = !self.mouse_capture;
+            self.pending_mouse_toggle = true;
+            if self.mouse_capture {
+                self.flash_status("mouse capture on — pane wheel scroll, copy disabled");
+            } else {
+                self.flash_status("mouse capture off — drag to select / copy");
+            }
             return false;
         }
         if matches!(action, Action::ToggleDatabaseMode) {
@@ -3049,7 +3065,8 @@ impl App {
             | Action::TreeCycleSortPrev
             | Action::TreeReverseSort
             | Action::StartCommandPalette
-            | Action::ToggleDatabaseMode => {}
+            | Action::ToggleDatabaseMode
+            | Action::ToggleMouseCapture => {}
             Action::Noop => {}
         }
         // Any movement / refresh / cd may have changed the selected
@@ -3401,6 +3418,28 @@ impl App {
         }
     }
 
+    /// Reset the DB catalog cache and re-fire loads for every
+    /// Children-level pane in the Miller stack so all visible panes
+    /// repopulate. Used both by the explicit refresh action and by
+    /// mutations (drop) that invalidate the cached catalog.
+    fn reload_db_catalog(&mut self) {
+        self.db_cache = crate::sources::multi::new_db_cache();
+        self.db_preview = None;
+        let sources: Vec<(usize, crate::sources::NodePath)> = self
+            .db_miller
+            .levels
+            .iter()
+            .filter_map(|l| match &l.source {
+                DbLevelSource::Children { root, path } => Some((*root, path.clone())),
+                _ => None,
+            })
+            .collect();
+        for (root, path) in sources {
+            self.ensure_db_children_loaded(root, &path);
+        }
+        self.on_db_cursor_changed();
+    }
+
     fn run_drop_db_object(&mut self, root: usize, path: &crate::sources::NodePath, cascade: bool) {
         use crate::sources::NodeKind;
         let Some(conn) = self.connections.get(root) else {
@@ -3417,8 +3456,7 @@ impl App {
         };
         match conn.drop_object(db, schema, table, cascade) {
             Ok(()) => {
-                self.db_cache = crate::sources::multi::new_db_cache();
-                self.db_preview = None;
+                self.reload_db_catalog();
                 self.flash_status(format!("dropped {label}"));
             }
             Err(e) => {
@@ -3784,10 +3822,23 @@ impl App {
                             // draw so we don't render between key
                             // and editor handoff.
                             if let Some(path) = self.take_pending_editor() {
-                                open_in_editor(terminal, &path)?;
+                                open_in_editor(terminal, &path, self.mouse_capture)?;
                                 self.preview_cache.invalidate(&path);
                                 self.request_preview();
                                 let _ = self.refresh();
+                            }
+                            if self.pending_mouse_toggle {
+                                self.pending_mouse_toggle = false;
+                                use crossterm::event::{
+                                    DisableMouseCapture, EnableMouseCapture,
+                                };
+                                use crossterm::execute;
+                                let backend = terminal.backend_mut();
+                                if self.mouse_capture {
+                                    execute!(backend, EnableMouseCapture).ok();
+                                } else {
+                                    execute!(backend, DisableMouseCapture).ok();
+                                }
                             }
                         }
                     }

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::DisableMouseCapture;
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
@@ -147,12 +147,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        SetTitle("gfb")
-    )?;
+    // Mouse capture is OFF by default so the terminal's native
+    // click-and-drag text selection (and thus copy) keeps working —
+    // gtop does the same. Wheel scroll still scrolls the focused
+    // pane in most modern terminals via alternate-scroll mode, which
+    // synthesises arrow keys. Users who want pane-aware wheel scroll
+    // can re-enable capture with `M` at runtime.
+    execute!(stdout, EnterAlternateScreen, SetTitle("gfb"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
