@@ -685,10 +685,12 @@ pub struct App {
     /// disrupt either.
     pub(crate) tree_sort: crate::tree::FbCol,
     pub(crate) tree_sort_descending: bool,
-    /// Cursor + expansion state for the dedicated database browser
-    /// (`ViewMode::Database`). Independent of `tree_state` so the two
-    /// modes keep separate cursors and expansion sets.
-    pub(crate) db_state: gtui::tree::TreeState<crate::sources::AnyNodeId>,
+    /// Miller-column state for the dedicated database browser
+    /// (`ViewMode::Database`). Each level is a sibling list: connections
+    /// at the root, then databases / schemas / tables as the user drills
+    /// in with →. The file browser uses the same three-pane Miller
+    /// layout, so both modes feel like the same app.
+    pub(crate) db_miller: DbMillerState,
     /// Database endpoints attached at startup via `--connect`.
     /// Empty vec means filesystem-only browsing — tree mode behaves
     /// exactly as it did pre-Phase-5.
@@ -729,6 +731,160 @@ pub(crate) struct DbPreview {
     pub columns: Vec<crate::sources::ColumnSpec>,
     /// Fast catalog-stats estimate; `None` when not cheaply available.
     pub row_count: Option<u64>,
+}
+
+/// One item visible inside a [`DbLevel`]. Mirrors the catalog tiers
+/// — endpoint / database / schema / table — and carries enough to
+/// reconstruct a [`crate::sources::NodePath`] for child loads,
+/// queries, and drops.
+#[derive(Debug, Clone)]
+pub enum DbItem {
+    Connection { root: usize, label: String },
+    Database { root: usize, db: String },
+    Schema { root: usize, db: String, schema: String },
+    Table { root: usize, db: String, schema: String, table: String },
+}
+
+impl DbItem {
+    pub fn label(&self) -> &str {
+        match self {
+            DbItem::Connection { label, .. } => label,
+            DbItem::Database { db, .. } => db,
+            DbItem::Schema { schema, .. } => schema,
+            DbItem::Table { table, .. } => table,
+        }
+    }
+
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            DbItem::Connection { .. } => "⛁",
+            DbItem::Database { .. } => "🗄",
+            DbItem::Schema { .. } => "📂",
+            DbItem::Table { .. } => "▦",
+        }
+    }
+
+    pub fn is_expandable(&self) -> bool {
+        !matches!(self, DbItem::Table { .. })
+    }
+
+    pub fn root(&self) -> usize {
+        match self {
+            DbItem::Connection { root, .. }
+            | DbItem::Database { root, .. }
+            | DbItem::Schema { root, .. }
+            | DbItem::Table { root, .. } => *root,
+        }
+    }
+
+    pub fn node_path(&self) -> crate::sources::NodePath {
+        use crate::sources::NodePath;
+        match self {
+            DbItem::Connection { root, .. } => NodePath::endpoint(*root),
+            DbItem::Database { root, db } => NodePath::database(*root, db),
+            DbItem::Schema { root, db, schema } => NodePath::schema(*root, db, schema),
+            DbItem::Table { root, db, schema, table } => {
+                NodePath::table(*root, db, schema, table)
+            }
+        }
+    }
+}
+
+/// What a [`DbLevel`] is showing. `Connections` is the root level
+/// (siblings = every `--connect`'d endpoint); `Children` shows the
+/// children of a specific catalog node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbLevelSource {
+    Connections,
+    Children {
+        root: usize,
+        path: crate::sources::NodePath,
+    },
+}
+
+/// One Miller column in the DB browser. Items are derived on demand
+/// from `connections` / `db_cache`; the level just tracks the cursor
+/// plus the label of the item that opened it (used for the breadcrumb
+/// without re-walking parents). Scroll is recomputed from cursor at
+/// draw time, so it doesn't need to live on the level.
+#[derive(Debug, Clone)]
+pub struct DbLevel {
+    pub source: DbLevelSource,
+    pub parent_label: Option<String>,
+    pub cursor: usize,
+}
+
+/// Miller-column state for the DB browser. Always has at least one
+/// level (the connections list). Pushing a level corresponds to
+/// drilling into the cursor's item; popping is `←` / `h`.
+#[derive(Debug, Clone)]
+pub struct DbMillerState {
+    pub levels: Vec<DbLevel>,
+}
+
+impl DbMillerState {
+    pub fn new() -> Self {
+        Self {
+            levels: vec![DbLevel {
+                source: DbLevelSource::Connections,
+                parent_label: None,
+                cursor: 0,
+            }],
+        }
+    }
+
+    pub fn current(&self) -> &DbLevel {
+        self.levels
+            .last()
+            .expect("DbMillerState always has at least one level")
+    }
+
+    pub fn current_mut(&mut self) -> &mut DbLevel {
+        self.levels
+            .last_mut()
+            .expect("DbMillerState always has at least one level")
+    }
+
+    pub fn depth(&self) -> usize {
+        self.levels.len()
+    }
+}
+
+impl Default for DbMillerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Project a `(root, NodePath, NodeData)` triple from the catalog
+/// into a [`DbItem`] for the Miller browser.
+pub(crate) fn db_item_from_path(
+    root: usize,
+    path: &crate::sources::NodePath,
+    data: &crate::sources::NodeData,
+) -> DbItem {
+    use crate::sources::NodeKind;
+    match path.level() {
+        NodeKind::Endpoint => DbItem::Connection {
+            root,
+            label: data.label.clone(),
+        },
+        NodeKind::Database => DbItem::Database {
+            root,
+            db: path.database.clone().unwrap_or_default(),
+        },
+        NodeKind::Schema => DbItem::Schema {
+            root,
+            db: path.database.clone().unwrap_or_default(),
+            schema: path.schema.clone().unwrap_or_default(),
+        },
+        NodeKind::Table => DbItem::Table {
+            root,
+            db: path.database.clone().unwrap_or_default(),
+            schema: path.schema.clone().unwrap_or_default(),
+            table: path.table.clone().unwrap_or_default(),
+        },
+    }
 }
 
 /// Content of a directory info scan — loaded asynchronously.
@@ -1002,7 +1158,7 @@ impl App {
             tree_state: gtui::tree::TreeState::default(),
             tree_sort: crate::tree::FbCol::Name,
             tree_sort_descending: false,
-            db_state: gtui::tree::TreeState::default(),
+            db_miller: DbMillerState::new(),
             connections,
             db_preview: None,
             db_cache: crate::sources::multi::new_db_cache(),
@@ -1133,31 +1289,26 @@ impl App {
     /// Open the SQL query editor, pre-filling SQL based on the currently
     /// selected DB node (table → SELECT *, otherwise empty).
     pub(crate) fn open_query_editor(&mut self) {
-        let rows = self.db_rows();
-        let cursor = self.db_state.nav.cursor;
-        let (conn_root, pre_sql) = if let Some(row) = rows.get(cursor) {
-            if let crate::sources::AnyNodeId::Db { root, path } = &row.id {
-                let sql = match path.level() {
-                    crate::sources::NodeKind::Table => {
-                        let db = path.database.as_deref().unwrap_or("");
-                        let sch = path.schema.as_deref().unwrap_or("");
-                        let tbl = path.table.as_deref().unwrap_or("");
-                        format!(
-                            "SELECT *\nFROM {}.{}.{}\nLIMIT 100",
-                            quote_db_ident(db),
-                            quote_db_ident(sch),
-                            quote_db_ident(tbl),
-                        )
-                    }
-                    crate::sources::NodeKind::Schema => {
-                        let sch = path.schema.as_deref().unwrap_or("");
-                        format!("-- schema: {sch}\n")
-                    }
-                    _ => String::new(),
-                };
-                (*root, sql)
-            } else {
-                (0, String::new())
+        let depth = self.db_miller.depth();
+        let items = self.db_level_items(depth - 1);
+        let cursor = self.db_miller.current().cursor;
+        let (conn_root, pre_sql) = if let Some(item) = items.get(cursor) {
+            match item {
+                DbItem::Table { root, db, schema, table } => {
+                    let sql = format!(
+                        "SELECT *\nFROM {}.{}.{}\nLIMIT 100",
+                        quote_db_ident(db),
+                        quote_db_ident(schema),
+                        quote_db_ident(table),
+                    );
+                    (*root, sql)
+                }
+                DbItem::Schema { root, schema, .. } => {
+                    (*root, format!("-- schema: {schema}\n"))
+                }
+                DbItem::Database { root, .. } | DbItem::Connection { root, .. } => {
+                    (*root, String::new())
+                }
             }
         } else {
             (0, String::new())
@@ -1349,11 +1500,17 @@ impl App {
         &self.fs_cache
     }
 
-    /// Drop both per-tree caches. Called on `Refresh` and on cwd /
-    /// expand mutations that change the visible row set, so the next
-    /// flatten reads from the source of truth.
+    /// Drop the filesystem readdir cache. Called from `refresh()` —
+    /// which itself fires on every fs-watcher tick — so the next
+    /// flatten re-reads cwd's directory entries from disk.
+    ///
+    /// Crucially this does NOT touch `db_cache`. A filesystem event
+    /// has no bearing on the database catalog, and dropping the DB
+    /// cache here would make every save under cwd wipe the DB-mode
+    /// panes back to "loading…" until the worker re-fetched every
+    /// drilled-in level. Explicit DB refresh (`r` / `F5` in DB mode)
+    /// resets `db_cache` directly.
     pub(crate) fn invalidate_tree_caches(&self) {
-        self.db_cache.borrow_mut().clear();
         self.fs_cache.borrow_mut().clear();
     }
 
@@ -1406,28 +1563,63 @@ impl App {
         self.finder.is_some()
     }
 
-    pub fn db_state(&self) -> &gtui::tree::TreeState<crate::sources::AnyNodeId> {
-        &self.db_state
+    pub fn db_miller(&self) -> &DbMillerState {
+        &self.db_miller
     }
 
-    /// Flatten the full tree and filter to DB-only rows. Used by both
-    /// the DB-mode key handler and the DB-mode renderer.
-    pub(crate) fn db_rows(&self) -> Vec<crate::tree::TreeRow> {
-        crate::tree::flatten_tree(
-            &self.cwd,
-            &self.db_state.expanded,
-            self.tree_sort,
-            self.tree_sort_descending,
-            self.show_hidden,
-            self.filter.as_deref(),
-            &self.connections,
-            &self.db_cache,
-            &self.fs_cache,
-            Some(&self.db_load_tx),
-        )
-        .into_iter()
-        .filter(|r| matches!(r.row, crate::sources::AnyRow::Db(_)))
-        .collect()
+    /// Items visible in the DB-Miller level at `idx`. Connections come
+    /// straight from `self.connections`; child levels read from
+    /// `db_cache`. Returns an empty `Vec` while a child load is still
+    /// in flight (cache state is `Loading`).
+    pub(crate) fn db_level_items(&self, idx: usize) -> Vec<DbItem> {
+        use crate::sources::multi::ChildrenState;
+        let Some(level) = self.db_miller.levels.get(idx) else {
+            return Vec::new();
+        };
+        match &level.source {
+            DbLevelSource::Connections => self
+                .connections
+                .iter()
+                .enumerate()
+                .map(|(root, c)| DbItem::Connection {
+                    root,
+                    label: c.endpoint_label().to_string(),
+                })
+                .collect(),
+            DbLevelSource::Children { root, path } => {
+                let cache = self.db_cache.borrow();
+                match cache.get(path) {
+                    Some(ChildrenState::Ready(rows)) => rows
+                        .iter()
+                        .map(|(child_path, data)| db_item_from_path(*root, child_path, data))
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Ensure the children of `(root, path)` are loaded (or in flight).
+    /// Inserts a `Loading` placeholder and dispatches an async request
+    /// to the worker if the cache is cold; no-op on hit.
+    pub(crate) fn ensure_db_children_loaded(
+        &self,
+        root: usize,
+        path: &crate::sources::NodePath,
+    ) {
+        use crate::sources::multi::ChildrenState;
+        {
+            let cache = self.db_cache.borrow();
+            if cache.contains_key(path) {
+                return;
+            }
+        }
+        self.db_cache
+            .borrow_mut()
+            .insert(path.clone(), ChildrenState::Loading);
+        if let Some(conn) = self.connections.get(root) {
+            conn.request_children(path.clone(), self.db_load_tx.clone());
+        }
     }
 
     pub fn is_command_palette_active(&self) -> bool {
@@ -1776,7 +1968,11 @@ impl App {
         match self.view_mode {
             ViewMode::Miller | ViewMode::Table => self.request_preview(),
             ViewMode::Tree => self.request_tree_preview(),
-            ViewMode::Database => self.request_db_mode_preview(),
+            ViewMode::Database => {
+                self.preview_state = PreviewState::None;
+                self.preview_scroll = 0;
+                self.on_db_cursor_changed();
+            }
         }
     }
 
@@ -1879,23 +2075,67 @@ impl App {
         });
     }
 
-    fn request_db_mode_preview(&mut self) {
-        let rows = self.db_rows();
-        let Some(row) = rows.get(self.db_state.nav.cursor).cloned() else {
-            self.preview_state = PreviewState::None;
-            self.preview_scroll = 0;
+    /// Refresh state derived from the DB-Miller cursor. Non-table
+    /// selections pre-load their children so the right pane can show
+    /// the next level live. Table schema previews are opt-in — fired
+    /// from `Action::EnterDir`, not from cursor moves — so just
+    /// browsing through a table list doesn't trigger a network round
+    /// trip per cursor tick. Whatever was previously displayed is
+    /// cleared either way.
+    fn on_db_cursor_changed(&mut self) {
+        self.db_preview = None;
+        let depth = self.db_miller.depth();
+        let items = self.db_level_items(depth - 1);
+        let cursor = self.db_miller.current().cursor;
+        let Some(item) = items.get(cursor).cloned() else {
+            return;
+        };
+        if item.is_expandable() {
+            let path = item.node_path();
+            self.ensure_db_children_loaded(item.root(), &path);
+        }
+    }
+
+    /// Synchronously fetch the schema preview for the table item at
+    /// the current DB-Miller cursor. No-op for non-table selections.
+    /// Triggered explicitly by `Action::EnterDir` so cursor moves
+    /// stay free.
+    fn request_db_schema_preview(&mut self) {
+        let depth = self.db_miller.depth();
+        let items = self.db_level_items(depth - 1);
+        let cursor = self.db_miller.current().cursor;
+        let Some(item) = items.get(cursor).cloned() else {
+            return;
+        };
+        let DbItem::Table { root, db, schema, table } = &item else {
+            return;
+        };
+        let path = crate::sources::NodePath::table(*root, db, schema, table);
+        if matches!(&self.db_preview, Some(p) if p.path == path) {
+            return;
+        }
+        let Some(conn) = self.connections.get(*root) else {
             self.db_preview = None;
             return;
         };
-        self.preview_state = PreviewState::None;
-        self.preview_scroll = 0;
-        self.request_db_preview(row.id.clone());
+        let columns = match conn.columns(db, schema, table) {
+            Ok(c) => c,
+            Err(e) => {
+                self.db_preview = None;
+                self.flash_status(format!("columns({table}) failed: {e}"));
+                return;
+            }
+        };
+        let row_count = conn.approximate_row_count(db, schema, table);
+        self.db_preview = Some(DbPreview { path, columns, row_count });
     }
 
     fn handle_db_mode(&mut self, action: Action) -> bool {
-        let rows = self.db_rows();
-        let total = rows.len();
-        let prior = self.db_state.nav.cursor;
+        let depth = self.db_miller.depth();
+        let items = self.db_level_items(depth - 1);
+        let total = items.len();
+        let prior_cursor = self.db_miller.current().cursor;
+        let prior_depth = depth;
         match action {
             Action::Quit => return true,
             Action::Cancel => {
@@ -1904,52 +2144,109 @@ impl App {
                 self.request_preview();
                 return false;
             }
-            Action::MoveUp => self.db_state.nav.move_by(-1, total),
-            Action::MoveDown => self.db_state.nav.move_by(1, total),
-            Action::PageUp => self.db_state.nav.move_by(-10, total),
-            Action::PageDown => self.db_state.nav.move_by(10, total),
-            Action::Top => self.db_state.nav.home(),
-            Action::Bottom => self.db_state.nav.end(total),
+            Action::MoveUp => {
+                let new = self.db_miller.current().cursor.saturating_sub(1);
+                self.db_miller.current_mut().cursor = new;
+            }
+            Action::MoveDown => {
+                if total > 0 {
+                    let new = (self.db_miller.current().cursor + 1).min(total - 1);
+                    self.db_miller.current_mut().cursor = new;
+                }
+            }
+            Action::PageUp => {
+                let new = self.db_miller.current().cursor.saturating_sub(10);
+                self.db_miller.current_mut().cursor = new;
+            }
+            Action::PageDown => {
+                if total > 0 {
+                    let new = (self.db_miller.current().cursor + 10).min(total - 1);
+                    self.db_miller.current_mut().cursor = new;
+                }
+            }
+            Action::Top => {
+                self.db_miller.current_mut().cursor = 0;
+            }
+            Action::Bottom => {
+                self.db_miller.current_mut().cursor = total.saturating_sub(1);
+            }
             Action::EnterDir => {
-                let cursor = self.db_state.nav.cursor;
-                let outcome = self.db_state.toggle_at(&rows, cursor);
-                match outcome {
-                    gtui::tree::ToggleOutcome::Expanded(_) => {
-                        // Expandable node (endpoint/db/schema): expand and
-                        // step into it. No schema to load.
-                        self.db_state.nav.move_by(1, total + 1);
-                    }
-                    gtui::tree::ToggleOutcome::NotExpandable => {
-                        // Leaf node (table): load schema on demand.
-                        self.request_db_mode_preview();
-                    }
-                    _ => {}
+                let Some(item) = items.get(prior_cursor).cloned() else {
+                    return false;
+                };
+                if item.is_expandable() {
+                    let path = item.node_path();
+                    let label = item.label().to_string();
+                    self.ensure_db_children_loaded(item.root(), &path);
+                    self.db_miller.levels.push(DbLevel {
+                        source: DbLevelSource::Children {
+                            root: item.root(),
+                            path,
+                        },
+                        parent_label: Some(label),
+                        cursor: 0,
+                    });
+                    self.db_preview = None;
+                    self.on_db_cursor_changed();
+                } else {
+                    // Leaf (table): explicit Enter loads the schema
+                    // preview. Cursor moves alone don't trigger this —
+                    // it's a deliberate fetch on a key press.
+                    self.request_db_schema_preview();
                 }
                 return false;
             }
             Action::ParentDir => {
-                self.db_state.collapse_or_parent(&rows);
+                if self.db_miller.levels.len() > 1 {
+                    self.db_miller.levels.pop();
+                    self.db_preview = None;
+                    self.on_db_cursor_changed();
+                }
+                return false;
             }
-            Action::Refresh => {
+            // `Rename` is `r` in the base keymap. File mode uses it to
+            // rename an entry; DB mode has no rename semantics, so we
+            // hijack the same key to mean "refresh the catalog" — much
+            // more useful in this context, and matches what most DB
+            // browsers map `r` to.
+            Action::Refresh | Action::Rename => {
                 self.db_cache = crate::sources::multi::new_db_cache();
                 self.db_preview = None;
+                // Re-fire loads for every Children-level in the stack
+                // so all panes repopulate, not just the focused one.
+                let sources: Vec<(usize, crate::sources::NodePath)> = self
+                    .db_miller
+                    .levels
+                    .iter()
+                    .filter_map(|l| match &l.source {
+                        DbLevelSource::Children { root, path } => Some((*root, path.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                for (root, path) in sources {
+                    self.ensure_db_children_loaded(root, &path);
+                }
+                self.on_db_cursor_changed();
+                return false;
             }
             Action::Trash => {
-                // `d` in DB mode opens a drop confirmation for tables and schemas.
-                let cursor = self.db_state.nav.cursor;
-                if let Some(row) = rows.get(cursor) {
-                    if let crate::sources::AnyNodeId::Db { root, path } = &row.id {
-                        use crate::sources::NodeKind;
-                        match path.level() {
-                            NodeKind::Table | NodeKind::Schema => {
-                                self.input_modal = Some(InputModal::ConfirmDropDbObject {
-                                    root: *root,
-                                    path: path.clone(),
-                                    cascade: false,
-                                });
-                            }
-                            _ => self.flash_status("drop: only tables and schemas can be dropped"),
+                if let Some(item) = items.get(prior_cursor) {
+                    match item {
+                        DbItem::Table { root, db, schema, table } => {
+                            self.input_modal = Some(InputModal::ConfirmDropDbObject {
+                                root: *root,
+                                path: crate::sources::NodePath::table(*root, db, schema, table),
+                                cascade: false,
+                            });
                         }
+                        DbItem::Schema { root, db, schema } => {
+                            self.input_modal = Some(InputModal::ConfirmDropDbObject {
+                                root: *root,
+                                path: crate::sources::NodePath::schema(*root, db, schema),
+                                cascade: false,
+                            });
+                        }
+                        _ => self.flash_status("drop: only tables and schemas can be dropped"),
                     }
                 }
             }
@@ -1957,12 +2254,20 @@ impl App {
                 self.open_query_editor();
                 return false;
             }
+            Action::PreviewNarrower => {
+                self.preview_size = self.preview_size.narrower();
+                return false;
+            }
+            Action::PreviewWider => {
+                self.preview_size = self.preview_size.wider();
+                return false;
+            }
             _ => {}
         }
-        // Clear stale preview when cursor moves — schema is loaded
-        // explicitly via Enter/l, not automatically.
-        if self.db_state.nav.cursor != prior {
-            self.db_preview = None;
+        if self.db_miller.current().cursor != prior_cursor
+            || self.db_miller.depth() != prior_depth
+        {
+            self.on_db_cursor_changed();
         }
         false
     }

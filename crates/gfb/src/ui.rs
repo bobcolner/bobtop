@@ -228,15 +228,46 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
         return;
     }
 
-    // In DB mode show a simple "database" indicator instead of a filesystem path.
+    // In DB mode show the Miller-level stack as a breadcrumb. Same
+    // shape as the file-mode breadcrumb below: leading indent, single
+    // leading glyph, components separated by ` / `, last component
+    // bold, the rest dimmed.
     if matches!(app.view_mode, crate::app::ViewMode::Database) {
-        let count = app.connections().len();
-        let label = if count == 1 { "database  ·  1 connection".to_string() }
-                    else { format!("database  ·  {} connections", count) };
-        let lines = vec![Line::from(vec![
-            Span::raw("  "),
-            Span::styled(label, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
-        ])];
+        let sep_style = Style::default().fg(theme.div_line);
+        let dim_style = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+        let last_style = Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD);
+
+        // Each drilled-in level after the root contributes its parent
+        // label; append the currently-selected item in the deepest
+        // level so the deepest segment updates live as the user moves.
+        let state = app.db_miller();
+        let mut segments: Vec<String> = state
+            .levels
+            .iter()
+            .skip(1)
+            .filter_map(|l| l.parent_label.clone())
+            .collect();
+        let depth = state.depth();
+        let items = app.db_level_items(depth - 1);
+        if let Some(item) = items.get(state.current().cursor) {
+            segments.push(item.label().to_string());
+        }
+
+        let mut spans: Vec<Span<'static>> = vec![Span::raw("  "), Span::raw("⛁ ")];
+        if segments.is_empty() {
+            spans.push(Span::styled("(no selection)", dim_style));
+        } else {
+            let n = segments.len();
+            for (i, seg) in segments.into_iter().enumerate() {
+                let style = if i + 1 == n { last_style } else { dim_style };
+                spans.push(Span::styled(seg, style));
+                if i + 1 < n {
+                    spans.push(Span::styled(" / ", sep_style));
+                }
+            }
+        }
+
+        let lines = vec![Line::from(spans)];
         let widget = ScrollableText::new(&lines, theme);
         frame.render_widget(&widget, area);
         return;
@@ -279,14 +310,11 @@ fn draw_breadcrumb(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     frame.render_widget(&widget, area);
 }
 
-/// Full-screen DB browser: tree on the left (~40%), preview on the right.
-/// Only DB nodes are shown — no filesystem entries.
+/// Three-pane DB browser using the same Miller-columns layout as the
+/// file browser: parent level on the left, current level in the
+/// middle, preview (schema for tables, next-level children otherwise,
+/// or the SQL editor when active) on the right.
 fn draw_db_mode(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
-    use crate::sources::AnyRow;
-    use crate::tree::{FbCol, build_rows_for_app};
-    use gtui::browser::BrowserShell;
-    use gtui::widgets::live_table::{Align, ColumnDef, TableEntry, WidthSpec};
-
     if app.connections().is_empty() {
         let lines = vec![
             Line::from(""),
@@ -305,43 +333,179 @@ fn draw_db_mode(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
         return;
     }
 
-    let all_rows = build_rows_for_app(
-        app.cwd(),
-        app.tree_sort,
-        app.tree_sort_descending,
-        app.show_hidden(),
-        &app.db_state().expanded,
-        app.filter(),
-        app.connections(),
-        app.db_cache(),
-        app.fs_cache(),
-        Some(app.db_load_tx()),
-    );
-    let db_rows: Vec<_> = all_rows
-        .into_iter()
-        .filter(|e| matches!(e, TableEntry::Item(r) if matches!(r.row, AnyRow::Db(_))))
-        .collect();
+    // Use the same preview weight as the file browser so `[`/`]`
+    // resize keys feel identical across modes. While the query editor
+    // is active, force the preview wide enough to comfortably show
+    // SQL + results without the user needing to widen it manually.
+    let preview_weight = if app.is_query_editor_active() {
+        crate::app::PreviewSize::Large.weight()
+    } else {
+        app.preview_size().weight()
+    };
+    let rects = split_main_columns(area, preview_weight);
+    let depth = app.db_miller().depth();
 
-    let columns: Vec<ColumnDef<FbCol>> = vec![ColumnDef {
-        id: FbCol::Name,
-        label: "Name",
-        width: WidthSpec::Flex,
-        align: Align::Left,
-        sortable: false,
-    }];
+    if depth >= 2 {
+        draw_db_level_pane(app, frame, theme, rects[0], depth - 2, false);
+    } else {
+        let panel = BoxedPanel::new(theme.div_line, theme.title)
+            .with_title("⌂".to_string());
+        frame.render_widget(&panel, rects[0]);
+    }
 
-    let cursor = app.db_state().nav.cursor;
-    let tree_pct = if app.is_query_editor_active() { 30 } else { 40 };
-    let preview_rect = BrowserShell::<FbCol>::new()
-        .with_title("database")
-        .with_accent(theme.panel_accents[1])
-        .with_tree_percent(tree_pct)
-        .render(frame, area, &db_rows, &columns, theme, FbCol::Name, cursor);
+    draw_db_level_pane(app, frame, theme, rects[1], depth - 1, true);
 
     if app.is_query_editor_active() {
-        draw_query_pane(app, frame, theme, preview_rect);
+        draw_query_pane(app, frame, theme, rects[2]);
+    } else if let Some(preview) = app.db_preview() {
+        draw_db_preview(preview, frame, theme, rects[2]);
     } else {
-        draw_preview_pane(app, frame, theme, preview_rect);
+        draw_db_next_level_preview(app, frame, theme, rects[2]);
+    }
+}
+
+/// Render one Miller column of the DB browser. `focused` controls the
+/// border accent (the current level gets the highlighted DB accent).
+fn draw_db_level_pane(
+    app: &App,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    level_idx: usize,
+    focused: bool,
+) {
+    use crate::app::{DbLevelSource, DbMillerState};
+    let state: &DbMillerState = app.db_miller();
+    let Some(level) = state.levels.get(level_idx) else {
+        return;
+    };
+    let items = app.db_level_items(level_idx);
+    let (title, glyph) = match &level.source {
+        DbLevelSource::Connections => ("connections".to_string(), "⛁"),
+        DbLevelSource::Children { .. } => (
+            level.parent_label.clone().unwrap_or_else(|| "—".to_string()),
+            db_level_glyph(level_idx),
+        ),
+    };
+    // Match the file browser: parent pane uses `div_line`, the focused
+    // current pane uses `panel_accents[3]`. Keeping the same palette
+    // across modes means the active-pane glow looks identical.
+    let accent = if focused {
+        theme.panel_accents[3]
+    } else {
+        theme.div_line
+    };
+    let panel = BoxedPanel::new(accent, theme.title)
+        .with_title(format!("{} {}", glyph, title))
+        .with_controls(if items.is_empty() {
+            "loading…".to_string()
+        } else {
+            format!("{} items", items.len())
+        });
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.height == 0 || items.is_empty() {
+        return;
+    }
+    let cols = vec![Column::new("", u16::MAX)];
+    let rows: Vec<Row<'static>> = items
+        .iter()
+        .map(|it| Row::data(vec![Cell::new(format!("{} {}", it.glyph(), it.label()))]))
+        .collect();
+    let body_h = inner.height.saturating_sub(1) as usize;
+    let scroll = if body_h > 0 && level.cursor >= body_h {
+        level.cursor + 1 - body_h
+    } else {
+        0
+    };
+    let table = Table::new(&cols, &rows, theme).with_selection(Some(level.cursor), scroll);
+    frame.render_widget(&table, inner);
+}
+
+/// Right-pane preview when the current selection is expandable: show
+/// the next level's children as a read-only list (drives the "live"
+/// look of Miller columns where one column ahead is always visible).
+fn draw_db_next_level_preview(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    use crate::sources::multi::ChildrenState;
+    let state = app.db_miller();
+    let depth = state.depth();
+    let items = app.db_level_items(depth - 1);
+    let cursor = state.current().cursor;
+    let Some(item) = items.get(cursor) else {
+        let panel = BoxedPanel::new(theme.div_line, theme.title).with_title("—".to_string());
+        frame.render_widget(&panel, area);
+        return;
+    };
+    if !item.is_expandable() {
+        // Table without a loaded preview — show a hint that Enter
+        // pulls the schema. Once loaded, this branch is skipped and
+        // `draw_db_preview` renders the columns instead.
+        use ratatui::style::Modifier;
+        let panel = BoxedPanel::new(theme.div_line, theme.title)
+            .with_title(format!("{} {}", item.glyph(), item.label()))
+            .with_controls("Enter to preview".to_string());
+        frame.render_widget(&panel, area);
+        let inner = panel.inner(area);
+        if inner.height >= 2 {
+            let hint = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "Press ".to_string(),
+                    Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM),
+                ),
+                Span::styled("Enter", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " to load the schema preview.",
+                    Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM),
+                ),
+            ]);
+            let lines = vec![Line::from(""), hint];
+            let widget = ScrollableText::new(&lines, theme);
+            frame.render_widget(&widget, inner);
+        }
+        return;
+    }
+    let path = item.node_path();
+    let children: Vec<crate::app::DbItem> = {
+        let cache = app.db_cache().borrow();
+        match cache.get(&path) {
+            Some(ChildrenState::Ready(rows)) => rows
+                .iter()
+                .map(|(p, d)| crate::app::db_item_from_path(item.root(), p, d))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let controls = if children.is_empty() {
+        "loading…".to_string()
+    } else {
+        format!("{} items", children.len())
+    };
+    let panel = BoxedPanel::new(theme.div_line, theme.title)
+        .with_title(format!("{} {}", item.glyph(), item.label()))
+        .with_controls(controls);
+    frame.render_widget(&panel, area);
+    let inner = panel.inner(area);
+    if inner.height == 0 || children.is_empty() {
+        return;
+    }
+    let cols = vec![Column::new("", u16::MAX)];
+    let rows: Vec<Row<'static>> = children
+        .iter()
+        .map(|it| Row::data(vec![Cell::new(format!("{} {}", it.glyph(), it.label()))]))
+        .collect();
+    let table = Table::new(&cols, &rows, theme);
+    frame.render_widget(&table, inner);
+}
+
+/// Glyph for the level at `idx` based on what *kind* of items it
+/// holds: 0 → connections, 1 → databases, 2 → schemas, 3 → tables.
+fn db_level_glyph(idx: usize) -> &'static str {
+    match idx {
+        0 => "⛁",
+        1 => "🗄",
+        2 => "📂",
+        _ => "▦",
     }
 }
 
@@ -1235,11 +1399,12 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
             ActionBar::new(chips)
         } else {
             ActionBar::new(vec![
-                ("l/Enter".into(), "expand/schema".into()),
-                ("h".into(), "collapse".into()),
+                ("l".into(), "drill in".into()),
+                ("Enter".into(), "preview".into()),
+                ("h".into(), "back".into()),
                 ("e".into(), "query".into()),
-                ("d".into(), "drop".into()),
-                ("R".into(), "refresh".into()),
+                ("x".into(), "drop".into()),
+                ("r".into(), "refresh".into()),
                 ("D/Esc".into(), "files".into()),
                 ("q".into(), "quit".into()),
             ])
@@ -1434,15 +1599,16 @@ fn format_relative_mtime(t: Option<SystemTime>) -> String {
 }
 
 /// Schema preview for a DB table: column names and types, plus an
-/// optional catalog-stats row count. No row data is fetched.
+/// optional catalog-stats row count. No row data is fetched. The
+/// table renders inside a nested boxed sub-panel so the column list
+/// reads as a tabular sub-component of the outer "table info" pane
+/// rather than naked text against the pane chrome.
 fn draw_db_preview(
     preview: &crate::app::DbPreview,
     frame: &mut Frame<'_>,
     theme: &Theme,
     area: Rect,
 ) {
-    use gtui::widgets::{panel, CornerStyle};
-
     let title = format!(
         "{}.{}.{}",
         preview.path.database.as_deref().unwrap_or("?"),
@@ -1453,32 +1619,88 @@ fn draw_db_preview(
         Some(n) => format!("{} cols  ·  ~{} rows", preview.columns.len(), format_count(n)),
         None => format!("{} cols", preview.columns.len()),
     };
-    let p = panel(theme.panel_accents[1], theme.title, CornerStyle::default())
+    // Right-pane preview accent matches the file browser's unfocused
+    // preview pane (`div_line`) so the active-pane glow stays on the
+    // CENTER column regardless of mode.
+    let outer = BoxedPanel::new(theme.div_line, theme.title)
         .with_title(title)
         .with_controls(controls);
-    frame.render_widget(&p, area);
-    let inner = p.inner(area);
-    if inner.width < 8 || inner.height < 2 {
+    frame.render_widget(&outer, area);
+    let outer_inner = outer.inner(area);
+    if outer_inner.width < 10 || outer_inner.height < 3 {
         return;
     }
 
-    // Two-column layout: name (flex) | type (right, capped at 24)
-    let type_w = (inner.width / 3).min(24).max(8);
-    let name_w = inner.width.saturating_sub(type_w + 1);
+    // ── Auto-size the inner box ─────────────────────────────────────────
+    // Natural column widths come from the longest header label, name,
+    // and type string. The nested box then sizes to content so a
+    // two-column table doesn't sprawl across an 80-cell preview pane.
+    let name_max = preview
+        .columns
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("column".len());
+    let type_max = preview
+        .columns
+        .iter()
+        .map(|c| c.data_type.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("type".len());
+    let name_w = (name_max as u16).clamp(6, 32);
+    let type_w = (type_max as u16).clamp(4, 24);
+    // body width = name + space + type; inner-box width adds the two
+    // border columns; outer padding adds another two.
+    let pad_x: u16 = 1;
+    let natural_body_w = name_w + 1 + type_w;
+    let natural_box_w = natural_body_w + 2;
+    let max_box_w = outer_inner.width.saturating_sub(pad_x * 2);
+    let box_w = natural_box_w.min(max_box_w);
 
+    // Inner height = header row + per-column rows + 2 border rows,
+    // capped at outer_inner.height so it never overflows.
+    let natural_box_h = (preview.columns.len() as u16).saturating_add(1).saturating_add(2);
+    let box_h = natural_box_h.min(outer_inner.height);
+
+    let inner_box_area = Rect::new(
+        outer_inner.x.saturating_add(pad_x),
+        outer_inner.y,
+        box_w,
+        box_h,
+    );
+    // `accent_subtle` (btop's proc_misc) is the suite's subdued accent —
+    // a child element should read as a child, not compete with the
+    // active-pane glow.
+    let inner_panel = BoxedPanel::new(theme.accent_subtle, theme.title)
+        .with_title("schema".to_string());
+    frame.render_widget(&inner_panel, inner_box_area);
+    let body = inner_panel.inner(inner_box_area);
+    if body.width < 6 || body.height < 1 {
+        return;
+    }
+
+    // Re-derive column widths from the actually-available body width
+    // in case clamping reduced it below the natural sizes.
+    let body_type_w = (body.width / 3).min(type_w).max(4);
+    let body_name_w = body.width.saturating_sub(body_type_w + 1);
     let cols = vec![
-        Column::new("column", name_w),
-        Column::new("type", type_w).right_aligned(true),
+        Column::new("column", body_name_w),
+        Column::new("type", body_type_w).right_aligned(true),
     ];
-    let rows: Vec<Row<'static>> = preview.columns.iter().map(|c| {
-        Row::data(vec![
-            Cell::new(c.name.clone()),
-            Cell::new(c.data_type.clone()),
-        ])
-    }).collect();
-
+    let rows: Vec<Row<'static>> = preview
+        .columns
+        .iter()
+        .map(|c| {
+            Row::data(vec![
+                Cell::new(c.name.clone()),
+                Cell::new(c.data_type.clone()),
+            ])
+        })
+        .collect();
     let table = Table::new(&cols, &rows, theme);
-    frame.render_widget(&table, inner);
+    frame.render_widget(&table, body);
 }
 
 /// Decompose a Unix epoch second into (year, month, day, hour, min, sec).
