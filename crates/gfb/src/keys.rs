@@ -70,6 +70,11 @@ pub enum Action {
     /// copy text the usual way; the trade-off is that wheel scroll
     /// stops feeding the app until capture is re-enabled.
     ToggleMouseCapture,
+    /// Open the modal options menu (`O` key) — tabbed shell hosting
+    /// the theme picker, behavior toggles, and DB connection list.
+    OpenOptions,
+    /// Toggle the help / keybind reference overlay (`?` key).
+    ToggleHelp,
     Noop,
 }
 
@@ -127,6 +132,8 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('i') => Action::ShowInfo,
         KeyCode::Char('B') => Action::ToggleBranchOverlay,
         KeyCode::Char('M') => Action::ToggleMouseCapture,
+        KeyCode::Char('O') => Action::OpenOptions,
+        KeyCode::Char('?') => Action::ToggleHelp,
         _ => Action::Noop,
     }
 }

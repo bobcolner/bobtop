@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use gtui::{
     format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, ConfirmDialog, EditableText,
-    MillerColumn, MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
+    HelpModal, MillerColumn, MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
 };
 use image::GenericImageView;
 use ratatui::layout::Rect;
@@ -106,6 +106,62 @@ pub fn draw(app: &App, frame: &mut Frame<'_>, theme: &Theme) {
     if app.is_branch_overlay_active() {
         draw_branch_overlay(app, frame, theme, area);
     }
+    if let Some(menu) = app.options_menu() {
+        menu.render(frame, area, theme);
+    }
+    if app.is_help_active() {
+        draw_help_overlay(frame, area, theme);
+    }
+}
+
+/// gfb keybind reference. Mirrors gtop's overlay layout via the shared
+/// `HelpModal` widget so the two apps' help screens look the same.
+const HELP_LINES: &[(&str, &str)] = &[
+    ("?", "toggle this help"),
+    ("q / b / Ctrl-C", "quit"),
+    ("Esc", "close overlay / clear filter / quit if idle"),
+    // navigation
+    ("↑ ↓ / j k", "move cursor"),
+    ("← / h", "parent directory"),
+    ("→ / l / Enter", "enter directory or open file"),
+    ("g / G  ·  Home / End", "jump to top / bottom"),
+    ("PgUp / PgDn  ·  Ctrl-U / Ctrl-D", "page up / down"),
+    ("Tab", "toggle focus between list and preview"),
+    ("[ / ]", "shrink / grow preview pane"),
+    // view modes
+    ("T", "toggle Miller / Tree view"),
+    ("D", "toggle database browser"),
+    ("Space", "toggle full-screen preview"),
+    (".", "show / hide dotfiles"),
+    // file operations
+    ("a", "create empty file"),
+    ("r", "rename selection (refresh in DB mode)"),
+    ("x / X", "trash / hard-delete with confirm"),
+    ("e", "open in $EDITOR"),
+    ("f", "recursive file finder"),
+    ("/", "filter current directory"),
+    // tree-mode sort
+    ("s / S", "cycle sort column forward / back (Tree mode)"),
+    ("R", "reverse sort direction (Tree mode)"),
+    // git
+    ("B", "branch overlay"),
+    ("i", "info panel"),
+    // misc
+    (":", "command palette"),
+    ("F5", "refresh"),
+    ("M", "toggle mouse capture (off = native copy)"),
+    ("O", "options — theme / behavior / connections"),
+];
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect, theme: &Theme) {
+    HelpModal::new(theme, " gfb ", HELP_LINES)
+        .with_banner_text("GFB")
+        .with_actions(vec![
+            ("Esc".into(), "close".into()),
+            ("?".into(), "toggle".into()),
+            ("q".into(), "quit".into()),
+        ])
+        .render(frame, area);
 }
 
 

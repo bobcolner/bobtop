@@ -5,16 +5,25 @@
 //! - Runtime search path: built-in → `~/.config/gtop/themes/` →
 //!   `~/.config/btop/themes/` (so existing btop users inherit their themes).
 //!
-//! The [`Theme`] struct is the *generic* toolkit theme — visual primitives
-//! every TUI app in the suite needs. Apps that need monitor-specific colors
-//! (CPU/MEM/NET gradients, process-modal slots) layer their own struct on
-//! top — see `gtop::monitor_theme::MonitorTheme` for the canonical
-//! example. The `.theme` parser stays generic; per-app overlays read
-//! whatever extra keys they need from the same `RawTheme`.
+//! The [`Theme`] struct carries every color and gradient any TUI app in
+//! the suite needs to render — both the generic chrome primitives
+//! (bg/fg/title/accent/divider/selected/panel-accents) AND the nine
+//! metric gradients (cpu/temp, memory split, network in/out, process)
+//! that btop themes define. Putting the gradients here means shared
+//! widgets like [`crate::widgets::HelpModal`] can use them and produce
+//! visually identical output across apps for a given theme.
+//!
+//! Apps that need a few extra app-specific solids (e.g. gtop's process-
+//! modal follow / pause backgrounds) layer their own struct on top —
+//! see `gtop::monitor_theme::MonitorTheme`. The `.theme` parser stays
+//! generic; per-app overlays read whatever extra keys they need from
+//! the same `RawTheme`.
 
 use std::path::PathBuf;
 
 use ratatui::style::Color;
+
+use crate::color::Gradient;
 
 pub mod builtin;
 pub mod parser;
@@ -51,6 +60,39 @@ pub struct Theme {
 
     /// Subdued accent — tree glyphs, subtle highlights. From btop `proc_misc`.
     pub accent_subtle: Color,
+
+    /// Metric gradients, mirroring btop's `<key>_start / <key>_mid /
+    /// <key>_end` triples. Any widget can reach these — `cpu` is the
+    /// "primary" gradient used by [`crate::widgets::HelpModal`] for
+    /// its banner so the look stays consistent across apps.
+    pub cpu: Gradient,
+    pub temp: Gradient,
+    pub used: Gradient,
+    pub available: Gradient,
+    pub cached: Gradient,
+    pub free: Gradient,
+    pub download: Gradient,
+    pub upload: Gradient,
+    pub process: Gradient,
+}
+
+impl Theme {
+    /// Semantic alias for `panel_accents[0]` — btop's `cpu_box`.
+    pub fn cpu_box(&self) -> Color {
+        self.panel_accents[0]
+    }
+    /// Semantic alias for `panel_accents[1]` — btop's `mem_box`.
+    pub fn mem_box(&self) -> Color {
+        self.panel_accents[1]
+    }
+    /// Semantic alias for `panel_accents[2]` — btop's `net_box`.
+    pub fn net_box(&self) -> Color {
+        self.panel_accents[2]
+    }
+    /// Semantic alias for `panel_accents[3]` — btop's `proc_box`.
+    pub fn proc_box(&self) -> Color {
+        self.panel_accents[3]
+    }
 }
 
 impl Theme {
@@ -75,6 +117,12 @@ impl Theme {
                 None => default,
             }
         };
+        let grad = |start: &str, mid: &str, end: &str, default: Gradient| -> Gradient {
+            let s = raw.get(start).and_then(|v| *v).unwrap_or(default.start);
+            let m = raw.get(mid).and_then(|v| *v).unwrap_or(default.mid);
+            let e = raw.get(end).and_then(|v| *v).unwrap_or(default.end);
+            Gradient::new(s, m, e)
+        };
 
         Self {
             name: name.into(),
@@ -95,6 +143,25 @@ impl Theme {
                 solid("proc_box", fb.panel_accents[3]),
             ],
             accent_subtle: solid("proc_misc", fb.accent_subtle),
+            cpu: grad("cpu_start", "cpu_mid", "cpu_end", fb.cpu),
+            temp: grad("temp_start", "temp_mid", "temp_end", fb.temp),
+            used: grad("used_start", "used_mid", "used_end", fb.used),
+            available: grad(
+                "available_start",
+                "available_mid",
+                "available_end",
+                fb.available,
+            ),
+            cached: grad("cached_start", "cached_mid", "cached_end", fb.cached),
+            free: grad("free_start", "free_mid", "free_end", fb.free),
+            download: grad(
+                "download_start",
+                "download_mid",
+                "download_end",
+                fb.download,
+            ),
+            upload: grad("upload_start", "upload_mid", "upload_end", fb.upload),
+            process: grad("process_start", "process_mid", "process_end", fb.process),
         }
     }
 
@@ -122,6 +189,51 @@ impl Theme {
                 rgb(0xff, 0x55, 0x55), // proc_box
             ],
             accent_subtle: rgb(0xbd, 0x93, 0xf9),
+            cpu: Gradient::new(
+                rgb(0x50, 0xfa, 0x7b),
+                rgb(0xf1, 0xfa, 0x8c),
+                rgb(0xff, 0x55, 0x55),
+            ),
+            temp: Gradient::new(
+                rgb(0x8b, 0xe9, 0xfd),
+                rgb(0xff, 0xb8, 0x6c),
+                rgb(0xff, 0x55, 0x55),
+            ),
+            used: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0xff, 0xb8, 0x6c),
+                rgb(0xff, 0x55, 0x55),
+            ),
+            available: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0xf1, 0xfa, 0x8c),
+                rgb(0x50, 0xfa, 0x7b),
+            ),
+            cached: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0x8b, 0xe9, 0xfd),
+                rgb(0xbd, 0x93, 0xf9),
+            ),
+            free: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0x8b, 0xe9, 0xfd),
+                rgb(0x50, 0xfa, 0x7b),
+            ),
+            download: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0xbd, 0x93, 0xf9),
+                rgb(0xff, 0x79, 0xc6),
+            ),
+            upload: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0xff, 0x79, 0xc6),
+                rgb(0xff, 0xb8, 0x6c),
+            ),
+            process: Gradient::new(
+                rgb(0x44, 0x47, 0x5a),
+                rgb(0xf1, 0xfa, 0x8c),
+                rgb(0x50, 0xfa, 0x7b),
+            ),
         }
     }
 }
@@ -155,6 +267,16 @@ pub fn downsample_theme_to_256(theme: &mut Theme) {
         *accent = conv(*accent);
     }
     theme.accent_subtle = conv(theme.accent_subtle);
+    let conv_grad = |g: Gradient| Gradient::new(conv(g.start), conv(g.mid), conv(g.end));
+    theme.cpu = conv_grad(theme.cpu);
+    theme.temp = conv_grad(theme.temp);
+    theme.used = conv_grad(theme.used);
+    theme.available = conv_grad(theme.available);
+    theme.cached = conv_grad(theme.cached);
+    theme.free = conv_grad(theme.free);
+    theme.download = conv_grad(theme.download);
+    theme.upload = conv_grad(theme.upload);
+    theme.process = conv_grad(theme.process);
 }
 
 /// Locate a theme by name. Search order: built-in → `~/.config/gtop/themes/`

@@ -155,10 +155,6 @@ pub(super) fn boxes_overlay_title() -> &'static str {
     " boxes — show/hide panels "
 }
 
-pub(super) fn options_overlay_title() -> &'static str {
-    " options "
-}
-
 pub(super) fn detail_title(d: &ProcessDetail) -> String {
     format!(" {} (pid {}) ", d.name, d.pid)
 }
@@ -170,9 +166,6 @@ pub(super) fn kill_title(req: &KillRequest) -> String {
     }
 }
 
-pub(super) fn help_title() -> &'static str {
-    " help — keybinds "
-}
 
 fn scope_segment(app: &App) -> String {
     match &app.selected_iface {

@@ -12,7 +12,9 @@ pub mod cli;
 pub mod sources;
 
 pub(crate) mod app;
+pub(crate) mod config;
 pub(crate) mod editor;
+pub(crate) mod options;
 pub(crate) mod find;
 pub(crate) mod fs;
 pub(crate) mod keys;

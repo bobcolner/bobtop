@@ -71,9 +71,10 @@ pub use keymap::{Scope, ScopeResult, ScopeStack};
 pub use util::{middle_anchor_scroll, Nav};
 pub use widgets::{
     ActionBar, BrailleGraph, BrailleText, BoxedPanel, ColumnDef, ConfirmDialog, CornerStyle,
-    DialogFooter, DualMode, EditableText, GraphStyle, GroupAggregate, LegendStyle, LiveTable,
-    Meter, MillerColumn, MillerColumns, MiniMeter, ModalShell, ScrollableText, SectionHeader,
-    SelectableList, SettingRow, SettingValue, SettingsForm, Sparkline, StackedBar,
-    StackedSegment, TableAlign, TableCell, TableEntry, TableRowExt, WidthSpec, Cell, Column,
-    Row, RowKind, Table, ToggleRow, Trace,
+    DialogFooter, DualMode, EditableText, GraphStyle, GroupAggregate, HelpModal, LegendStyle,
+    LiveTable, MenuOutcome, Meter, MillerColumn, MillerColumns, MiniMeter, ModalShell,
+    OptionsMenu, OptionsTab, ScrollableText, SectionHeader, SelectableList, SettingRow,
+    SettingValue, SettingsForm, Sparkline, StackedBar, StackedSegment, TabResult, TableAlign,
+    TableCell, TableEntry, TableRowExt, WidthSpec, Cell, Column, Row, RowKind, Table, ToggleRow,
+    Trace,
 };

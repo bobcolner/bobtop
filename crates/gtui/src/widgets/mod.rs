@@ -23,7 +23,10 @@ pub mod braille_graph;
 pub mod braille_text;
 pub mod confirm_dialog;
 pub mod meter;
+pub mod help_modal;
+pub mod keybind_footer;
 pub mod modal;
+pub mod options_menu;
 pub mod mini_meter;
 pub mod live_table;
 pub mod editable_text;
@@ -43,7 +46,9 @@ pub use braille_graph::{BrailleGraph, DualMode, GraphStyle, Trace, DEFAULT_DIM_F
 pub use braille_text::BrailleText;
 pub use confirm_dialog::{ConfirmDialog, DialogFooter};
 pub use meter::Meter;
+pub use help_modal::HelpModal;
 pub use modal::ModalShell;
+pub use options_menu::{MenuOutcome, OptionsMenu, OptionsTab, TabResult};
 pub use mini_meter::MiniMeter;
 pub use live_table::{
     cycle_sort_column, Align as TableAlign, Cell as TableCell, ColumnDef, GroupAggregate,

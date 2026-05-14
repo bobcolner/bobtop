@@ -1,7 +1,7 @@
 use crate::app::{KillRequest, ProcessDetail};
 use crate::options_editor::OptionsEditor;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UiState {
     /// `?` toggles the centered help overlay listing keybinds (B2).
     pub show_help: bool,

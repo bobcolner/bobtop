@@ -691,6 +691,16 @@ pub struct App {
     /// command runs once per dispatch, with the new state matching
     /// `self.mouse_capture`.
     pending_mouse_toggle: bool,
+    /// Active options menu (`O`). When `Some`, the modal grabs all
+    /// keys until commit or cancel.
+    pub(crate) options_menu: Option<gtui::widgets::OptionsMenu>,
+    /// Theme name that was active when the options modal opened, so
+    /// `Cancel` can revert any live preview the user did on the
+    /// theme tab.
+    pub(crate) options_original_theme: Option<String>,
+    /// `?` toggles a centered help / keybind reference overlay.
+    /// When `true`, the modal grabs all keys (any press closes it).
+    pub(crate) show_help: bool,
     show_hidden: bool,
     sort: SortMode,
     /// Per-directory cursor memory. Whenever we leave a directory we
@@ -1287,6 +1297,9 @@ impl App {
             pending_editor: None,
             mouse_capture: false,
             pending_mouse_toggle: false,
+            options_menu: None,
+            options_original_theme: None,
+            show_help: false,
             show_hidden: false,
             sort: SortMode::Name,
             cursor_memory: HashMap::new(),
@@ -1736,6 +1749,250 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Apply behavior fields from a freshly-loaded `Config`. Called
+    /// from `cli::run` after `new_with` so the construction path
+    /// stays minimal. Connection URLs aren't applied here — the CLI
+    /// layer owns the worker-spawn loop.
+    pub(crate) fn apply_initial_config(&mut self, cfg: &crate::config::Config) {
+        if let Some(b) = cfg.mouse_capture {
+            self.mouse_capture = b;
+        }
+        if let Some(b) = cfg.show_hidden {
+            self.show_hidden = b;
+        }
+        if let Some(s) = &cfg.sort {
+            self.sort = match s.as_str() {
+                "size" => SortMode::Size,
+                "mtime" | "modified" => SortMode::Mtime,
+                _ => SortMode::Name,
+            };
+        }
+    }
+
+    // ── Options menu ──────────────────────────────────────────────────────
+
+    pub fn mouse_capture_enabled(&self) -> bool {
+        self.mouse_capture
+    }
+
+    pub fn is_help_active(&self) -> bool {
+        self.show_help
+    }
+
+    pub(crate) fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    pub(crate) fn close_help(&mut self) {
+        self.show_help = false;
+    }
+
+    pub fn is_options_active(&self) -> bool {
+        self.options_menu.is_some()
+    }
+
+    pub fn options_menu(&self) -> Option<&gtui::widgets::OptionsMenu> {
+        self.options_menu.as_ref()
+    }
+
+    /// Open the modal options menu populated from current App state +
+    /// the on-disk config (used for connection list seeding).
+    pub(crate) fn open_options(&mut self) {
+        use crate::options::{BehaviorTab, BehaviorValues, ConnectionsTab, ThemeTab};
+        use gtui::widgets::{OptionsMenu, OptionsTab};
+
+        let theme_name = self.theme.name.clone();
+        let theme_tab = ThemeTab::new(&theme_name);
+        let behavior_tab = BehaviorTab::new(BehaviorValues {
+            mouse_capture: self.mouse_capture,
+            show_hidden: self.show_hidden,
+            sort: self.sort,
+        });
+        let existing: Vec<String> = self
+            .connections
+            .iter()
+            .map(|c| c.endpoint_label().to_string())
+            .collect();
+        let connections_tab = ConnectionsTab::new(existing);
+
+        let tabs: Vec<Box<dyn OptionsTab>> = vec![
+            Box::new(theme_tab),
+            Box::new(behavior_tab),
+            Box::new(connections_tab),
+        ];
+        let menu = OptionsMenu::new(" options ", tabs).with_size(64, 22);
+        self.options_menu = Some(menu);
+        self.options_original_theme = Some(theme_name);
+    }
+
+    pub(crate) fn close_options(&mut self) {
+        self.options_menu = None;
+        self.options_original_theme = None;
+    }
+
+    /// Dispatch a key to the options menu and react to its outcome.
+    /// Returns whether the menu is still open.
+    pub(crate) fn handle_options_key(&mut self, key: crossterm::event::KeyEvent) {
+        use gtui::widgets::MenuOutcome;
+        let Some(menu) = self.options_menu.as_mut() else { return };
+        let outcome = menu.handle_key(key);
+        // After every key, sync the theme preview from whatever the
+        // theme tab currently has selected. Cheap — load_theme is just
+        // a hashmap lookup and a few color reads.
+        self.sync_theme_preview();
+        // Drain any pending connection add staged by the tab. We do
+        // it here (not in the event loop) so the work happens before
+        // the next render and the new entry shows up in the list.
+        self.drain_pending_connection_add();
+
+        match outcome {
+            MenuOutcome::Stay => {}
+            MenuOutcome::Cancel => {
+                self.cancel_options();
+            }
+            MenuOutcome::Commit => {
+                self.commit_options();
+            }
+        }
+    }
+
+    fn sync_theme_preview(&mut self) {
+        let Some(menu) = self.options_menu.as_ref() else { return };
+        let Some(tab) = menu.active_tab() else { return };
+        // Best-effort: only the theme tab exposes a current selection
+        // we care about. We can't downcast through dyn OptionsTab, so
+        // inspect by title — pluggable trait keeps tab types in this
+        // crate so the comparison is stable.
+        if tab.title() != "theme" {
+            return;
+        }
+        // Re-walk the tabs to find the typed theme tab without dyn
+        // downcasting: we built the menu so we know index 0 is theme.
+        let tab_ref = match menu.tabs().first() {
+            Some(t) => t,
+            None => return,
+        };
+        // Use the trait method through a downcast-by-known-shape: we
+        // also expose the typed theme tab via a tiny adapter. Cheap
+        // workaround for not adding `Any` to the trait surface.
+        let preview = crate::options::infer_theme_selection(tab_ref.as_ref());
+        if let Some(name) = preview {
+            if name != self.theme.name {
+                self.theme = gtui::load_theme(&name);
+            }
+        }
+    }
+
+    fn drain_pending_connection_add(&mut self) {
+        // Pull the URL out under a short borrow so we can then call
+        // `self.flash_status` / `self.reload_db_catalog` without
+        // overlapping it.
+        let url = {
+            let Some(menu) = self.options_menu.as_mut() else { return };
+            let Some(tab) = menu.tabs_mut().get_mut(2) else { return };
+            match crate::options::take_pending_add(tab.as_mut()) {
+                Some(u) => u,
+                None => return,
+            }
+        };
+        // Spawn synchronously; ConnectionWorker::spawn already blocks
+        // on the worker's open result and returns Err on connect
+        // failure, which matches the UX we want here.
+        match crate::sources::ConnectionWorker::spawn(url.clone(), None, false) {
+            Ok(worker) => {
+                self.connections.push(worker);
+                self.flash_status(format!("connected: {url}"));
+                if let Some(menu) = self.options_menu.as_mut() {
+                    if let Some(tab) = menu.tabs_mut().get_mut(2) {
+                        crate::options::finalize_add_on_tab(tab.as_mut(), url);
+                    }
+                }
+                self.reload_db_catalog();
+            }
+            Err(e) => {
+                let msg = format!("connect failed: {e}");
+                self.flash_status(msg.clone());
+                if let Some(menu) = self.options_menu.as_mut() {
+                    if let Some(tab) = menu.tabs_mut().get_mut(2) {
+                        crate::options::set_tab_error(tab.as_mut(), msg);
+                    }
+                }
+            }
+        }
+    }
+
+    fn cancel_options(&mut self) {
+        if let Some(name) = self.options_original_theme.clone() {
+            if name != self.theme.name {
+                self.theme = gtui::load_theme(&name);
+            }
+        }
+        self.flash_status("options cancelled");
+        self.close_options();
+    }
+
+    fn commit_options(&mut self) {
+        let Some(menu) = self.options_menu.as_ref() else { return };
+        // Pull values via the same shape-based adapter used for the
+        // theme preview, then close the menu before applying so any
+        // status flashes / refreshes operate against the post-menu
+        // App state.
+        let theme_name = menu
+            .tabs()
+            .first()
+            .and_then(|t| crate::options::infer_theme_selection(t.as_ref()))
+            .unwrap_or_else(|| self.theme.name.clone());
+        let behavior = menu
+            .tabs()
+            .get(1)
+            .and_then(|t| crate::options::infer_behavior_values(t.as_ref()));
+        let connections = menu
+            .tabs()
+            .get(2)
+            .map(|t| crate::options::finalize_connections_from_tab(t.as_ref()))
+            .unwrap_or_default();
+        self.close_options();
+
+        // Apply behavior changes.
+        if let Some(values) = behavior {
+            if values.mouse_capture != self.mouse_capture {
+                self.mouse_capture = values.mouse_capture;
+                self.pending_mouse_toggle = true;
+            }
+            if values.show_hidden != self.show_hidden {
+                self.show_hidden = values.show_hidden;
+            }
+            if values.sort != self.sort {
+                self.sort = values.sort;
+            }
+            // Re-scan so the new sort / hidden setting is visible.
+            let _ = self.refresh();
+        }
+
+        // Theme is already live (sync_theme_preview kept it in sync).
+        // Just ensure it matches the final commit value.
+        if theme_name != self.theme.name {
+            self.theme = gtui::load_theme(&theme_name);
+        }
+
+        // Persist to disk.
+        let config = crate::config::Config {
+            theme: Some(theme_name),
+            mouse_capture: Some(self.mouse_capture),
+            show_hidden: Some(self.show_hidden),
+            sort: Some(match self.sort {
+                SortMode::Name => "name".into(),
+                SortMode::Size => "size".into(),
+                SortMode::Mtime => "mtime".into(),
+            }),
+            connections,
+        };
+        match crate::config::save(&config) {
+            Ok(p) => self.flash_status(format!("saved {}", p.display())),
+            Err(e) => self.flash_status(format!("save failed: {e}")),
         }
     }
 
@@ -2709,7 +2966,9 @@ impl App {
             Action::Noop
             | Action::StartCommandPalette
             | Action::ToggleDatabaseMode
-            | Action::ToggleMouseCapture => {}
+            | Action::ToggleMouseCapture
+            | Action::OpenOptions
+            | Action::ToggleHelp => {}
         }
         if self.tree_state.nav.cursor != prior_cursor {
             self.request_tree_preview();
@@ -2827,6 +3086,14 @@ impl App {
         }
         if matches!(action, Action::StartCommandPalette) {
             self.command_palette = Some(CommandPaletteState::default());
+            return false;
+        }
+        if matches!(action, Action::OpenOptions) {
+            self.open_options();
+            return false;
+        }
+        if matches!(action, Action::ToggleHelp) {
+            self.toggle_help();
             return false;
         }
         if matches!(action, Action::ToggleMouseCapture) {
@@ -3066,7 +3333,9 @@ impl App {
             | Action::TreeReverseSort
             | Action::StartCommandPalette
             | Action::ToggleDatabaseMode
-            | Action::ToggleMouseCapture => {}
+            | Action::ToggleMouseCapture
+            | Action::OpenOptions
+            | Action::ToggleHelp => {}
             Action::Noop => {}
         }
         // Any movement / refresh / cd may have changed the selected
@@ -3757,6 +4026,22 @@ impl App {
                                 return Ok(());
                             }
                             self.handle_finder_key(key);
+                        } else if self.is_help_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            // Any key closes the help overlay — matches
+                            // gtop's behavior and avoids special-casing.
+                            self.close_help();
+                        } else if self.is_options_active() {
+                            if matches!(key.code, KeyCode::Char('c'))
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                return Ok(());
+                            }
+                            self.handle_options_key(key);
                         } else if self.is_filter_input() {
                             self.handle_filter_key(key);
                         } else if self.is_branch_overlay_active() {

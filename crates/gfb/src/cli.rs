@@ -81,6 +81,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     //      trips from gtop, or repeated standalone launches).
     //   3. No arg + no persisted state → $PWD.
     let persisted = state::load();
+    let user_cfg = crate::config::load();
     let start = cli
         .path
         .or_else(|| {
@@ -90,7 +91,19 @@ pub fn run(args: Vec<String>) -> Result<()> {
                 .filter(|p| p.is_dir())
         })
         .map_or_else(|| std::env::current_dir(), Ok)?;
-    let theme = load_theme(&cli.theme);
+    // Theme precedence: CLI (if it diverges from the built-in default)
+    // beats the saved config; config beats the default. This means a
+    // user who picks a theme via the options menu will see it on the
+    // next launch without having to also pass `--theme`.
+    let theme_name = if cli.theme != DEFAULT_THEME_NAME {
+        cli.theme.clone()
+    } else {
+        user_cfg
+            .theme
+            .clone()
+            .unwrap_or_else(|| DEFAULT_THEME_NAME.to_string())
+    };
+    let theme = load_theme(&theme_name);
     let backend = match cli.image_backend.as_str() {
         "native" => ImageBackendChoice::Native,
         "sextant" => ImageBackendChoice::Sextant,
@@ -98,11 +111,19 @@ pub fn run(args: Vec<String>) -> Result<()> {
     };
 
     // ENV fallback: if no --connect flags were given, check GFB_CONNECT
-    // (space-separated URLs) and GFB_DUCKLAKE_* for auto-connect.
+    // (space-separated URLs); then config-saved connections; finally
+    // GFB_DUCKLAKE_* for auto-connect.
     if cli.connections.is_empty() {
         if let Ok(env) = std::env::var("GFB_CONNECT") {
             cli.connections = env.split_whitespace().map(String::from).collect();
         }
+    }
+    if cli.connections.is_empty() && !user_cfg.connections.is_empty() {
+        cli.connections = user_cfg
+            .connections
+            .iter()
+            .map(|c| c.url.clone())
+            .collect();
     }
     if cli.ducklake_catalog.is_none() {
         cli.ducklake_catalog = std::env::var("GFB_DUCKLAKE_CATALOG").ok();
@@ -144,6 +165,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     }
 
     let mut app = App::new_with(start, theme, backend, connections)?;
+    app.apply_initial_config(&user_cfg);
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
@@ -152,8 +174,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // gtop does the same. Wheel scroll still scrolls the focused
     // pane in most modern terminals via alternate-scroll mode, which
     // synthesises arrow keys. Users who want pane-aware wheel scroll
-    // can re-enable capture with `M` at runtime.
+    // can re-enable capture with `M` at runtime, or persist the
+    // preference via the options menu.
     execute!(stdout, EnterAlternateScreen, SetTitle("gfb"))?;
+    if app.mouse_capture_enabled() {
+        use crossterm::event::EnableMouseCapture;
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
