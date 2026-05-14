@@ -49,6 +49,7 @@ pub mod layout;
 pub mod prelude;
 pub mod theme;
 pub mod text;
+pub mod terminal;
 pub mod tree;
 pub mod util;
 pub mod widgets;
@@ -67,6 +68,7 @@ pub use text::{
     bool_label, display_width, format_bytes, format_bytes_compact, format_rate, sanitize_for_display,
     truncate_chars, write_str_at, write_str_clipped,
 };
+pub use terminal::{TerminalPane, TerminalSession};
 pub use keymap::{Scope, ScopeResult, ScopeStack};
 pub use util::{middle_anchor_scroll, Nav};
 pub use widgets::{

@@ -744,6 +744,9 @@ pub struct App {
     /// Default Medium; Hidden collapses the pane entirely so the
     /// list/parent get more horizontal room.
     preview_size: PreviewSize,
+    /// PTY-backed shell hosted in the right preview pane while active.
+    terminal: Option<gtui::TerminalSession>,
+    terminal_scroll: usize,
     /// Inclusive-exclusive x range of the side preview pane, recorded
     /// by the renderer. Used to dispatch mouse-wheel events to the
     /// pane the cursor is over.
@@ -1318,6 +1321,8 @@ impl App {
             focus: Focus::List,
             full_preview: false,
             preview_size: PreviewSize::Medium,
+            terminal: None,
+            terminal_scroll: 0,
             preview_pane_x_start: 0,
             preview_pane_x_end: 0,
             jump_pending: false,
@@ -2095,6 +2100,71 @@ impl App {
         self.preview_size
     }
 
+    pub fn terminal(&self) -> Option<&gtui::TerminalSession> {
+        self.terminal.as_ref()
+    }
+
+    pub fn terminal_scroll(&self) -> usize {
+        self.terminal_scroll
+    }
+
+    pub fn is_terminal_active(&self) -> bool {
+        self.terminal.is_some()
+    }
+
+    fn toggle_terminal(&mut self) {
+        if self.terminal.take().is_some() {
+            self.terminal_scroll = 0;
+            self.flash_status("terminal closed");
+            return;
+        }
+        let rows = self.preview_viewport_h.max(1) as u16;
+        let cols = self
+            .preview_pane_x_end
+            .saturating_sub(self.preview_pane_x_start)
+            .saturating_sub(2)
+            .max(1);
+        match gtui::TerminalSession::spawn(&self.cwd, rows, cols) {
+            Ok(session) => {
+                self.terminal = Some(session);
+                self.terminal_scroll = 0;
+                if matches!(self.preview_size, PreviewSize::Hidden | PreviewSize::Small) {
+                    self.preview_size = PreviewSize::Medium;
+                }
+                self.flash_status("terminal opened");
+            }
+            Err(e) => self.flash_status(format!("terminal: {e}")),
+        }
+    }
+
+    fn drain_terminal(&mut self) -> bool {
+        let Some(term) = self.terminal.as_mut() else {
+            return false;
+        };
+        let dirty = term.drain();
+        if dirty {
+            self.terminal_scroll = term.line_count().saturating_sub(self.preview_viewport_h);
+        }
+        dirty
+    }
+
+    fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        if let Some(term) = self.terminal.as_mut() {
+            term.resize(rows, cols);
+        }
+    }
+
+    pub(crate) fn handle_terminal_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(key.code, KeyCode::Char('t')) && key.modifiers.is_empty() {
+            self.toggle_terminal();
+            return false;
+        }
+        if let Some(term) = self.terminal.as_mut() {
+            term.send_key(key);
+        }
+        false
+    }
+
     pub fn image_backend(&self) -> ImageBackend {
         self.image_backend
     }
@@ -2259,7 +2329,13 @@ impl App {
             && column < self.preview_pane_x_end
             && self.preview_pane_x_end > self.preview_pane_x_start;
         if in_preview {
-            self.scroll_preview(delta);
+            if let Some(term) = self.terminal.as_ref() {
+                let max_top = term.line_count().saturating_sub(1);
+                let next = self.terminal_scroll as isize + delta;
+                self.terminal_scroll = next.clamp(0, max_top as isize) as usize;
+            } else {
+                self.scroll_preview(delta);
+            }
         } else {
             self.move_list_cursor(delta);
         }
@@ -2946,6 +3022,9 @@ impl App {
                 // Already handled in the outer dispatcher. Defensive
                 // no-op here.
             }
+            Action::ToggleTerminal => {
+                // Already handled in the outer dispatcher.
+            }
             // File-ops (Trash / HardDelete / Rename / Touch) currently
             // route through the miller-mode entries vector. Supporting
             // them in tree mode requires the modal flow to read from
@@ -3082,6 +3161,10 @@ impl App {
                 ViewMode::Table | ViewMode::Database => ViewMode::Miller,
             };
             self.request_preview_for_active_mode();
+            return false;
+        }
+        if matches!(action, Action::ToggleTerminal) {
+            self.toggle_terminal();
             return false;
         }
         if matches!(action, Action::StartCommandPalette) {
@@ -3328,6 +3411,7 @@ impl App {
                 return false;
             }
             Action::ToggleViewMode
+            | Action::ToggleTerminal
             | Action::TreeCycleSortNext
             | Action::TreeCycleSortPrev
             | Action::TreeReverseSort
@@ -3920,6 +4004,7 @@ impl App {
             let _ = self.drain_query_results();
             let _ = self.drain_dir_info();
             let _ = self.drain_git_scan();
+            let _ = self.drain_terminal();
             if self.drain_fs_events() {
                 // The 120 ms event-poll tick acts as natural debounce
                 // — a burst of inotify events (cargo build can fire
@@ -3964,6 +4049,7 @@ impl App {
                 if let Some(p) = rects.get(2) {
                     self.preview_pane_x_start = p.x;
                     self.preview_pane_x_end = p.x.saturating_add(p.width);
+                    self.resize_terminal(p.height.saturating_sub(4), p.width.saturating_sub(2));
                 }
                 ui::draw(self, frame, &self.theme);
             })?;
@@ -4042,6 +4128,10 @@ impl App {
                                 return Ok(());
                             }
                             self.handle_options_key(key);
+                        } else if self.is_terminal_active() {
+                            if self.handle_terminal_key(key) {
+                                return Ok(());
+                            }
                         } else if self.is_filter_input() {
                             self.handle_filter_key(key);
                         } else if self.is_branch_overlay_active() {

@@ -47,6 +47,8 @@ pub enum Action {
     PreviewNarrower,
     /// Grow the preview pane one step (Hidden → Small → Medium → Large).
     PreviewWider,
+    /// Open / close the right preview pane terminal (`t`).
+    ToggleTerminal,
     /// Flip between Miller and Tree view modes (`T`). Each mode
     /// keeps its own cursor/sort state so toggling is non-destructive.
     ToggleViewMode,
@@ -117,8 +119,11 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char(']') => Action::PreviewWider,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::PageUp => Action::PageUp,
+        // Right-pane terminal. Lowercase `t` keeps Shift-T reserved
+        // for the long-standing Miller/Tree view toggle.
+        KeyCode::Char('t') => Action::ToggleTerminal,
         // View mode toggle. `T` is unbound in miller mode today and
-        // unique enough to not collide with anything muscle memory.
+        // current directory is always one keystroke from a shell.
         KeyCode::Char('T') => Action::ToggleViewMode,
         KeyCode::Char('D') => Action::ToggleDatabaseMode,
         // Tree-mode-only sort cycling. `s` / `S` advance / step back

@@ -9,7 +9,8 @@ use std::time::SystemTime;
 
 use gtui::{
     format_bytes_compact, ActionBar, BoxedPanel, Cell, Column, ConfirmDialog, EditableText,
-    HelpModal, MillerColumn, MillerColumns, ModalShell, Row, ScrollableText, Table, Theme,
+    HelpModal, MillerColumn, MillerColumns, ModalShell, Row, ScrollableText, Table, TerminalPane,
+    Theme,
 };
 use image::GenericImageView;
 use ratatui::layout::Rect;
@@ -129,6 +130,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Tab", "toggle focus between list and preview"),
     ("[ / ]", "shrink / grow preview pane"),
     // view modes
+    ("t", "open / close terminal pane"),
     ("T", "toggle Miller / Tree view"),
     ("D", "toggle database browser"),
     ("Space", "toggle full-screen preview"),
@@ -940,6 +942,15 @@ fn draw_parent_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect)
 
 fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(term) = app.terminal() {
+        let pane = TerminalPane::new(term, theme)
+            .with_title(format!("terminal · {}", app.cwd_display()))
+            .with_controls("t close  ·  shell keys pass through")
+            .with_accent(theme.panel_accents[3])
+            .with_scroll(app.terminal_scroll());
+        frame.render_widget(pane, area);
         return;
     }
     // Editor takes over the preview pane when active *and* not in

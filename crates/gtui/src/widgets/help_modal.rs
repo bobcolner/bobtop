@@ -16,8 +16,9 @@
 //!
 //! Sizing is auto: width fits the longest line (or banner) within
 //! `[min_width, area.width-4]`; height fits banner + lines + footer
-//! within `[8, area.height-2]`. Lines past the visible row count
-//! truncate — they aren't scrollable today.
+//! within `[8, area.height-2]`. When a single vertical list would
+//! truncate and the modal is wide enough, entries flow into two
+//! side-by-side key/description columns.
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -119,7 +120,8 @@ impl<'a> HelpModal<'a> {
             .max()
             .unwrap_or(40);
         let banner_intrinsic_w = banner.map(|b| b.intrinsic_width()).unwrap_or(0);
-        let natural_w: u16 = longest_line.max(banner_intrinsic_w + 4) + 4;
+        let two_col_w = longest_line.saturating_mul(2).saturating_add(8);
+        let natural_w: u16 = longest_line.max(banner_intrinsic_w + 4).max(two_col_w) + 4;
         let max_w = area.width.saturating_sub(4).max(self.min_width);
         let want_w = natural_w.max(self.min_width).min(max_w);
 
@@ -175,37 +177,68 @@ impl<'a> HelpModal<'a> {
             body.y + 1
         };
 
-        // ── Lines.
-        let desc_x = body.x + 2 + key_w + 2;
-        let desc_w = body
-            .x
-            .saturating_add(body.width)
-            .saturating_sub(desc_x)
-            .saturating_sub(2);
         let lines_avail = body
             .y
             .saturating_add(body.height)
             .saturating_sub(key_rows_y)
             .saturating_sub(footer_block_h) as usize;
+        let single_desc_x = body.x + 2 + key_w + 2;
+        let single_desc_w = body
+            .x
+            .saturating_add(body.width)
+            .saturating_sub(single_desc_x)
+            .saturating_sub(2);
         let buf = frame.buffer_mut();
-        for (i, (key, desc)) in self.lines.iter().take(lines_avail).enumerate() {
-            let row_y = key_rows_y + i as u16;
-            write_str_clipped(
-                buf,
-                body.x + 2,
-                row_y,
-                key,
-                key_w,
-                Style::default().bg(bg).fg(self.theme.hi_fg),
-            );
-            write_str_clipped(
-                buf,
-                desc_x,
-                row_y,
-                desc,
-                desc_w,
-                Style::default().bg(bg).fg(self.theme.main_fg),
-            );
+        let can_two_col = self.lines.len() > lines_avail
+            && body.width >= two_col_w.min(area.width.saturating_sub(4));
+        if can_two_col {
+            let col_gap = 4;
+            let col_w = body.width.saturating_sub(4 + col_gap) / 2;
+            let rows_per_col = lines_avail.max(1);
+            for (i, (key, desc)) in self.lines.iter().take(rows_per_col * 2).enumerate() {
+                let col = (i / rows_per_col) as u16;
+                let row = (i % rows_per_col) as u16;
+                let x = body.x + 2 + col * (col_w + col_gap);
+                let row_y = key_rows_y + row;
+                let desc_x = x + key_w + 2;
+                let desc_w = col_w.saturating_sub(key_w + 2);
+                write_str_clipped(
+                    buf,
+                    x,
+                    row_y,
+                    key,
+                    key_w,
+                    Style::default().bg(bg).fg(self.theme.hi_fg),
+                );
+                write_str_clipped(
+                    buf,
+                    desc_x,
+                    row_y,
+                    desc,
+                    desc_w,
+                    Style::default().bg(bg).fg(self.theme.main_fg),
+                );
+            }
+        } else {
+            for (i, (key, desc)) in self.lines.iter().take(lines_avail).enumerate() {
+                let row_y = key_rows_y + i as u16;
+                write_str_clipped(
+                    buf,
+                    body.x + 2,
+                    row_y,
+                    key,
+                    key_w,
+                    Style::default().bg(bg).fg(self.theme.hi_fg),
+                );
+                write_str_clipped(
+                    buf,
+                    single_desc_x,
+                    row_y,
+                    desc,
+                    single_desc_w,
+                    Style::default().bg(bg).fg(self.theme.main_fg),
+                );
+            }
         }
 
         // ── Footer chips. Mirror OptionsMenu's footer for visual parity.
