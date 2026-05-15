@@ -77,6 +77,10 @@ pub enum Action {
     OpenOptions,
     /// Toggle the help / keybind reference overlay (`?` key).
     ToggleHelp,
+    /// Toggle git-diff preview mode (`d` key). When on, files with a
+    /// pending git status render as their diff against HEAD instead of
+    /// their content; when off (default), files always render normally.
+    ToggleGitDiff,
     Noop,
 }
 
@@ -139,6 +143,7 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('M') => Action::ToggleMouseCapture,
         KeyCode::Char('O') => Action::OpenOptions,
         KeyCode::Char('?') => Action::ToggleHelp,
+        KeyCode::Char('d') => Action::ToggleGitDiff,
         _ => Action::Noop,
     }
 }

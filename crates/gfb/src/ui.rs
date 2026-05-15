@@ -147,6 +147,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("R", "reverse sort direction (Tree mode)"),
     // git
     ("B", "branch overlay"),
+    ("d", "toggle git diff preview for changed files"),
     ("i", "info panel"),
     // misc
     (":", "command palette"),

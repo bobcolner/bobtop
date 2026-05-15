@@ -357,6 +357,18 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// True for paths whose extension matches a known image format.
+/// Used to skip the git-diff preview path so binary files render as
+/// images (or fall through to the text/hex preview) instead of being
+/// dumped as `+`-prefixed lines.
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .map(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp"))
+        .unwrap_or(false)
+}
+
 /// Run `git diff HEAD -- <path>` and return colored lines for the preview pane.
 fn git_diff_lines(path: &Path, repo_root: &Path) -> Vec<ratatui::text::Line<'static>> {
     use ratatui::style::{Color, Modifier, Style};
@@ -873,6 +885,11 @@ pub struct App {
     pub(crate) git_scan_rx: mpsc::Receiver<GitScanResult>,
     /// Branch overlay (`B` key). `None` when closed.
     pub(crate) branch_overlay: Option<BranchOverlay>,
+    /// When true, files that have a pending git status render their
+    /// diff-against-HEAD instead of their content in the preview pane.
+    /// Toggled via the `d` keybind. Defaults to false so the preview
+    /// behaves the same as a non-git directory until the user opts in.
+    pub(crate) git_diff_enabled: bool,
 }
 
 /// Per-file git status (most-visible status wins when both staged and
@@ -1406,6 +1423,7 @@ impl App {
             git_scan_tx: { let (tx, _) = mpsc::channel(); tx },
             git_scan_rx: { let (_, rx) = mpsc::channel(); rx },
             branch_overlay: None,
+            git_diff_enabled: false,
         };
         // Real channel pairs (the placeholders above get dropped
         // immediately). Keeping the struct-init shape simple — the
@@ -3124,6 +3142,10 @@ impl App {
                 self.open_branch_overlay();
                 return false;
             }
+            Action::ToggleGitDiff => {
+                self.toggle_git_diff();
+                return false;
+            }
             Action::Noop
             | Action::StartCommandPalette
             | Action::ToggleDatabaseMode
@@ -3135,6 +3157,26 @@ impl App {
             self.request_tree_preview();
         }
         false
+    }
+
+    /// Flip git-diff preview mode and rebuild the preview for the
+    /// currently-selected entry so the change is visible immediately.
+    /// Cache invalidation is targeted at the selected path only — other
+    /// cached previews stay valid because they were rendered under
+    /// whichever mode the user had at the time, which still matches
+    /// what they'd see if they re-selected the file in that mode.
+    fn toggle_git_diff(&mut self) {
+        self.git_diff_enabled = !self.git_diff_enabled;
+        let selected_path = self.selected().map(|e| e.path.clone());
+        if let Some(p) = &selected_path {
+            self.preview_cache.invalidate(p);
+        }
+        self.flash_status(if self.git_diff_enabled {
+            "git diff preview: on (d to toggle)".to_string()
+        } else {
+            "git diff preview: off".to_string()
+        });
+        self.request_preview();
     }
 
     fn request_preview(&mut self) {
@@ -3164,11 +3206,25 @@ impl App {
         self.preview_state = PreviewState::Loading(path.clone());
         let tx = self.preview_tx.clone();
 
-        // If the file has a git status, show the diff instead of file content.
-        let is_git_changed = !entry.is_dir()
-            && self.git.files.contains_key(&path)
-            && self.git.repo_root.is_some();
-        if is_git_changed {
+        // Git-diff preview is opt-in via the `d` keybind. When on,
+        // files with a pending git status render as their diff against
+        // HEAD instead of their content. Skipped for:
+        //   * Untracked / Added → no diff, falling back to "show whole
+        //     file as additions" loses syntax highlighting.
+        //   * Image-extension files → `git diff` is "Binary files
+        //     differ" or a useless whole-file fallback; the user wants
+        //     the image preview.
+        let want_diff = self.git_diff_enabled
+            && !entry.is_dir()
+            && self.git.repo_root.is_some()
+            && self
+                .git
+                .files
+                .get(&path)
+                .map(|s| !matches!(s, GitFileStatus::Untracked | GitFileStatus::Added))
+                .unwrap_or(false)
+            && !is_image_path(&path);
+        if want_diff {
             let repo_root = self.git.repo_root.clone().unwrap();
             let task_path = path.clone();
             self.rt.spawn_blocking(move || {
@@ -3490,6 +3546,10 @@ impl App {
             }
             Action::ToggleBranchOverlay => {
                 self.open_branch_overlay();
+                return false;
+            }
+            Action::ToggleGitDiff => {
+                self.toggle_git_diff();
                 return false;
             }
             Action::ToggleViewMode
@@ -4050,21 +4110,26 @@ impl App {
         if want == self.last_image_paint {
             return Ok(());
         }
+        // Tear down a previously-placed image when the selection
+        // changes — kitty images persist across redraws otherwise and
+        // would ghost over the new content.
+        if want != self.last_image_paint && self.last_image_paint.is_some() {
+            let _ = crate::preview::kitty::clear_all_images();
+        }
         if let Some((path, rect)) = &want {
-            let conf = viuer::Config {
-                x: rect.x,
-                y: rect.y as i16,
-                width: Some(rect.width as u32),
-                height: Some(rect.height as u32),
-                absolute_offset: true,
-                use_kitty: true,
-                use_iterm: true,
-                ..Default::default()
-            };
-            // print_from_file errors when the protocol isn't
-            // actually supported; we already gated on detect, but
-            // be defensive — drop on error rather than panic.
-            let _ = viuer::print_from_file(path, &conf);
+            // Direct kitty graphics emit. Bypasses viuer because viuer's
+            // runtime kitty-support query times out over SSH and falls
+            // back to text blocks — and when we tried forcing it via
+            // KITTY_WINDOW_ID, viuer picked "local" mode and tried to
+            // transmit by file path, which the local terminal can't
+            // reach across SSH.
+            let _ = crate::preview::kitty::paint_image_at(
+                path,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+            );
         }
         self.last_image_paint = want;
         Ok(())

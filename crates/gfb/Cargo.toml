@@ -41,6 +41,10 @@ pulldown-cmark = { version = "0.10", default-features = false }
 # actually browse — the full feature flag pulls TIFF/HDR/etc. that we
 # don't need and add ~1 MB to the binary.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+# Inline kitty graphics protocol emit (bypasses viuer when SSH'd from
+# Ghostty/kitty/WezTerm — viuer's runtime kitty-support query times
+# out and silently falls back to text blocks).
+base64 = "0.22"
 # Live refresh — watch the cwd so file changes show up without
 # manual `r`. We only need a "something changed" signal, so the
 # default backend (inotify on Linux, kqueue on macOS) is fine.

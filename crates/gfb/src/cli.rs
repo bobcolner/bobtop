@@ -34,7 +34,9 @@ pub struct Cli {
     #[arg(long, default_value = DEFAULT_THEME_NAME)]
     pub theme: String,
     /// Image preview backend. `auto` detects kitty/iTerm/sixel and
-    /// falls back to sextant blocks; `native` forces viuer; `sextant`
+    /// falls back to sextant blocks; `native` forces native bitmap
+    /// rendering (kitty graphics protocol — useful when SSH'd from
+    /// Ghostty/kitty/WezTerm and auto-detection times out); `sextant`
     /// forces our internal rasterizer.
     #[arg(long, value_parser = ["auto", "native", "sextant"], default_value = "auto")]
     pub image_backend: String,
@@ -109,6 +111,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "sextant" => ImageBackendChoice::Sextant,
         _ => ImageBackendChoice::Auto,
     };
+
 
     // ENV fallback: if no --connect flags were given, check GFB_CONNECT
     // (space-separated URLs); then config-saved connections; finally

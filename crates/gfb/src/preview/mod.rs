@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod highlight;
 pub mod image;
+pub mod kitty;
 pub mod markdown;
 pub mod text;
 

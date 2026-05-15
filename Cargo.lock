@@ -1381,6 +1381,7 @@ name = "gfb"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "duckdb",
