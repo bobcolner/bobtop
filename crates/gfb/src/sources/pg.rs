@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use tokio::runtime::Runtime;
 use tokio_postgres::{Client, NoTls};
 
-use super::db::{ColumnSpec, Connection, Database, Row, Schema, Table};
+use super::db::{ColumnSpec, Connection, Database, ModifiedKind, Row, Schema, Table, TableMeta};
 
 /// Holds a single-threaded Tokio runtime alongside the wire client.
 /// Trait methods are sync; each call `block_on`s the appropriate
@@ -213,6 +213,46 @@ impl Connection for PgConnection {
                     .collect(),
             })
             .collect())
+    }
+
+    fn table_metadata(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
+        if db != self.db_name {
+            return Ok(TableMeta::default());
+        }
+        let client = self.client.lock().expect("client mutex poisoned");
+        // pg_total_relation_size returns bytes including indexes/toast;
+        // reltuples is updated by VACUUM/ANALYZE; greatest()-of-stat
+        // timestamps gives "anything that's run on this table recently"
+        // which is the closest cheap proxy for "modified" (Postgres
+        // doesn't track table-level mtime directly).
+        let rows = self.block(client.query(
+            "SELECT \
+               GREATEST(c.reltuples::bigint, 0) AS rows, \
+               pg_total_relation_size(c.oid)::bigint AS bytes, \
+               EXTRACT(EPOCH FROM GREATEST( \
+                   s.last_vacuum, s.last_autovacuum, \
+                   s.last_analyze, s.last_autoanalyze))::bigint AS modified_epoch \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid \
+             WHERE c.relname = $1 AND n.nspname = $2",
+            &[&table, &schema],
+        )).context("query pg_class/pg_stat_all_tables for table_metadata")?;
+        let Some(r) = rows.first() else {
+            return Ok(TableMeta::default());
+        };
+        let row_count: i64 = r.try_get(0).unwrap_or(0);
+        let bytes: i64 = r.try_get(1).unwrap_or(0);
+        let modified_epoch: Option<i64> = r.try_get(2).ok();
+        let modified = modified_epoch
+            .filter(|&s| s > 0)
+            .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s as u64));
+        Ok(TableMeta {
+            row_count: if row_count > 0 { Some(row_count as u64) } else { None },
+            size_bytes: if bytes > 0 { Some(bytes as u64) } else { None },
+            modified,
+            modified_kind: ModifiedKind::Table,
+        })
     }
 
     fn approximate_row_count(&self, db: &str, schema: &str, table: &str) -> Option<u64> {

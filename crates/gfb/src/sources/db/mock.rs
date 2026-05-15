@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use super::{ColumnSpec, Connection, Database, Row, Schema, Table};
+use super::{ColumnSpec, Connection, Database, Row, Schema, Table, TableMeta};
 
 pub struct MockConnection {
     label: String,
@@ -267,5 +267,33 @@ impl Connection for MockConnection {
 
     fn drop_object(&self, _db: &str, _schema: &str, _table: Option<&str>, _cascade: bool) -> Result<()> {
         anyhow::bail!("mock connection does not support drop")
+    }
+
+    fn table_metadata(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
+        let Some(t) = self.find_table(db, schema, table) else {
+            return Ok(TableMeta::default());
+        };
+        let rows = t.rows.len() as u64;
+        // Pretend each row averages the byte width of the demo data.
+        let bytes: u64 = t.rows.iter()
+            .map(|r| r.iter().map(|c| c.len() as u64).sum::<u64>())
+            .sum();
+        // Stable demo "modified" derived from the table-name hash so
+        // rows render consistently between frames without storing real
+        // mtimes anywhere.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in table.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let secs_ago = h % (60 * 60 * 24 * 30); // up to 30 days ago
+        let modified = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(secs_ago));
+        Ok(TableMeta {
+            row_count: Some(rows),
+            size_bytes: if bytes > 0 { Some(bytes) } else { None },
+            modified,
+            modified_kind: super::ModifiedKind::Table,
+        })
     }
 }

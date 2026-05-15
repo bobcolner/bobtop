@@ -136,6 +136,18 @@ pub trait Connection {
         None
     }
 
+    /// Cheap catalog metadata for a single table — row count, on-disk
+    /// size, last-modified timestamp. All fields optional; backends
+    /// fill in what they can read without scanning. The default impl
+    /// just delegates to `approximate_row_count` so legacy backends
+    /// keep working.
+    fn table_metadata(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
+        Ok(TableMeta {
+            row_count: self.approximate_row_count(db, schema, table),
+            ..Default::default()
+        })
+    }
+
     /// Execute an arbitrary SQL statement and return the result set.
     /// Column names are returned separately so the renderer can label
     /// the table header without a schema lookup. Cells are stringified
@@ -185,6 +197,28 @@ pub struct ColumnSpec {
 #[derive(Debug, Clone)]
 pub struct Row {
     pub cells: Vec<String>,
+}
+
+/// Cheap catalog metadata used to annotate the table list in the
+/// Miller browser. Fields are independent — a backend may know rows
+/// but not size, etc. All async (worker thread) so the UI stays live.
+#[derive(Debug, Clone, Default)]
+pub struct TableMeta {
+    pub row_count: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub modified: Option<std::time::SystemTime>,
+    /// What the `modified` field actually measures. Lets the UI label
+    /// it honestly — "modified" for true per-table timestamps,
+    /// "db file mtime" for backends (DuckDB) that fall back to the
+    /// underlying file's mtime because they don't track per-table.
+    pub modified_kind: ModifiedKind,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModifiedKind {
+    #[default]
+    Table,
+    DbFile,
 }
 
 /// Resolve `target` to a concrete connection. `target` is the

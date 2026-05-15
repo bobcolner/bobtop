@@ -23,12 +23,12 @@ pub mod multi;
 pub(crate) mod worker;
 
 pub use db::{
-    open, ColumnSpec, Connection, Database, DuckLakeAttach, NodeData, NodeKind, NodePath, Row,
-    Schema, Table,
+    open, ColumnSpec, Connection, Database, DuckLakeAttach, ModifiedKind, NodeData, NodeKind,
+    NodePath, Row, Schema, Table, TableMeta,
 };
 pub use multi::{AnyNodeId, AnyRow};
 pub(crate) use multi::MultiRootCatalog;
-pub(crate) use worker::{ConnectionWorker, LoadResult};
+pub(crate) use worker::{ConnectionWorker, LoadResult, TableMetaResult};
 
 #[cfg(feature = "postgres")]
 pub mod pg;

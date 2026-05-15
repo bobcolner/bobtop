@@ -330,7 +330,7 @@ impl TableRowExt<FbCol> for TreeRow {
 /// Render an mtime as `YYYY-MM-DD HH:MM`. Defers to the system
 /// clock conversion path — fb already paid that cost in `text.rs`
 /// for the miller-mode list pane, so we do the same shape here.
-fn format_mtime(t: Option<SystemTime>) -> String {
+pub(crate) fn format_mtime(t: Option<SystemTime>) -> String {
     let Some(t) = t else { return String::new() };
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)

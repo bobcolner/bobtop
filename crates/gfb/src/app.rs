@@ -849,6 +849,13 @@ pub struct App {
     /// after each event tick (see `drain_db_loads`).
     pub(crate) db_load_tx: std::sync::mpsc::Sender<crate::sources::LoadResult>,
     pub(crate) db_load_rx: std::sync::mpsc::Receiver<crate::sources::LoadResult>,
+    /// Cache of per-table catalog metadata (rows / size / mtime). Same
+    /// async shape as `db_cache`: cache miss inserts `Loading`, dispatches
+    /// a worker request, and the main loop fills in the result via
+    /// `drain_db_meta_loads`.
+    pub(crate) db_meta_cache: std::cell::RefCell<std::collections::HashMap<crate::sources::NodePath, MetaState>>,
+    pub(crate) db_meta_tx: std::sync::mpsc::Sender<crate::sources::TableMetaResult>,
+    pub(crate) db_meta_rx: std::sync::mpsc::Receiver<crate::sources::TableMetaResult>,
     /// SQL query editor state. `Some` while the editor is open.
     pub(crate) query_editor: Option<QueryEditorState>,
     /// Reply channel for async query execution results.
@@ -1068,6 +1075,17 @@ pub(crate) fn db_item_from_path(
             table: path.table.clone().unwrap_or_default(),
         },
     }
+}
+
+/// State of one entry in the per-table metadata cache. Same shape as
+/// [`crate::sources::multi::ChildrenState`] — Loading → Ready/Failed
+/// once the worker reply lands.
+#[derive(Debug, Clone)]
+pub enum MetaState {
+    Loading,
+    Ready(crate::sources::TableMeta),
+    #[allow(dead_code)]
+    Failed(String),
 }
 
 /// Content of a directory info scan — loaded asynchronously.
@@ -1363,6 +1381,15 @@ impl App {
                 let (_, rx) = std::sync::mpsc::channel();
                 rx
             },
+            db_meta_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            db_meta_tx: {
+                let (tx, _) = std::sync::mpsc::channel();
+                tx
+            },
+            db_meta_rx: {
+                let (_, rx) = std::sync::mpsc::channel();
+                rx
+            },
             query_editor: None,
             query_result_tx: {
                 let (tx, _) = std::sync::mpsc::sync_channel(1);
@@ -1386,6 +1413,9 @@ impl App {
         let (load_tx, load_rx) = std::sync::mpsc::channel();
         app.db_load_tx = load_tx;
         app.db_load_rx = load_rx;
+        let (meta_tx, meta_rx) = std::sync::mpsc::channel();
+        app.db_meta_tx = meta_tx;
+        app.db_meta_rx = meta_rx;
         let (query_tx, query_rx) = std::sync::mpsc::sync_channel(1);
         app.query_result_tx = query_tx;
         app.query_result_rx = query_rx;
@@ -1457,6 +1487,12 @@ impl App {
         use crate::sources::multi::ChildrenState;
         let mut dirty = false;
         while let Ok(load) = self.db_load_rx.try_recv() {
+            // Note: per-table metadata fetches are *not* enqueued here.
+            // Doing so for a schema with N tables would saturate the
+            // single-threaded worker with N catalog queries before any
+            // user-initiated `columns()` / preview request could run,
+            // freezing the app on Enter. The renderer instead requests
+            // metadata only for visible rows (see `draw_db_level_pane`).
             let state = match load.result {
                 Ok(rows) => ChildrenState::Ready(rows),
                 Err(e) => {
@@ -1468,6 +1504,49 @@ impl App {
             dirty = true;
         }
         dirty
+    }
+
+    /// Drain any worker-thread `TableMetaResult`s that landed since the
+    /// last tick. Returns true when at least one result arrived so the
+    /// main loop knows to redraw the table-listing column.
+    pub(crate) fn drain_db_meta_loads(&mut self) -> bool {
+        let mut dirty = false;
+        while let Ok(res) = self.db_meta_rx.try_recv() {
+            let state = match res.result {
+                Ok(meta) => MetaState::Ready(meta),
+                Err(e) => MetaState::Failed(format!("{e:#}")),
+            };
+            self.db_meta_cache.borrow_mut().insert(res.path, state);
+            dirty = true;
+        }
+        dirty
+    }
+
+    /// Read-only view of the table-metadata cache for the renderer.
+    pub fn db_meta_cache(&self) -> &std::cell::RefCell<std::collections::HashMap<crate::sources::NodePath, MetaState>> {
+        &self.db_meta_cache
+    }
+
+    /// Cache miss → install `Loading` and dispatch a worker request.
+    /// Cache hit (any state) is a no-op. Safe to call from the
+    /// renderer for each visible row — the cache prevents duplicates.
+    pub fn ensure_table_meta_loaded(&self, path: crate::sources::NodePath) {
+        self.request_table_meta(path);
+    }
+
+    fn request_table_meta(&self, path: crate::sources::NodePath) {
+        {
+            let cache = self.db_meta_cache.borrow();
+            if cache.contains_key(&path) {
+                return;
+            }
+        }
+        self.db_meta_cache
+            .borrow_mut()
+            .insert(path.clone(), MetaState::Loading);
+        if let Some(conn) = self.connections.get(path.conn) {
+            conn.request_table_meta(path, self.db_meta_tx.clone());
+        }
     }
 
     pub fn db_preview(&self) -> Option<&DbPreview> {
@@ -2155,7 +2234,10 @@ impl App {
     }
 
     pub(crate) fn handle_terminal_key(&mut self, key: KeyEvent) -> bool {
-        if matches!(key.code, KeyCode::Char('t')) && key.modifiers.is_empty() {
+        let close = matches!(key.code, KeyCode::F(12))
+            || (matches!(key.code, KeyCode::Char('t'))
+                && key.modifiers.contains(KeyModifiers::CONTROL));
+        if close {
             self.toggle_terminal();
             return false;
         }
@@ -4001,6 +4083,7 @@ impl App {
             // unconditional `terminal.draw` below already happens
             // every tick so we don't need to gate on it.
             let _ = self.drain_db_loads();
+            let _ = self.drain_db_meta_loads();
             let _ = self.drain_query_results();
             let _ = self.drain_dir_info();
             let _ = self.drain_git_scan();

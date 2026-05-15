@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 
 use anyhow::Result;
 
-use super::db::{ColumnSpec, Connection, DuckLakeAttach, NodeData, NodeKind, NodePath, Row};
+use super::db::{ColumnSpec, Connection, DuckLakeAttach, NodeData, NodeKind, NodePath, Row, TableMeta};
 
 /// Result of an async children load. The catalog populates the
 /// cache in `Loading` state when it spawns the request; the main
@@ -33,6 +33,15 @@ use super::db::{ColumnSpec, Connection, DuckLakeAttach, NodeData, NodeKind, Node
 pub(crate) struct LoadResult {
     pub path: NodePath,
     pub result: Result<Vec<(NodePath, NodeData)>>,
+}
+
+/// Result of an async per-table metadata fetch. Carried back to the
+/// main loop so it can populate the metadata cache without blocking
+/// any keystroke. `path.level()` is always `NodeKind::Table` here.
+#[derive(Debug)]
+pub(crate) struct TableMetaResult {
+    pub path: NodePath,
+    pub result: Result<TableMeta>,
 }
 
 /// Result of an async SQL query execution.
@@ -69,6 +78,10 @@ enum Request {
         schema: String,
         table: String,
         reply: mpsc::Sender<Option<u64>>,
+    },
+    TableMetaAsync {
+        path: NodePath,
+        reply: mpsc::Sender<TableMetaResult>,
     },
     DropObject {
         db: String,
@@ -191,6 +204,13 @@ impl ConnectionWorker {
         let _ = self.tx.send(Request::ExecQuery { sql, gen, reply });
     }
 
+    /// Async per-table metadata fetch (rows / size / mtime). Caller
+    /// receives a `TableMetaResult` on `reply` once the worker runs
+    /// the catalog query. `path.level()` must be `NodeKind::Table`.
+    pub fn request_table_meta(&self, path: NodePath, reply: mpsc::Sender<TableMetaResult>) {
+        let _ = self.tx.send(Request::TableMetaAsync { path, reply });
+    }
+
     /// Sync preview-rows fetch, same blocking shape as `columns`.
     #[allow(dead_code)]
     pub fn preview_rows(
@@ -262,6 +282,13 @@ fn worker_main(
             }
             Request::RowCount { db, schema, table, reply } => {
                 let _ = reply.send(conn.approximate_row_count(&db, &schema, &table));
+            }
+            Request::TableMetaAsync { path, reply } => {
+                let result = match (path.database.as_deref(), path.schema.as_deref(), path.table.as_deref()) {
+                    (Some(db), Some(schema), Some(table)) => conn.table_metadata(db, schema, table),
+                    _ => Ok(super::db::TableMeta::default()),
+                };
+                let _ = reply.send(TableMetaResult { path, result });
             }
             Request::DropObject { db, schema, table, cascade, reply } => {
                 let _ = reply.send(conn.drop_object(&db, &schema, table.as_deref(), cascade));

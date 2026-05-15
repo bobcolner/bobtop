@@ -433,7 +433,7 @@ fn draw_db_mode(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
     if app.is_query_editor_active() {
         draw_query_pane(app, frame, theme, rects[2]);
     } else if let Some(preview) = app.db_preview() {
-        draw_db_preview(preview, frame, theme, rects[2]);
+        draw_db_preview(app, preview, frame, theme, rects[2]);
     } else {
         draw_db_next_level_preview(app, frame, theme, rects[2]);
     }
@@ -482,6 +482,7 @@ fn draw_db_level_pane(
     if inner.height == 0 || items.is_empty() {
         return;
     }
+
     let cols = vec![Column::new("", u16::MAX)];
     let rows: Vec<Row<'static>> = items
         .iter()
@@ -947,7 +948,7 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
     if let Some(term) = app.terminal() {
         let pane = TerminalPane::new(term, theme)
             .with_title(format!("terminal · {}", app.cwd_display()))
-            .with_controls("t close  ·  shell keys pass through")
+            .with_controls("Ctrl-T / F12 close  ·  shell keys pass through")
             .with_accent(theme.panel_accents[3])
             .with_scroll(app.terminal_scroll());
         frame.render_widget(pane, area);
@@ -964,7 +965,7 @@ fn draw_preview_pane(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect
     // databases / schemas don't have a row preview, so the panel
     // just shows a hint.
     if let Some(preview) = app.db_preview() {
-        draw_db_preview(preview, frame, theme, area);
+        draw_db_preview(app, preview, frame, theme, area);
         return;
     }
     let preview_title = app
@@ -1753,12 +1754,61 @@ fn format_relative_mtime(t: Option<SystemTime>) -> String {
     }
 }
 
+/// Build the dim-styled info line shown above the schema sub-box:
+/// `rows: 1.2K   size: 4.2 MB   modified: 2026-05-12 14:23`. Empty
+/// when no metadata fields are populated (so the schema sub-box gets
+/// the full vertical space). Shows `loading…` when the async fetch
+/// is still in flight so the user knows something is on its way.
+fn build_db_info_spans<'a>(
+    meta: Option<&crate::sources::TableMeta>,
+    fallback_rows: Option<u64>,
+    loading: bool,
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    use ratatui::style::Modifier;
+    let label = Style::default().fg(theme.title).add_modifier(Modifier::BOLD);
+    let value = Style::default().fg(theme.main_fg);
+    let dim = Style::default().fg(theme.main_fg).add_modifier(Modifier::DIM);
+
+    let mut pairs: Vec<(&'static str, String)> = Vec::new();
+    let row_count = meta.and_then(|m| m.row_count).or(fallback_rows);
+    if let Some(n) = row_count {
+        pairs.push(("rows", format_count(n)));
+    }
+    if let Some(b) = meta.and_then(|m| m.size_bytes) {
+        pairs.push(("size", format_bytes_compact(b)));
+    }
+    if let Some(ts) = meta.and_then(|m| m.modified) {
+        let label = match meta.map(|m| m.modified_kind) {
+            Some(crate::sources::ModifiedKind::DbFile) => "db file mtime",
+            _ => "modified",
+        };
+        pairs.push((label, crate::tree::format_mtime(Some(ts))));
+    }
+    if pairs.is_empty() {
+        if loading {
+            return vec![Span::styled("  loading metadata…", dim)];
+        }
+        return Vec::new();
+    }
+    let mut spans: Vec<Span<'a>> = vec![Span::raw("  ")];
+    for (i, (k, v)) in pairs.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("   ", dim));
+        }
+        spans.push(Span::styled(format!("{k}: "), label));
+        spans.push(Span::styled(v, value));
+    }
+    spans
+}
+
 /// Schema preview for a DB table: column names and types, plus an
 /// optional catalog-stats row count. No row data is fetched. The
 /// table renders inside a nested boxed sub-panel so the column list
 /// reads as a tabular sub-component of the outer "table info" pane
 /// rather than naked text against the pane chrome.
 fn draw_db_preview(
+    app: &App,
     preview: &crate::app::DbPreview,
     frame: &mut Frame<'_>,
     theme: &Theme,
@@ -1770,19 +1820,67 @@ fn draw_db_preview(
         preview.path.schema.as_deref().unwrap_or("?"),
         preview.path.table.as_deref().unwrap_or("?"),
     );
-    let controls = match preview.row_count {
-        Some(n) => format!("{} cols  ·  ~{} rows", preview.columns.len(), format_count(n)),
-        None => format!("{} cols", preview.columns.len()),
+    // Pull cached metadata for this table — rendered as a visible info
+    // line inside the panel body (the top-bar controls slot would clip
+    // when the title + metadata don't fit, and `·` separators get split
+    // into their own bracket segments by the `BoxedPanel` segment
+    // delimiter).
+    let meta_state: Option<crate::sources::TableMeta> = {
+        use crate::app::MetaState;
+        let cache = app.db_meta_cache().borrow();
+        match cache.get(&preview.path) {
+            Some(MetaState::Ready(m)) => Some(m.clone()),
+            _ => None,
+        }
     };
-    // Right-pane preview accent matches the file browser's unfocused
-    // preview pane (`div_line`) so the active-pane glow stays on the
-    // CENTER column regardless of mode.
+    let meta_loading = {
+        use crate::app::MetaState;
+        let cache = app.db_meta_cache().borrow();
+        matches!(cache.get(&preview.path), Some(MetaState::Loading))
+    };
+    // Kick off a fetch if we haven't seen this table yet (e.g. user
+    // jumped straight to a table without expanding its schema first).
+    app.ensure_table_meta_loaded(preview.path.clone());
+
     let outer = BoxedPanel::new(theme.div_line, theme.title)
         .with_title(title)
-        .with_controls(controls);
+        .with_controls(format!("{} cols", preview.columns.len()));
     frame.render_widget(&outer, area);
     let outer_inner = outer.inner(area);
     if outer_inner.width < 10 || outer_inner.height < 3 {
+        return;
+    }
+
+    // Info line: "rows: 1.2K   size: 4.2 MB   modified: 2026-05-12 14:23"
+    // Renders before the schema sub-box. `…` while loading; absent
+    // when the backend has nothing to report.
+    let info_spans = build_db_info_spans(
+        meta_state.as_ref(),
+        preview.row_count,
+        meta_loading,
+        theme,
+    );
+    let info_consumed = if !info_spans.is_empty() && outer_inner.height >= 2 {
+        let info_rect = Rect::new(
+            outer_inner.x.saturating_add(1),
+            outer_inner.y,
+            outer_inner.width.saturating_sub(2),
+            1,
+        );
+        let lines = vec![Line::from(info_spans)];
+        let widget = ScrollableText::new(&lines, theme);
+        frame.render_widget(&widget, info_rect);
+        2 // info row + blank spacer
+    } else {
+        0
+    };
+    let outer_inner = Rect::new(
+        outer_inner.x,
+        outer_inner.y.saturating_add(info_consumed),
+        outer_inner.width,
+        outer_inner.height.saturating_sub(info_consumed),
+    );
+    if outer_inner.height < 3 {
         return;
     }
 

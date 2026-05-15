@@ -15,11 +15,16 @@
 use anyhow::{Context, Result};
 use duckdb::{params, AccessMode, Config, Connection as DuckConn};
 
-use super::db::{ColumnSpec, Connection, Database, Row, Schema, Table};
+use super::db::{ColumnSpec, Connection, Database, ModifiedKind, Row, Schema, Table, TableMeta};
 
 pub struct DuckConnection {
     conn: DuckConn,
     label: String,
+    /// Filesystem path to the underlying `.db` file, or `None` for
+    /// `:memory:`. Surfaced as the table's `modified` timestamp so
+    /// the preview pane shows *something* — DuckDB has no per-table
+    /// mtime concept of its own.
+    file_path: Option<std::path::PathBuf>,
 }
 
 impl DuckConnection {
@@ -58,7 +63,12 @@ impl DuckConnection {
         } else {
             format!("duckdb://{path}")
         };
-        Ok(Self { conn, label })
+        let file_path = if in_memory {
+            None
+        } else {
+            Some(std::path::PathBuf::from(path))
+        };
+        Ok(Self { conn, label, file_path })
     }
 
     /// `INSTALL ducklake; LOAD ducklake; ATTACH 'ducklake:postgres:URL'
@@ -278,6 +288,60 @@ impl Connection for DuckConnection {
                 .collect();
         }
         Ok((col_names, rows))
+    }
+
+    fn table_metadata(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
+        // Rows: estimated_size from duckdb_tables(). Size: sum of
+        // compressed block sizes from pragma_storage_info — only OK
+        // here because the renderer fires this on demand (single
+        // table the user opened), not for every visible row. DuckDB
+        // doesn't track per-table mtime, so `modified` stays None.
+        let mut stmt = self.conn.prepare(
+            "SELECT estimated_size FROM duckdb_tables() \
+             WHERE database_name = ? AND schema_name = ? AND table_name = ?",
+        )?;
+        let row_count: Option<u64> = stmt
+            .query_row(params![db, schema, table], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .ok()
+            .flatten()
+            .and_then(|n| if n > 0 { Some(n as u64) } else { None });
+
+        let qualified = format!(
+            "{}.{}.{}",
+            quote_ident(db),
+            quote_ident(schema),
+            quote_ident(table)
+        );
+        let qualified_lit = qualified.replace('\'', "''");
+        let size_sql = format!(
+            "SELECT COALESCE(SUM(compressed_size), 0)::BIGINT \
+             FROM pragma_storage_info('{qualified_lit}')"
+        );
+        let size_bytes = self
+            .conn
+            .query_row(&size_sql, params![], |r| r.get::<_, i64>(0))
+            .ok()
+            .and_then(|n| if n > 0 { Some(n as u64) } else { None });
+
+        // DuckDB has no per-table mtime, so we fall back to the .db
+        // file's mtime. Acceptable here because this method runs only
+        // for the table the user explicitly opened — the misleading
+        // "every row identical" symptom from the per-row Miller
+        // column doesn't apply.
+        let modified = self
+            .file_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+
+        Ok(TableMeta {
+            row_count,
+            size_bytes,
+            modified,
+            modified_kind: ModifiedKind::DbFile,
+        })
     }
 
     fn drop_object(&self, db: &str, schema: &str, table: Option<&str>, cascade: bool) -> Result<()> {
