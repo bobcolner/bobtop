@@ -110,10 +110,11 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::Char('.') => Action::ToggleHidden,
-        // `r` is rename now; refresh moves to F5 (the notify watcher
-        // makes manual refresh rarely needed anyway).
-        KeyCode::Char('r') => Action::Rename,
-        KeyCode::F(5) => Action::Refresh,
+        // `r` is refresh (matches lf / btop convention); rename moves
+        // to `c` ("change name", ranger-style). F5 still works for
+        // muscle-memory.
+        KeyCode::Char('r') | KeyCode::F(5) => Action::Refresh,
+        KeyCode::Char('c') => Action::Rename,
         KeyCode::Char('x') => Action::Trash,
         KeyCode::Char('X') => Action::HardDelete,
         KeyCode::Char('a') => Action::Touch,

@@ -137,7 +137,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     (".", "show / hide dotfiles"),
     // file operations
     ("a", "create empty file"),
-    ("r", "rename selection (refresh in DB mode)"),
+    ("c", "rename selection"),
     ("x / X", "trash / hard-delete with confirm"),
     ("e", "open in $EDITOR"),
     ("f", "recursive file finder"),
@@ -151,7 +151,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("i", "info panel"),
     // misc
     (":", "command palette"),
-    ("F5", "refresh"),
+    ("r / F5", "refresh"),
     ("M", "toggle mouse capture (off = native copy)"),
     ("O", "options — theme / behavior / connections"),
 ];
@@ -1632,7 +1632,8 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
             ("T".into(), "tree".into()),
             ("D".into(), "db".into()),
             ("x".into(), "trash".into()),
-            ("r".into(), "rename".into()),
+            ("r".into(), "refresh".into()),
+            ("c".into(), "rename".into()),
             ("a".into(), "new".into()),
             ("e".into(), "edit".into()),
             (".".into(), "hidden".into()),

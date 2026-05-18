@@ -2607,14 +2607,16 @@ impl App {
                     self._fs_watcher = Some(w);
                     self.fs_rx = Some(rx);
                 }
-                Err(_) => {
+                Err(e) => {
                     self._fs_watcher = None;
                     self.fs_rx = None;
+                    self.flash_status(format!("watch failed: {e}"));
                 }
             },
-            Err(_) => {
+            Err(e) => {
                 self._fs_watcher = None;
                 self.fs_rx = None;
+                self.flash_status(format!("watcher init failed: {e}"));
             }
         }
     }
