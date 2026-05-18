@@ -32,6 +32,9 @@ pub enum Action {
     StartFilter,
     /// Send the selected entry to the system trash.
     Trash,
+    /// Restore the most recently trashed item from this session
+    /// (LIFO). Linux + Windows only — macOS can't enumerate trash.
+    UndoTrash,
     /// Permanently delete the selected entry (after confirmation).
     HardDelete,
     /// Rename the selected entry — opens an input modal pre-filled
@@ -117,6 +120,7 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('c') => Action::Rename,
         KeyCode::Char('x') => Action::Trash,
         KeyCode::Char('X') => Action::HardDelete,
+        KeyCode::Char('u') => Action::UndoTrash,
         KeyCode::Char('a') => Action::Touch,
         KeyCode::Char('f') => Action::StartFind,
         KeyCode::Char('e') => Action::StartEditor,

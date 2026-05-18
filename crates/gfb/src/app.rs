@@ -808,6 +808,11 @@ pub struct App {
     /// Cleared after a few ticks so it doesn't linger.
     status_message: Option<String>,
     status_message_ticks: u8,
+    /// LIFO of original paths trashed during this session. `u` pops
+    /// and restores the newest matching `TrashItem` from the system
+    /// trash. Only populated on platforms where `trash::os_limited`
+    /// is available (Linux + Windows); macOS can't enumerate trash.
+    trash_undo_stack: Vec<PathBuf>,
     /// Key dispatch stack. Today the modals (input prompts, editor,
     /// finder, filter) intercept keys via flag-based pre-checks in
     /// `run`; the stack only carries the always-on `BaseScope`.
@@ -1377,6 +1382,7 @@ impl App {
             editor: None,
             status_message: None,
             status_message_ticks: 0,
+            trash_undo_stack: Vec::new(),
             scopes: gtui::ScopeStack::new(Box::new(BaseScope)),
             command_palette: None,
             view_mode: ViewMode::Miller,
@@ -3136,6 +3142,9 @@ impl App {
                     Some("file ops: switch to Miller mode (T) for now".to_string());
                 self.status_message_ticks = 24;
             }
+            Action::UndoTrash => {
+                self.run_undo_trash();
+            }
             Action::ShowInfo => {
                 self.open_info_panel();
                 return false;
@@ -3453,6 +3462,9 @@ impl App {
                         target: entry.path.clone(),
                     });
                 }
+            }
+            Action::UndoTrash => {
+                self.run_undo_trash();
             }
             Action::HardDelete => {
                 if let Some(entry) = self.selected() {
@@ -4040,14 +4052,79 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.display().to_string());
+        // Canonicalize *before* moving so the path stored on the
+        // undo stack matches what trash::os_limited::list() reports
+        // as original_parent (which is always absolute).
+        let original = target.canonicalize().unwrap_or_else(|_| target.to_path_buf());
         match trash::delete(target) {
             Ok(()) => {
-                self.flash_status(format!("trashed {}", name));
+                self.flash_status(format!("trashed {} — u to undo", name));
                 self.preview_cache.invalidate(&target.to_path_buf());
+                self.trash_undo_stack.push(original);
                 let _ = self.refresh();
             }
             Err(e) => self.flash_status(format!("trash: {}", e)),
         }
+    }
+
+    /// Pop the most recently trashed path from the session undo stack
+    /// and restore the matching `TrashItem` from the system trash.
+    /// Linux + Windows only — `trash::os_limited` isn't built on
+    /// macOS / iOS / Android, so this is a no-op (with a status flash)
+    /// there.
+    #[cfg(any(
+        target_os = "windows",
+        all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))
+    ))]
+    fn run_undo_trash(&mut self) {
+        let Some(original) = self.trash_undo_stack.pop() else {
+            self.flash_status("undo: nothing to restore");
+            return;
+        };
+        let items = match trash::os_limited::list() {
+            Ok(v) => v,
+            Err(e) => {
+                self.flash_status(format!("undo: list failed: {e}"));
+                self.trash_undo_stack.push(original);
+                return;
+            }
+        };
+        // Same original path can appear multiple times (file trashed,
+        // recreated, trashed again). Restore the newest one.
+        let candidate = items
+            .into_iter()
+            .filter(|it| it.original_path() == original)
+            .max_by_key(|it| it.time_deleted);
+        let Some(item) = candidate else {
+            self.flash_status(format!(
+                "undo: {} not found in trash",
+                original.display()
+            ));
+            return;
+        };
+        let name = item.name.to_string_lossy().into_owned();
+        match trash::os_limited::restore_all([item]) {
+            Ok(()) => {
+                self.flash_status(format!("restored {}", name));
+                self.preview_cache.invalidate(&original);
+                let _ = self.refresh();
+            }
+            Err(e) => {
+                // Push the path back so the user can retry after
+                // resolving the collision (e.g. by renaming the
+                // file that took its place).
+                self.trash_undo_stack.push(original);
+                self.flash_status(format!("undo: {e}"));
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "windows",
+        all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android"))
+    )))]
+    fn run_undo_trash(&mut self) {
+        self.flash_status("undo trash: not supported on this OS");
     }
 
     fn run_hard_delete(&mut self, target: &Path) {
