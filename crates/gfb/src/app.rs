@@ -1788,23 +1788,37 @@ impl App {
         dirty
     }
 
-    /// Open the branch overlay by running `git branch`.
+    /// Open the branch overlay. Uses `for-each-ref` rather than
+    /// `git branch` so the output is unambiguous — `git branch`
+    /// decorates lines with `*`, `+` (worktree-linked), or
+    /// `(HEAD detached at …)` and those leak into the branch name
+    /// if parsed naively, breaking the subsequent checkout.
     pub(crate) fn open_branch_overlay(&mut self) {
         let Some(ref root) = self.git.repo_root.clone() else { return };
-        let output = std::process::Command::new("git")
-            .args(["branch"])
+        let listed = std::process::Command::new("git")
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
             .current_dir(root)
             .output();
-        let Ok(out) = output else { return };
+        let Ok(out) = listed else { return };
+        if !out.status.success() { return; }
         let text = String::from_utf8_lossy(&out.stdout);
-        let mut current: Option<String> = None;
-        let mut branches: Vec<String> = Vec::new();
-        for line in text.lines() {
-            let is_current = line.starts_with('*');
-            let name = line.trim_start_matches(['*', ' ']).to_string();
-            if is_current { current = Some(name.clone()); }
-            branches.push(name);
-        }
+        let mut branches: Vec<String> = text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        // Current branch — empty when in detached HEAD.
+        let current = std::process::Command::new("git")
+            .args(["symbolic-ref", "--short", "-q", "HEAD"])
+            .current_dir(root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         // Put current branch first.
         if let Some(ref cur) = current {
             if let Some(pos) = branches.iter().position(|b| b == cur) {
@@ -1829,12 +1843,16 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up    => ov.selected = ov.selected.saturating_sub(1),
             KeyCode::Esc                         => { self.branch_overlay = None; }
             KeyCode::Enter => {
-                let branch = {
+                let (branch, current) = {
                     let ov = self.branch_overlay.as_ref().unwrap();
-                    ov.branches.get(ov.selected).cloned()
+                    (ov.branches.get(ov.selected).cloned(), ov.current.clone())
                 };
                 self.branch_overlay = None;
                 if let Some(b) = branch {
+                    if current.as_deref() == Some(b.as_str()) {
+                        self.flash_status(format!("already on {b}"));
+                        return;
+                    }
                     if let Some(ref root) = self.git.repo_root.clone() {
                         let res = std::process::Command::new("git")
                             .args(["checkout", &b])
@@ -1848,8 +1866,12 @@ impl App {
                                 self.request_preview();
                             }
                             Ok(o) => {
-                                let msg = String::from_utf8_lossy(&o.stderr);
-                                self.flash_status(format!("checkout failed: {}", msg.lines().next().unwrap_or("?")));
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                let msg = stderr
+                                    .lines()
+                                    .find(|l| !l.trim().is_empty())
+                                    .unwrap_or("?");
+                                self.flash_status(format!("checkout failed: {msg}"));
                             }
                             Err(e) => self.flash_status(format!("git: {e}")),
                         }
