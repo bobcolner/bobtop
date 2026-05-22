@@ -95,8 +95,8 @@ Return the answer and the exact gtop query you used.
 ## Install
 
 ```bash
-git clone https://github.com/bobcolner/bobtop
-cd bobtop
+git clone https://github.com/bobcolner/gverse
+cd gverse
 cargo build --release -p gtop
 ```
 

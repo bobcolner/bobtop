@@ -73,7 +73,7 @@ gtop agent pid_inspect --pid 1234
 Socket lives at `$XDG_RUNTIME_DIR/gtop.sock` (fallback
 `/tmp/gtop-$UID.sock`); responses are line-delimited JSON with
 schema `gtop/v1`. See the workspace README at
-<https://github.com/bobcolner/bobtop> for the full agent verb
+<https://github.com/bobcolner/gverse> for the full agent verb
 reference.
 
 ## Attribution tiers
