@@ -1,8 +1,8 @@
 # gtop
 
-`gtop` is a terminal system monitor in Rust with a btop-style TUI,
-async sampling, and per-process network bandwidth attribution. Linux
-first; macOS support is best-effort.
+`gtop` is a terminal system monitor in Rust, with async sampling and
+per-process network bandwidth attribution. Linux first; macOS support
+is best-effort.
 
 ## Install
 

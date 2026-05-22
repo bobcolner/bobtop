@@ -523,7 +523,7 @@ impl<'a> BrailleText<'a> {
     /// Common pairings:
     /// - `('─', '─')`  thin line under and over (matched)
     /// - `('━', '━')`  heavy line both rows
-    /// - `('═', '═')`  double line (very btop)
+    /// - `('═', '═')`  double line
     /// - `('─', '━')`  thin top, heavy bottom (asymmetric weight)
     /// - `('▔', '▁')`  ASCII-safe top/bottom rule chars
     /// - `('•', '•')`  dotted
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn six_letter_word_has_expected_width() {
         // 6 × 3 cells (letter) + 5 × 1 cell (gap) = 23 cells.
-        let t = BrailleText::new("BOBTOP");
+        let t = BrailleText::new("WIDGET");
         assert_eq!(t.width(), 23);
     }
 
@@ -706,7 +706,7 @@ mod tests {
     fn rules_fill_area_around_centered_letters() {
         // 23-cell intrinsic letters drawn in a 33-cell-wide area: 5 cells
         // of rule on each side (with 1-cell gap before/after letters).
-        let t = BrailleText::new("BOBTOP").with_rule('-', '=');
+        let t = BrailleText::new("WIDGET").with_rule('-', '=');
         let area = Rect::new(0, 0, 33, 2);
         let mut buf = Buffer::empty(area);
         (&t).render(area, &mut buf);
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn renders_into_buffer_without_panic() {
-        let t = BrailleText::new("BOBTOP");
+        let t = BrailleText::new("WIDGET");
         let area = Rect::new(0, 0, t.width(), t.height());
         let mut buf = Buffer::empty(area);
         (&t).render(area, &mut buf);
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn render_clips_to_area() {
-        let t = BrailleText::new("BOBTOP");
+        let t = BrailleText::new("WIDGET");
         let area = Rect::new(0, 0, 5, 2);
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 2));
         (&t).render(area, &mut buf);

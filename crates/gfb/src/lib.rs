@@ -1,10 +1,19 @@
-//! `gfb` — TUI file browser library.
+//! `gfb` — TUI file browser, with optional Postgres / DuckDB /
+//! DuckLake browsing.
 //!
-//! Public surface intentionally narrow: external callers go through
-//! [`cli::run`] and nothing else. All other modules are crate-internal
-//! plumbing — they were previously `pub` so the binary in `src/bin/`
-//! could reach them, but the binary only ever called `cli::run`, so
-//! exposing the rest was bloat.
+//! This crate ships as a binary (`gfb`); the library exists mainly so
+//! the binary can live in `src/bin/` and so integration tests can drive
+//! the app without re-spawning a process. External callers should go
+//! through [`cli::run`] — everything else is crate-internal plumbing.
+//!
+//! # Features
+//!
+//! - `postgres` — Postgres backend via `tokio-postgres` (browse a live DB).
+//! - `duckdb`   — DuckDB backend, with DuckLake attach support.
+//! - `all-sources` (default) — enables both `postgres` and `duckdb`.
+//!
+//! Without any DB features the file-browser surface still works; the
+//! `--connect` flag will reject postgres/duckdb URLs at runtime.
 
 #![forbid(unsafe_code)]
 

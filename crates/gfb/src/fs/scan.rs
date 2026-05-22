@@ -3,7 +3,7 @@
 //! Async/streamed scan can come later (large NFS dirs, network mounts);
 //! for now `read_dir` is plenty fast on local filesystems and avoids the
 //! complexity of partial-list rendering. Sort order is dirs-first then
-//! by name, mirroring yazi/ranger defaults.
+//! by name.
 
 use std::cmp::Ordering;
 use std::io;

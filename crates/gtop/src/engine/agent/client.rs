@@ -63,7 +63,7 @@ pub fn send(path: &Path, request: &serde_json::Value) -> Result<AgentResponse, S
 /// Connect to an existing socket, or — when missing — spawn `binary
 /// args...` (detached via `setsid`), poll the path for up to
 /// `timeout`, and connect once it appears. Honors
-/// `BOBTOP_NO_AUTOSPAWN=1` so callers (CI, security-sensitive contexts)
+/// `GTOP_NO_AUTOSPAWN=1` so callers (CI, security-sensitive contexts)
 /// can opt out by env.
 ///
 /// Errors carry a human-readable reason. The caller is expected to
@@ -78,12 +78,12 @@ pub fn connect_or_spawn(
     if let Ok(s) = UnixStream::connect(path) {
         return Ok(s);
     }
-    if std::env::var("BOBTOP_NO_AUTOSPAWN")
+    if std::env::var("GTOP_NO_AUTOSPAWN")
         .ok()
         .filter(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .is_some()
     {
-        return Err("socket missing and BOBTOP_NO_AUTOSPAWN=1 is set".into());
+        return Err("socket missing and GTOP_NO_AUTOSPAWN=1 is set".into());
     }
     spawn_detached(binary, args).map_err(|e| format!("spawn {}: {e}", binary.display()))?;
     let deadline = std::time::Instant::now() + timeout;

@@ -15,7 +15,7 @@
 //! ## Loader
 //!
 //! Uses libbpf-rs. The build script generates a typed skeleton at
-//! `$OUT_DIR/net.skel.rs` exposing `BobtopNetSkelBuilder` and accessors
+//! `$OUT_DIR/net.skel.rs` exposing `GtopNetSkelBuilder` and accessors
 //! for each map and program. Migrated from aya 0.13 after persistent
 //! "error parsing ELF data" failures on hosts where the BPF object was
 //! valid (aya's from-scratch ELF parser disagreed with newer LLVM

@@ -8,9 +8,6 @@
 //!   sample type emitted onto the [`DataBus`].
 //! - [`DataBus`] — a `tokio::sync::broadcast`-backed pub/sub channel that
 //!   decouples collectors from consumers (TUI, exporters, etc.).
-//!
-//! Was the standalone `bobtop-core` crate before Phase 1 of the
-//! refactor folded it in here.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]

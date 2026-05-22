@@ -1611,8 +1611,8 @@ fn draw_action_bar(app: &App, frame: &mut Frame<'_>, theme: &Theme, area: Rect) 
     }
     let actions: Vec<(String, String)> = if app.jump_pending() {
         // While the chord is pending the action bar shifts to a hint
-        // for which keys are valid second-presses. Mirrors what yazi
-        // does to make the chord feel discoverable.
+        // for which keys are valid second-presses — makes the chord
+        // feel discoverable.
         vec![
             ("g…".into(), "jump:".into()),
             ("g".into(), "top".into()),
@@ -1927,9 +1927,8 @@ fn draw_db_preview(
         box_w,
         box_h,
     );
-    // `accent_subtle` (btop's proc_misc) is the suite's subdued accent —
-    // a child element should read as a child, not compete with the
-    // active-pane glow.
+    // `accent_subtle` is the suite's subdued accent — a child element
+    // should read as a child, not compete with the active-pane glow.
     let inner_panel = BoxedPanel::new(theme.accent_subtle, theme.title)
         .with_title("schema".to_string());
     frame.render_widget(&inner_panel, inner_box_area);

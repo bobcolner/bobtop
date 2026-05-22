@@ -1,9 +1,9 @@
 # gfb
 
-`gfb` is a Yazi-style TUI file browser — and, with the right feature
-flags on, a Postgres / DuckDB / DuckLake catalog browser too. Both
-sources share one tree pane: the cwd and every `--connect`'d
-endpoint stack as siblings at depth 0.
+`gfb` is a TUI file browser — and, with the right feature flags on,
+a Postgres / DuckDB / DuckLake catalog browser too. Both sources
+share one tree pane: the cwd and every `--connect`'d endpoint stack
+as siblings at depth 0.
 
 ## Install
 
@@ -30,7 +30,7 @@ gfb /etc                  # start in /etc
 gfb --theme tokyo-night
 ```
 
-Two layouts: miller (default — three columns à la `yazi`) and tree
+Two layouts: miller (default — three columns) and tree
 (toggle with `T`). Built-in nano-style editor over a syntect
 highlighter (open with `e`). Image preview detects kitty / iTerm /
 sixel and falls back to sextant blocks.

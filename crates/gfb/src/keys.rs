@@ -113,9 +113,8 @@ pub fn map(ev: KeyEvent) -> Action {
         KeyCode::Char('g') | KeyCode::Home => Action::Top,
         KeyCode::Char('G') | KeyCode::End => Action::Bottom,
         KeyCode::Char('.') => Action::ToggleHidden,
-        // `r` is refresh (matches lf / btop convention); rename moves
-        // to `c` ("change name", ranger-style). F5 still works for
-        // muscle-memory.
+        // `r` is refresh; rename moves to `c` ("change name"). F5
+        // still works for muscle-memory.
         KeyCode::Char('r') | KeyCode::F(5) => Action::Refresh,
         KeyCode::Char('c') => Action::Rename,
         KeyCode::Char('x') => Action::Trash,

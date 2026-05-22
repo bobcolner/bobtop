@@ -1,12 +1,13 @@
 [package]
 name = "gfb"
-description = "Yazi-style TUI file browser with optional Postgres / DuckDB / DuckLake browsing"
+description = "TUI file browser with optional Postgres / DuckDB / DuckLake browsing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/gfb"
 keywords = ["file", "browser", "tui", "duckdb", "postgres"]
 categories = ["command-line-utilities"]
 

@@ -1,12 +1,13 @@
 [package]
 name = "gtop"
-description = "btop-flavoured TUI system monitor: CPU, memory, network, disk, per-process bandwidth attribution"
+description = "TUI system monitor: CPU, memory, network, disk, per-process bandwidth attribution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
+documentation = "https://docs.rs/gtop"
 keywords = ["monitor", "system", "tui", "btop", "ebpf"]
 categories = ["command-line-utilities", "os::linux-apis"]
 build = "build.rs"

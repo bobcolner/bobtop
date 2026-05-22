@@ -1,15 +1,15 @@
 # gtop
 
-`gtop` is a terminal system monitor in Rust with a btop-style TUI, async
-sampling, and per-process network bandwidth attribution. It is Linux-first;
-macOS support is best-effort.
+`gtop` is a terminal system monitor in Rust, with async sampling and
+per-process network bandwidth attribution. It is Linux-first; macOS
+support is best-effort.
 
 `gtop` is one of three crates in this workspace:
 
 | Crate | Kind | What it is |
 | --- | --- | --- |
 | [`gtui`](crates/gtui)  | library | Reusable Ratatui toolkit — widgets, themes, layout, keymap |
-| [`gtop`](crates/gtop)  | binary  | btop-flavoured system monitor (this README) |
+| [`gtop`](crates/gtop)  | binary  | TUI system monitor (this README) |
 | [`gfb`](crates/gfb)    | binary  | TUI file (and database) browser, built on `gtui` |
 
 ## Summary

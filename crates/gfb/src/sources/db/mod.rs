@@ -221,12 +221,6 @@ pub enum ModifiedKind {
     DbFile,
 }
 
-/// Resolve `target` to a concrete connection. `target` is the
-/// `--connect` CLI value:
-///
-/// - `mock` → built-in demo data
-/// - `postgres://...` → tokio-postgres backend (TODO: not wired yet)
-/// - `duckdb:///path` → duckdb-rs backend (TODO: not wired yet)
 /// DuckLake attach parameters. When `Some`, [`open`] opens the DuckDB
 /// connection and immediately runs `INSTALL ducklake; LOAD ducklake;
 /// ATTACH 'ducklake:postgres:URL' AS <name> (DATA_PATH '...')` so the
@@ -238,6 +232,13 @@ pub struct DuckLakeAttach {
     pub data_path: String,
 }
 
+/// Resolve `target` to a concrete connection. `target` is the
+/// `--connect` CLI value:
+///
+/// - `mock` → built-in demo data
+/// - `postgres://...` / `postgresql://...` → tokio-postgres backend
+///   (requires the `postgres` feature)
+/// - `duckdb://path` → duckdb-rs backend (requires the `duckdb` feature)
 pub fn open(
     target: &str,
     ducklake: Option<DuckLakeAttach>,

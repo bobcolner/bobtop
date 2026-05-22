@@ -2,12 +2,6 @@
 //! call [`ui::draw`] without going through the binary's `tokio::main`. The
 //! binary `main.rs` re-uses the same modules.
 
-// Internal plumbing — formerly the standalone bobtop-core /
-// bobtop-collectors / bobtop-pid-attr / bobtop-engine crates. Folded
-// into gtop in the Phase 1 refactor (see docs/gtop-refactor.md). The
-// module names match the old crate names with hyphens dropped, so a
-// `bobtop_core::sample::ProcessInfo` import becomes
-// `crate::core::sample::ProcessInfo`.
 pub mod collectors;
 pub mod core;
 pub mod engine;
